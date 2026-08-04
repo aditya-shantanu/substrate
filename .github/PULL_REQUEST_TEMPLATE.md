@@ -1,6 +1,15 @@
-Fixes #<issue_number_goes_here>
+Fixes #<issue_number>
 
-> It's a good idea to open an issue first for discussion.
+> **Stop:** Does this PR reference an open issue above? If not, please open one first.
+> PRs without a linked issue will not be reviewed.
 
-- [ ] Tests pass
-- [ ] Appropriate changes to documentation are included in the PR
+## What changed and why
+
+<!-- Brief description of the change and the reasoning behind it -->
+
+## Checklist
+
+- [ ] Issue is linked above
+- [ ] Tests pass locally (`go test ./...`)
+- [ ] Root-gated tests pass if applicable (`hack/run-root-tests.sh`)
+- [ ] Documentation updated if behavior changed
