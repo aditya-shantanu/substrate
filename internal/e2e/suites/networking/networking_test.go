@@ -40,19 +40,31 @@ func TestActorDirectAccess(t *testing.T) {
 	})
 	t.Run("via ingress", func(t *testing.T) {
 		actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
-		response, err := router.Get(ctx, actorRef, "/readyz")
-		if err != nil {
-			t.Fatalf("GET Actor through ingress: %v", err)
+		// Retry until the ingress routes are programmed. After ResumeActor returns
+		// the xDS update from the control plane may not have reached the router yet,
+		// causing a transient 503 connection timeout.
+		const timeout = 30 * time.Second
+		deadline := time.Now().Add(timeout)
+		for {
+			response, err := router.Get(ctx, actorRef, "/readyz")
+			if err != nil {
+				t.Fatalf("GET Actor through ingress: %v", err)
+			}
+			body, err := io.ReadAll(response.Body)
+			response.Body.Close()
+			if err != nil {
+				t.Fatalf("reading ingress response body (HTTP %d): %v", response.StatusCode, err)
+			}
+			if response.StatusCode == http.StatusOK {
+				t.Logf("Actor access through ingress succeeded; body: %s", body)
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("Actor access through ingress returned HTTP %d after %v; body: %s", response.StatusCode, timeout, body)
+			}
+			t.Logf("Actor access through ingress returned HTTP %d; retrying...", response.StatusCode)
+			time.Sleep(1 * time.Second)
 		}
-		defer response.Body.Close()
-		body, err := io.ReadAll(response.Body)
-		if err != nil {
-			t.Fatalf("reading ingress response body (HTTP %d): %v", response.StatusCode, err)
-		}
-		if response.StatusCode != http.StatusOK {
-			t.Fatalf("Actor access through ingress returned HTTP %d, want 200; body: %s", response.StatusCode, body)
-		}
-		t.Logf("Actor access through ingress succeeded; body: %s", body)
 	})
 }
 
