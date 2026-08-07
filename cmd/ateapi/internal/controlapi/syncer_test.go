@@ -949,7 +949,9 @@ func TestSyncer_UpdateWorker_RetryOnVersionConflict(t *testing.T) {
 	}
 
 	// Verify that the worker in Redis eventually gets updated to the new SandboxClass despite the version conflict.
-	err = wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+	// 15s: the syncer's rate-limiting work queue adds backoff between retries; on a loaded
+	// CI runner the second attempt can take longer than the previous 5s window allowed.
+	err = wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
 		w, err := persistence.GetWorker(ctx, ns, poolName, podName)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {

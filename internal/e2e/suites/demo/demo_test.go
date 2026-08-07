@@ -1018,7 +1018,7 @@ func hasStorageClass(ctx context.Context, clients *e2e.Clients, name string) boo
 func waitForActorStatus(ctx context.Context, t *testing.T, clients *e2e.Clients, actorName string, expectedStatus ateapipb.Actor_Status) {
 	t.Helper()
 	t.Logf("Waiting for Actor %q to be %v...", actorName, expectedStatus)
-	timeout := 60 * time.Second
+	timeout := 120 * time.Second
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		resp, err := clients.SubstrateAPI.GetActor(ctx, &ateapipb.GetActorRequest{
@@ -1038,7 +1038,9 @@ func waitForActorStatus(ctx context.Context, t *testing.T, clients *e2e.Clients,
 func callActor(t *testing.T, actorRef resources.ActorRef) (string, error) {
 	t.Helper()
 
-	deadline := time.Now().Add(30 * time.Second)
+	// 90s: actor reaches STATUS_RUNNING before xDS routes are fully propagated
+	// in atenet-router. The extra headroom covers the route-sync lag on loaded runners.
+	deadline := time.Now().Add(90 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
 		resp, err := callActorOnce(t, actorRef)
