@@ -125,7 +125,11 @@ def _enrich_closer(repo: str, issues: list[dict]) -> None:
             f'i{iss["number"]}: issue(number: {iss["number"]}) {{'
             f' timelineItems(itemTypes: [CLOSED_EVENT], last: 1) {{'
             f'  nodes {{ ... on ClosedEvent {{'
-            f'   closer {{ __typename }} }} }} }} }}'
+            f'   closer {{'
+            f'    __typename'
+            f'    ... on PullRequest {{ author {{ login }} }}'
+            f'    ... on Commit {{ authors(first:1) {{ nodes {{ user {{ login }} }} }} }}'
+            f'   }} }} }} }} }}'
             for iss in batch
         )
         query = f'{{ repository(owner: "{owner}", name: "{name}") {{ {aliases} }} }}'
@@ -145,9 +149,20 @@ def _enrich_closer(repo: str, issues: list[dict]) -> None:
             key = f"i{iss['number']}"
             nodes = data.get(key, {}).get("timelineItems", {}).get("nodes", [])
             node = nodes[0] if nodes else None
-            typename = (node or {}).get("closer", {}) or {}
-            typename = typename.get("__typename") if isinstance(typename, dict) else None
-            iss["closer_type"] = typename  # 'PullRequest', 'Commit', or None
+            closer = (node or {}).get("closer") or {}
+            typename = closer.get("__typename")  # 'PullRequest', 'Commit', or None
+
+            # Extract the closer's login
+            closer_login = None
+            if typename == "PullRequest":
+                closer_login = (closer.get("author") or {}).get("login")
+            elif typename == "Commit":
+                commit_authors = closer.get("authors", {}).get("nodes", [])
+                if commit_authors:
+                    closer_login = (commit_authors[0].get("user") or {}).get("login")
+
+            iss["closer_type"] = typename
+            iss["closer_login"] = closer_login
 
 
 def fetch_ci_runs(repo: str, since: str, until: str, limit: int = 1000,
@@ -262,17 +277,23 @@ def compute_issue_stats(issue: dict) -> dict:
         gap = _hours(_parse_dt(ext[i]["createdAt"]) - _parse_dt(ext[i-1]["createdAt"]))
         inter_comment_hours.append(gap)
 
-    closer_type = issue.get("closer_type")  # 'PullRequest', 'Commit', or None
-    state_reason = issue.get("stateReason")  # 'COMPLETED', 'NOT_PLANNED', or None
+    closer_type  = issue.get("closer_type")   # 'PullRequest', 'Commit', or None
+    closer_login = issue.get("closer_login")  # login of whoever closed it
+    state_reason = issue.get("stateReason")   # 'COMPLETED', 'NOT_PLANNED', or None
 
-    # Classify how the issue was resolved (only meaningful for closed issues)
+    # Classify how the issue was resolved (only meaningful for closed issues).
+    # "self_fixed" = author filed the issue AND their own PR/commit closed it —
+    # a workflow artifact of the issue-first PR template, not a triage gap.
     if issue["state"] == "CLOSED":
         if closer_type in ("PullRequest", "Commit"):
-            close_reason = "pr_or_commit"   # closed by a PR / merge commit — normal
+            if closer_login and closer_login == author:
+                close_reason = "self_fixed"     # author filed + fixed it themselves
+            else:
+                close_reason = "pr_or_commit"   # someone else's PR/commit closed it
         elif state_reason == "NOT_PLANNED":
-            close_reason = "not_planned"    # explicitly marked won't-fix/duplicate
+            close_reason = "not_planned"        # explicitly marked won't-fix/duplicate
         else:
-            close_reason = "manual"         # closed via UI with no PR or commit
+            close_reason = "manual"             # closed via UI with no PR or commit
     else:
         close_reason = None
 
@@ -405,19 +426,33 @@ def aggregate_issue_stats(issue_stats: list[dict]) -> dict:
 
     # Break down closed-no-comment issues by how they were closed
     closed_no_comment = [s for s in closed if s["first_comment_hours"] is None]
+
+    # Self-fixed issues: author filed the issue and their own PR closed it.
+    # These are a workflow artifact of the issue-first PR template — not real
+    # triage gaps. Compute comment stats both including and excluding them so
+    # we get an honest picture of community engagement.
+    self_fixed = [s for s in issue_stats if s.get("close_reason") == "self_fixed"]
+    community  = [s for s in issue_stats if s.get("close_reason") != "self_fixed"]
+    comm_first = [s["first_comment_hours"] for s in community if s["first_comment_hours"] is not None]
+
     return {
         "total_issues": len(issue_stats),
         "open_issues": sum(1 for s in issue_stats if s["state"] == "OPEN"),
         "closed_issues": len(closed),
+        "self_fixed_issues": len(self_fixed),
+        "community_issues": len(community),
         "issues_with_comments": sum(1 for s in issue_stats if s["first_comment_hours"] is not None),
         "issues_without_comments": sum(1 for s in issue_stats if s["first_comment_hours"] is None),
         "closed_no_comment_total": len(closed_no_comment),
+        "closed_no_comment_self_fixed":      sum(1 for s in closed_no_comment if s.get("close_reason") == "self_fixed"),
         "closed_no_comment_by_pr_or_commit": sum(1 for s in closed_no_comment if s.get("close_reason") == "pr_or_commit"),
         "closed_no_comment_not_planned":     sum(1 for s in closed_no_comment if s.get("close_reason") == "not_planned"),
         "closed_no_comment_manual":          sum(1 for s in closed_no_comment if s.get("close_reason") == "manual"),
         "first_comment": _distribution(first_comment_vals),
+        "first_comment_community": _distribution(comm_first),
         "inter_comment": _distribution(inter_comment_vals),
         "comment_count_dist": _comment_count_dist(issue_stats),
+        "comment_count_dist_community": _comment_count_dist(community),
         "time_to_close": _distribution(close_vals),
     }
 
@@ -455,7 +490,9 @@ def print_pr_comparison(before: dict, after: dict, bl: str, al: str) -> None:
 def print_issue_summary(agg: dict, label: str = "") -> None:
     title = f"Issue traction — {label}" if label else "Issue traction"
     _hdr(title)
+    sf    = agg['self_fixed_issues']
     cnc   = agg['closed_no_comment_total']
+    sf_nc = agg['closed_no_comment_self_fixed']
     by_pr = agg['closed_no_comment_by_pr_or_commit']
     notpl = agg['closed_no_comment_not_planned']
     manl  = agg['closed_no_comment_manual']
@@ -463,16 +500,19 @@ def print_issue_summary(agg: dict, label: str = "") -> None:
     print(f"  Issues in window:          {agg['total_issues']}")
     print(f"  Open:                      {agg['open_issues']}")
     print(f"  Closed:                    {agg['closed_issues']}")
+    print(f"    ↳ self-fixed (author filed + fixed): {sf}  (PR template artifact — not a triage gap)")
     print(f"  With external comments:    {agg['issues_with_comments']}")
     print(f"  No external comments:      {agg['issues_without_comments']}")
-    print(f"    ↳ closed by PR/commit:   {by_pr}  (visible cross-link — normal)")
+    print(f"    ↳ self-fixed, no comment:{sf_nc}  (expected — author fixed it directly)")
+    print(f"    ↳ closed by others' PR:  {by_pr}  (cross-link visible — normal)")
     print(f"    ↳ closed as not-planned: {notpl}  (won't-fix/duplicate — expected)")
     print(f"    ↳ closed manually, no PR:{manl}  ← real concern")
     print()
-    _print_dist(agg["first_comment"], "Time to first comment  (issue open → first external comment)")
+    _print_dist(agg["first_comment"], "Time to first comment  (all issues)")
+    _print_dist(agg["first_comment_community"], "Time to first comment  (community issues only, excl. self-fixed)")
     _print_dist(agg["inter_comment"], "Subsequent comment gap  (time between consecutive external comments)")
 
-    ccd = agg.get("comment_count_dist", {})
+    ccd = agg.get("comment_count_dist_community", agg.get("comment_count_dist", {}))
     if ccd.get("count", 0) > 0:
         b = ccd["buckets"]
         n = ccd["count"]

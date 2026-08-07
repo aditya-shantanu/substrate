@@ -19,11 +19,12 @@ Flakiness is a direct velocity tax on every contributor and the most acute probl
 
 ### 2. Issue Velocity
 
-The speed of engagement on issues that do get attention is improving. The structural problem is coverage — and it is getting worse as volume grows.
+After correcting for workflow artifacts, issue health looks better than the raw numbers suggested — but one real gap remains.
 
-- **Issue engagement rate collapsed from 78% → 48%** as issue volume grew 35% from May–Jun to Jul–Aug. The absolute number of issues receiving any comment barely changed while the queue grew — maintainer bandwidth is not scaling.
-- **40% of closed issues had no comment thread** — but 34 of those 40 were closed by a PR/commit cross-link (normal GitHub practice, the link is visible). Only **6 issues (2%)** were closed manually with no PR and no comment. Not a systemic problem.
-- **45% of issues that do get a comment receive only 1.** Single-touch triage is the norm, not sustained discussion.
+- **38% of closed issues (37/98) are self-fixed**: the author filed the issue and their own PR closed it, a direct consequence of the PR template's issue-first requirement. These don't need triage. Stripping them out, the actual community issue queue is smaller and more engaged than the raw stats showed.
+- **Only 6 issues were genuinely closed with no explanation** — no comment, no PR link, no reason. Not a systemic problem.
+- **Issue engagement rate shows 48% of recent issues receive no external comment**, but this is inflated by self-fixed issues. The underlying concern is real: as issue volume grows, maintainer response bandwidth isn't keeping pace with the community queue.
+- **43% of community issues that get any comment receive only 1.** This is less alarming than it sounds — many resolve quickly via a single "fixed in PR #X" response. The ones to watch are open issues with 1 comment and no follow-up.
 
 ### 3. PR Velocity
 
@@ -108,7 +109,7 @@ on:
 2. Posts a triage comment: acknowledgement, labels applied, follow-up questions if repro is missing, duplicate link if found
 3. Assigns to the relevant component owner if the area is identifiable
 
-**Success metric:** issue engagement rate (issues with at least one external comment or a PR close link) increases from 48% → 80%+. The agent ensures every issue gets at least one substantive response within minutes of filing.
+**Success metric:** community issue engagement rate (excluding self-fixed issues) increases from ~63% → 85%+. The agent ensures every community issue gets at least one substantive response within minutes of filing.
 
 ---
 
@@ -187,23 +188,32 @@ Sample is small (only PRs that received a `CHANGES_REQUESTED` review) — treat 
 
 ### A2. Issue Velocity — Detail
 
+#### Self-Fixed vs Community Issues
+
+38% of closed issues (37/98) are **self-fixed**: the author filed the issue and their own PR closed it — a workflow artifact of the issue-first PR template. These require no triage. The remaining 61 closed issues are community issues where someone other than the author resolved it.
+
+| Category | Count | Notes |
+|---|---|---|
+| Closed issues total | 98 | |
+| Self-fixed (author filed + fixed) | 37 (38%) | PR template artifact |
+| Community-resolved | 61 (62%) | Someone else fixed or reviewed |
+
 #### First Comment
 
 Time from issue opened to the first non-author, non-bot comment.
 
-**Overall (280 issues, all time)**
+**Overall (282 issues, all time)**
 
-| Metric | Value |
-|---|---|
-| Issues with at least one external comment | 170 / 280 (61%) |
-| Issues with no external comment | 110 / 280 (39%) |
-| Median | 18.5h |
-| p75 | 3.7d |
-| p90 | 16.7d |
-| Mean | 5.4d |
-| Min / Max | 1m / 63.7d |
+| Metric | All issues | Community only (excl. self-fixed) |
+|---|---|---|
+| Issues with ≥1 external comment | 171 / 282 (61%) | 155 / 245 (63%) |
+| Issues with no external comment | 111 / 282 (39%) | 90 / 245 (37%) |
+| Median | 18.0h | 21.0h |
+| p75 | 3.7d | 4.5d |
+| p90 | 16.5d | 17.6d |
+| Mean | 5.3d | 5.8d |
 
-**Trend**
+**Trend (all issues)**
 
 | Metric | May–Jun (n=93) | Jul–Aug (n=77) | Change |
 |---|---|---|---|
@@ -212,43 +222,49 @@ Time from issue opened to the first non-author, non-bot comment.
 | p75 | 9.6d | 2.4d | -75% |
 | Mean | 8.0d | 2.2d | -73% |
 
+Note: the apparent drop in engagement rate (78% → 48%) is partly driven by a growing share of self-fixed issues in the recent period, which never need an external comment.
+
 #### Subsequent Comments
 
-Comment count per issue (170 issues with ≥1 external comment):
+Comment count per issue (community issues with ≥1 external comment, n=155):
 
 | Comments per issue | Count | Share |
 |---|---|---|
-| Exactly 1 | 76 | 45% |
-| 2–3 | 48 | 28% |
-| 4–9 | 38 | 22% |
-| 10+ | 8 | 5% |
-| Median / Mean / Max | 2.0 / 3.1 / 28 | — |
+| Exactly 1 | 67 | 43% |
+| 2–3 | 47 | 30% |
+| 4–9 | 34 | 22% |
+| 10+ | 7 | 5% |
+| Median / Mean / Max | 2.0 / 3.0 / 20 | — |
 
-**Gap between consecutive external comments** (n=353 pairs)
+43% of community issues that receive any engagement get exactly 1 comment. This is not necessarily alarming — many are resolved with a single "fixed in PR #X" acknowledgement. The watch list is open issues with 1 stale comment.
+
+**Gap between consecutive external comments** (n=356 pairs)
 
 | Metric | Value |
 |---|---|
-| Median | 14.8h |
-| p75 | 3.1d |
-| p90 | 11.7d |
-| Mean | 4.5d |
+| Median | 15.4h |
+| p75 | 3.3d |
+| p90 | 12.0d |
+| Mean | 4.6d |
 | Min / Max | 0m / 65.2d |
 
 #### Time to Close
 
-Time from issue opened to issue closed (closed issues only).
+Time from issue opened to issue closed (closed issues only, n=98).
 
-**Overall (97 closed issues, all time)**
+| Close reason | Count | Notes |
+|---|---|---|
+| Self-fixed (author's own PR) | 37 (38%) | PR template artifact — normal |
+| Closed by someone else's PR/commit | 13 (13%) | Cross-link visible — normal |
+| Closed as not-planned | 0 | — |
+| Closed manually, no PR, no comment | **6 (6%)** | Real concern — no explanation |
 
 | Metric | Value |
 |---|---|
-| Closed with no comment thread | 40 / 98 (41%) |
-| &nbsp;&nbsp;↳ closed by PR/commit (normal) | 34 |
-| &nbsp;&nbsp;↳ closed manually, no PR/comment | **6** ← real concern |
-| Median | 3.6d |
-| p75 | 11.2d |
+| Median | 3.7d |
+| p75 | 11.0d |
 | p90 | 41.0d |
-| Mean | 10.1d |
+| Mean | 10.0d |
 | Min / Max | 0m / 69.3d |
 
 **Trend**
