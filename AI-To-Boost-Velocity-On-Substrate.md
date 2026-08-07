@@ -11,27 +11,19 @@
 
 ### 1. CI / Test Flakiness ⚠️ Most Urgent
 
-Flakiness is a direct velocity tax on every contributor and the most acute problem right now.
-
-- **52.9% PR branch flakiness rate.** Over half of PR branches that trigger more than one CI run have a pattern of fail → pass on the same code. Contributors routinely re-run CI without changes just to get a green signal.
-- **Main branch is broken 23.6% of the time.** Roughly 1 in 4 merges to main produces a failing CI run, forcing every subsequent PR author to triage "is this me or pre-existing?"
-- **Root cause is almost certainly the e2e tests.** The workflow runs a full kind cluster with micro-VM assets, KVM access, and two Kubernetes network stacks on GitHub's free `ubuntu-latest` runners — highly sensitive to runner state, disk, and cache.
+- **Main branch is broken 23.6% of the time** — 1 in 4 merges produces a failing CI run.
+- **52.9% of multi-run PR branches are flaky** — contributors re-run CI without code changes just to get green.
+- Root cause: 5 specific tests account for half of named failures; the other half is envtest resource contention. E2e infrastructure is a secondary factor.
 
 ### 2. Issue Velocity
 
-After correcting for workflow artifacts, issue health looks better than the raw numbers suggested — but one real gap remains.
-
-- **38% of closed issues (37/98) are self-fixed**: the author filed the issue and their own PR closed it, a direct consequence of the PR template's issue-first requirement. These don't need triage. Stripping them out, the actual community issue queue is smaller and more engaged than the raw stats showed.
-- **Only 6 issues were genuinely closed with no explanation** — no comment, no PR link, no reason. Not a systemic problem.
-- **Issue engagement rate shows 48% of recent issues receive no external comment**, but this is inflated by self-fixed issues. The underlying concern is real: as issue volume grows, maintainer response bandwidth isn't keeping pace with the community queue.
-- **43% of community issues that get any comment receive only 1.** This is less alarming than it sounds — many resolve quickly via a single "fixed in PR #X" response. The ones to watch are open issues with 1 comment and no follow-up.
+- **37% of community issues receive no external comment.** As issue volume grows, maintainer response bandwidth isn't keeping pace.
+- **Open issues with a single stale comment** are the watch list — they look engaged but may be unresolved.
 
 ### 3. PR Velocity
 
-The least critical area — direction is positive. First-review latency improved 41% (mean) and re-review turnaround improved 57% over the past two months. Two gaps remain:
-
-- **23% of PRs receive no review at all.** Nearly 1 in 4 closed PRs was merged or closed without a single external review event. This is a governance gap, not a speed gap.
-- **Long tail: p90 first-review is 3.3 days.** The median looks healthy at 6h, but 10% of PRs wait more than 3 days — a small number of PRs drag the mean (29h) well above the median.
+- **23% of PRs receive no review at all** — a governance gap, not a speed gap.
+- **p90 first-review is 3.3 days** — the median (6h) looks healthy but a long tail of PRs sits ignored.
 
 ---
 
