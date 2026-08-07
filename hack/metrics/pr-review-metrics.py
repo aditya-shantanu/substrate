@@ -101,8 +101,53 @@ def fetch_issues(repo: str, since: str, until: str, limit: int = 500) -> list[di
     until_dt = _parse_date(until, end_of_day=True)
     raw = _gh("issue", "list", "--repo", repo, "--state", "all",
               "--limit", str(limit),
-              "--json", "number,title,createdAt,closedAt,state,author,comments")
-    return [iss for iss in raw if since_dt <= _parse_dt(iss["createdAt"]) <= until_dt]
+              "--json", "number,title,createdAt,closedAt,state,author,comments,stateReason")
+    issues = [iss for iss in raw if since_dt <= _parse_dt(iss["createdAt"]) <= until_dt]
+    _enrich_closer(repo, issues)
+    return issues
+
+
+def _enrich_closer(repo: str, issues: list[dict]) -> None:
+    """
+    For each closed issue with no external comments, query GraphQL in batches to
+    find what closed it: a PullRequest, a Commit (usually from a PR merge), or
+    nothing (manually closed via the GitHub UI).
+
+    Adds a 'closer_type' key to each issue: 'PullRequest', 'Commit', 'manual', or None.
+    """
+    owner, name = repo.split("/")
+    targets = [iss for iss in issues if iss.get("state") == "CLOSED"]
+
+    BATCH = 20
+    for i in range(0, len(targets), BATCH):
+        batch = targets[i:i + BATCH]
+        aliases = "\n".join(
+            f'i{iss["number"]}: issue(number: {iss["number"]}) {{'
+            f' timelineItems(itemTypes: [CLOSED_EVENT], last: 1) {{'
+            f'  nodes {{ ... on ClosedEvent {{'
+            f'   closer {{ __typename }} }} }} }} }}'
+            for iss in batch
+        )
+        query = f'{{ repository(owner: "{owner}", name: "{name}") {{ {aliases} }} }}'
+        try:
+            result = subprocess.run(
+                ["gh", "api", "graphql", "-f", f"query={query}"],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                continue
+            data = json.loads(result.stdout).get("data", {}).get("repository", {})
+        except Exception:
+            continue
+
+        number_to_issue = {iss["number"]: iss for iss in batch}
+        for iss in batch:
+            key = f"i{iss['number']}"
+            nodes = data.get(key, {}).get("timelineItems", {}).get("nodes", [])
+            node = nodes[0] if nodes else None
+            typename = (node or {}).get("closer", {}) or {}
+            typename = typename.get("__typename") if isinstance(typename, dict) else None
+            iss["closer_type"] = typename  # 'PullRequest', 'Commit', or None
 
 
 def fetch_ci_runs(repo: str, since: str, until: str, limit: int = 1000,
@@ -217,11 +262,27 @@ def compute_issue_stats(issue: dict) -> dict:
         gap = _hours(_parse_dt(ext[i]["createdAt"]) - _parse_dt(ext[i-1]["createdAt"]))
         inter_comment_hours.append(gap)
 
+    closer_type = issue.get("closer_type")  # 'PullRequest', 'Commit', or None
+    state_reason = issue.get("stateReason")  # 'COMPLETED', 'NOT_PLANNED', or None
+
+    # Classify how the issue was resolved (only meaningful for closed issues)
+    if issue["state"] == "CLOSED":
+        if closer_type in ("PullRequest", "Commit"):
+            close_reason = "pr_or_commit"   # closed by a PR / merge commit — normal
+        elif state_reason == "NOT_PLANNED":
+            close_reason = "not_planned"    # explicitly marked won't-fix/duplicate
+        else:
+            close_reason = "manual"         # closed via UI with no PR or commit
+    else:
+        close_reason = None
+
     return {
         "number": issue["number"],
         "title": issue["title"],
         "author": author,
         "state": issue["state"],
+        "state_reason": state_reason,
+        "close_reason": close_reason,
         "created_at": issue["createdAt"],
         "closed_at": issue.get("closedAt"),
         "first_comment_hours": first_comment_hours,
@@ -342,13 +403,18 @@ def aggregate_issue_stats(issue_stats: list[dict]) -> dict:
     close_vals         = [s["time_to_close_hours"] for s in issue_stats if s["time_to_close_hours"] is not None]
     closed             = [s for s in issue_stats if s["state"] == "CLOSED"]
 
+    # Break down closed-no-comment issues by how they were closed
+    closed_no_comment = [s for s in closed if s["first_comment_hours"] is None]
     return {
         "total_issues": len(issue_stats),
         "open_issues": sum(1 for s in issue_stats if s["state"] == "OPEN"),
         "closed_issues": len(closed),
         "issues_with_comments": sum(1 for s in issue_stats if s["first_comment_hours"] is not None),
         "issues_without_comments": sum(1 for s in issue_stats if s["first_comment_hours"] is None),
-        "closed_without_comments": sum(1 for s in closed if s["first_comment_hours"] is None),
+        "closed_no_comment_total": len(closed_no_comment),
+        "closed_no_comment_by_pr_or_commit": sum(1 for s in closed_no_comment if s.get("close_reason") == "pr_or_commit"),
+        "closed_no_comment_not_planned":     sum(1 for s in closed_no_comment if s.get("close_reason") == "not_planned"),
+        "closed_no_comment_manual":          sum(1 for s in closed_no_comment if s.get("close_reason") == "manual"),
         "first_comment": _distribution(first_comment_vals),
         "inter_comment": _distribution(inter_comment_vals),
         "comment_count_dist": _comment_count_dist(issue_stats),
@@ -389,12 +455,19 @@ def print_pr_comparison(before: dict, after: dict, bl: str, al: str) -> None:
 def print_issue_summary(agg: dict, label: str = "") -> None:
     title = f"Issue traction — {label}" if label else "Issue traction"
     _hdr(title)
+    cnc   = agg['closed_no_comment_total']
+    by_pr = agg['closed_no_comment_by_pr_or_commit']
+    notpl = agg['closed_no_comment_not_planned']
+    manl  = agg['closed_no_comment_manual']
+
     print(f"  Issues in window:          {agg['total_issues']}")
     print(f"  Open:                      {agg['open_issues']}")
     print(f"  Closed:                    {agg['closed_issues']}")
     print(f"  With external comments:    {agg['issues_with_comments']}")
     print(f"  No external comments:      {agg['issues_without_comments']}")
-    print(f"  Closed w/o any comment:    {agg['closed_without_comments']}")
+    print(f"    ↳ closed by PR/commit:   {by_pr}  (visible cross-link — normal)")
+    print(f"    ↳ closed as not-planned: {notpl}  (won't-fix/duplicate — expected)")
+    print(f"    ↳ closed manually, no PR:{manl}  ← real concern")
     print()
     _print_dist(agg["first_comment"], "Time to first comment  (issue open → first external comment)")
     _print_dist(agg["inter_comment"], "Subsequent comment gap  (time between consecutive external comments)")

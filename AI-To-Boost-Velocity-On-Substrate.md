@@ -22,7 +22,7 @@ Flakiness is a direct velocity tax on every contributor and the most acute probl
 The speed of engagement on issues that do get attention is improving. The structural problem is coverage — and it is getting worse as volume grows.
 
 - **Issue engagement rate collapsed from 78% → 48%** as issue volume grew 35% from May–Jun to Jul–Aug. The absolute number of issues receiving any comment barely changed while the queue grew — maintainer bandwidth is not scaling.
-- **40% of closed issues had no comment thread.** Note: this metric counts explicit GitHub comments only — issues closed via a PR merge show a visible cross-link event instead of a comment, which is normal GitHub practice and not a concern. The real signal is issues closed with *neither* a PR link *nor* a comment — those are worth investigating.
+- **40% of closed issues had no comment thread** — but 34 of those 40 were closed by a PR/commit cross-link (normal GitHub practice, the link is visible). Only **6 issues (2%)** were closed manually with no PR and no comment. Not a systemic problem.
 - **45% of issues that do get a comment receive only 1.** Single-touch triage is the norm, not sustained discussion.
 
 ### 3. PR Velocity
@@ -242,7 +242,9 @@ Time from issue opened to issue closed (closed issues only).
 
 | Metric | Value |
 |---|---|
-| Closed with no comment thread | 39 / 97 (40%) |
+| Closed with no comment thread | 40 / 98 (41%) |
+| &nbsp;&nbsp;↳ closed by PR/commit (normal) | 34 |
+| &nbsp;&nbsp;↳ closed manually, no PR/comment | **6** ← real concern |
 | Median | 3.6d |
 | p75 | 11.2d |
 | p90 | 41.0d |
