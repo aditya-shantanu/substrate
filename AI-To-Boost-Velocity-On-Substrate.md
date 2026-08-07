@@ -35,11 +35,7 @@ The least critical area — direction is positive. First-review latency improved
 
 ## Plan
 
-The plan has two horizons. The short term is concrete and executable now. The long term is an architectural bet: agents as autonomous contributors that own a metric rather than a task.
-
----
-
-### Short Term — Scheduled CI Failure Agent
+### 1. CI / Test Flakiness — Short Term
 
 Wire `hack/metrics/ci-failure-analysis.py` into a GitHub Actions scheduled workflow that runs every N hours and acts on its own findings. The agent operates exactly like a human contributor — it can only open issues and send PRs. It has no direct write access to the repo.
 
@@ -52,7 +48,7 @@ Wire `hack/metrics/ci-failure-analysis.py` into a GitHub Actions scheduled workf
    - Agent reads the test source and failure log
    - Proposes a fix (race fix, deterministic setup, retry guard, etc.)
    - Opens a PR linked to the issue
-4. For `no free workers` failures: open a single tracking issue (not per-test) flagging the envtest setup as the root cause — this needs human investigation, not a code fix
+4. For `no free workers` failures: open a single tracking issue (not per-test) flagging the envtest setup as the root cause — needs human investigation, not a code fix
 5. Close registry entries for tests that have been clean for 10+ consecutive runs
 
 **Current known flakes to seed the registry (Aug 2026):**
@@ -65,28 +61,70 @@ Wire `hack/metrics/ci-failure-analysis.py` into a GitHub Actions scheduled workf
 | `TestSyncer_UpdateWorker_RetryOnVersionConflict` | 2 | unit |
 | `TestLoaderConcurrentHandshakes` | 2 | unit |
 
-**Success metric:** main branch CI failure rate drops from 23.6% toward 0. Measure with `pr-review-metrics.py ci-compare` after 30 days.
+**Success metric:** main CI failure rate drops from 23.6% toward 0. Measure with `pr-review-metrics.py ci-compare` after 30 days.
 
 ---
 
-### Long Term — Metric-Driven Autonomous Contributors
+### 2. PR Review — Short Term
 
-Rather than scripting specific actions, give each agent a high-level metric and let it figure out how to move it. The agent behaves like any other contributor: it reads the codebase, writes scripts, files issues, and opens PRs. It cannot merge its own PRs, cannot push to protected branches, and cannot take any action a regular external contributor couldn't take. The existing review process is the safety layer.
+Work with TLs to define and build a **PR review skill** — a Claude Code slash command that, given a PR, produces a structured review: summary of changes, correctness concerns, test coverage gaps, and a recommendation (approve / request changes / needs discussion).
 
-**Example agents:**
+> **Note:** A `/review` skill already exists in Claude Code for GitHub PRs. Evaluate whether it fits the substrate codebase's conventions (Go, Kubernetes, actor model patterns) or needs a project-specific variant with substrate-specific guidance baked in.
+
+Once the skill is validated by TLs, wire it into a GitHub Actions workflow triggered on PR open and push:
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize]
+```
+
+**Per trigger:**
+1. Agent runs the PR review skill against the diff
+2. Posts the review as a PR comment (not a blocking review — advisory only until quality is validated)
+3. If the PR has no linked issue, flags it per the PR etiquette guidelines (PR #722)
+
+**Success metric:** % of PRs with at least one review increases from 77% → 90%+. The agent covers the long tail of PRs that currently get no human attention.
+
+---
+
+### 3. Issue Triage — Short Term
+
+Work with TLs to define and build an **issue triage skill** — there is no existing one. The skill, given an issue, should: identify if it's a duplicate, suggest relevant labels, ask for missing repro information, and post an initial acknowledgement so the reporter knows it was seen.
+
+> **Note:** No issue triage skill currently exists in Claude Code. This needs to be created. The skill should be substrate-aware: know the component areas (atelet, atenet, ateapi, ateomnet, etc.) so it can label and route correctly.
+
+Once the skill is ready, wire it into a GitHub Actions workflow triggered on issue open and edit:
+
+```yaml
+on:
+  issues:
+    types: [opened, edited]
+```
+
+**Per trigger:**
+1. Agent runs the issue triage skill
+2. Posts a triage comment: acknowledgement, labels applied, follow-up questions if repro is missing, duplicate link if found
+3. Assigns to the relevant component owner if the area is identifiable
+
+**Success metric:** issue engagement rate increases from 48% → 80%+. The agent ensures every issue gets at least one substantive response within minutes of filing.
+
+---
+
+## Long Term — Metric-Driven Autonomous Contributors
+
+This applies across all three areas. Rather than scripting specific actions, give each agent a high-level metric and let it figure out how to move it. The agent behaves like any other contributor: it reads the codebase, writes scripts, files issues, and opens PRs. It cannot merge its own PRs, cannot push to protected branches, and cannot take any action a regular external contributor couldn't take. The existing review process is the safety layer.
 
 | Agent | Metric | Allowed actions |
 |---|---|---|
 | Flakiness agent | Main CI failure rate < 2% | File issues, open PRs fixing failing tests |
-| Coverage agent | No net regression in test coverage on merge | Open PRs adding missing test cases |
-| Review latency agent | p90 first-review < 24h | Ping stale PRs, suggest reviewers, file process issues |
-| Issue triage agent | < 20% of issues have no comment after 48h | Comment with triage, tag, suggest duplicates |
+| Coverage agent | No net regression in test coverage | Open PRs adding missing test cases |
+| Review agent | p90 first-review < 24h | Review PRs, ping stale ones, suggest reviewers |
+| Triage agent | < 20% of issues uncommented after 48h | Triage, label, comment, surface duplicates |
 
-Each agent runs on a schedule, measures its own metric, decides whether to act, and acts if the metric is off target. Maintainers review and merge (or reject) the PRs like any other contribution.
+Each agent runs on a schedule, measures its own metric, decides whether to act, and acts if the metric is off-target. Maintainers review and merge (or reject) the output like any other contribution.
 
-The key design principle: **the metric is the contract, not the implementation.** Agents can create new scripts, refactor test utilities, restructure test setup — whatever moves the metric. This avoids the brittleness of scripted automation and lets the agents adapt as the codebase evolves.
-
-<!-- Fill in: Issue Velocity and PR Velocity plans -->
+**The metric is the contract, not the implementation.** Agents can create new scripts, refactor test utilities, restructure test setup — whatever moves the number. This avoids the brittleness of scripted automation and lets agents adapt as the codebase evolves.
 
 ---
 
