@@ -35,48 +35,58 @@ The least critical area — direction is positive. First-review latency improved
 
 ## Plan
 
-### CI / Test Flakiness
+The plan has two horizons. The short term is concrete and executable now. The long term is an architectural bet: agents as autonomous contributors that own a metric rather than a task.
 
-The failure analysis script (`hack/metrics/ci-failure-analysis.py`) classifies CI failures by root cause rather than just counting branch-level flakiness. Run it first to confirm the breakdown hasn't shifted before acting:
+---
 
-```bash
-python3 hack/metrics/ci-failure-analysis.py \
-  --repo agent-substrate/substrate \
-  --fetch-limit 500 --sample 40 \
-  --save /tmp/ci-failure-breakdown.json
-```
+### Short Term — Scheduled CI Failure Agent
 
-**Current breakdown (40 sampled failed runs, Aug 2026):**
+Wire `hack/metrics/ci-failure-analysis.py` into a GitHub Actions scheduled workflow that runs every N hours and acts on its own findings. The agent operates exactly like a human contributor — it can only open issues and send PRs. It has no direct write access to the repo.
 
-| Category | Count | Action |
+**Per run:**
+1. Run `ci-failure-analysis.py` to classify the latest failed runs
+2. For each newly seen named test failure not already in `hack/metrics/flaky-registry.json`:
+   - Open a GitHub issue with the test name, failure log excerpt, and fail count
+   - Record the issue number in `flaky-registry.json`
+3. For the top-3 unresolved unit test flakes (by frequency):
+   - Agent reads the test source and failure log
+   - Proposes a fix (race fix, deterministic setup, retry guard, etc.)
+   - Opens a PR linked to the issue
+4. For `no free workers` failures: open a single tracking issue (not per-test) flagging the envtest setup as the root cause — this needs human investigation, not a code fix
+5. Close registry entries for tests that have been clean for 10+ consecutive runs
+
+**Current known flakes to seed the registry (Aug 2026):**
+
+| Test | Failures | Category |
 |---|---|---|
-| Named Go test failures | 20 / 40 (50%) | Fix the specific tests below |
-| No free workers (envtest contention) | 12 / 40 (30%) | Fix test setup, not the tests |
-| E2e timeout / 503 | 2 / 40 (5%) | Retry wrapper or runner improvement |
-| Unclassified | 6 / 40 (15%) | Investigate manually |
+| `TestDurableDirLifecycle` | 6 | unit |
+| `TestActorLifecycle` | 4 | unit |
+| `TestMultipleDurableDirLifecycle` | 2 | unit |
+| `TestSyncer_UpdateWorker_RetryOnVersionConflict` | 2 | unit |
+| `TestLoaderConcurrentHandshakes` | 2 | unit |
 
-**Specific tests failing (by frequency):**
-- `TestDurableDirLifecycle` — 6×
-- `TestActorLifecycle` — 4×
-- `TestMultipleDurableDirLifecycle` — 2×
-- `TestSyncer_UpdateWorker_RetryOnVersionConflict` — 2×
-- `TestLoaderConcurrentHandshakes` — 2×
+**Success metric:** main branch CI failure rate drops from 23.6% toward 0. Measure with `pr-review-metrics.py ci-compare` after 30 days.
 
-**Planned agent pipeline (per N hours):**
+---
 
-```
-ci-failure-analysis.py
-  → for each new named test failure not in flaky-registry.json:
-      file GitHub issue (with failure log excerpt)
-      add to registry (test → issue number)
-  → for top-3 unit test flakes:
-      agent reads test + failure log → opens PR with fix
-  → for "no free workers" failures:
-      fix is in test setup (not the test) → separate manual investigation
-  → update registry (close issues for tests clean for 10+ runs)
-```
+### Long Term — Metric-Driven Autonomous Contributors
 
-<!-- Fill in remaining sections: Issue Velocity plan, PR Velocity plan -->
+Rather than scripting specific actions, give each agent a high-level metric and let it figure out how to move it. The agent behaves like any other contributor: it reads the codebase, writes scripts, files issues, and opens PRs. It cannot merge its own PRs, cannot push to protected branches, and cannot take any action a regular external contributor couldn't take. The existing review process is the safety layer.
+
+**Example agents:**
+
+| Agent | Metric | Allowed actions |
+|---|---|---|
+| Flakiness agent | Main CI failure rate < 2% | File issues, open PRs fixing failing tests |
+| Coverage agent | No net regression in test coverage on merge | Open PRs adding missing test cases |
+| Review latency agent | p90 first-review < 24h | Ping stale PRs, suggest reviewers, file process issues |
+| Issue triage agent | < 20% of issues have no comment after 48h | Comment with triage, tag, suggest duplicates |
+
+Each agent runs on a schedule, measures its own metric, decides whether to act, and acts if the metric is off target. Maintainers review and merge (or reject) the PRs like any other contribution.
+
+The key design principle: **the metric is the contract, not the implementation.** Agents can create new scripts, refactor test utilities, restructure test setup — whatever moves the metric. This avoids the brittleness of scripted automation and lets the agents adapt as the codebase evolves.
+
+<!-- Fill in: Issue Velocity and PR Velocity plans -->
 
 ---
 
