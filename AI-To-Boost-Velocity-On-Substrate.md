@@ -2,7 +2,7 @@
 
 **Baseline captured:** 2026-08-07  
 **Window:** Full repo history — 2026-05-13 to 2026-08-07  
-**Script:** `hack/metrics/pr-review-metrics.py`
+**Scripts:** [`hack/metrics/pr-review-metrics.py`](https://github.com/aditya-shantanu/substrate/blob/docs/velocity-metrics/hack/metrics/pr-review-metrics.py) · [`hack/metrics/ci-failure-analysis.py`](https://github.com/aditya-shantanu/substrate/blob/docs/velocity-metrics/hack/metrics/ci-failure-analysis.py) — branch: [`docs/velocity-metrics`](https://github.com/aditya-shantanu/substrate/tree/docs/velocity-metrics)
 
 ---
 
