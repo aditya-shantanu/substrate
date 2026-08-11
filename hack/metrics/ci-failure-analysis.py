@@ -22,8 +22,8 @@ from failed runs and classifies each failure into one of several categories:
 
   no_free_workers   — envtest/integration tests fail because no worker is assigned
                       ("no free workers available") — resource contention in tests
-  e2e_timeout       — e2e tests time out waiting for actor/service responses (503s,
-                      connection resets, kubectl wait timeouts)
+  e2e_timeout       — e2e tests time out waiting for actor/service responses or
+                      kubectl wait conditions; upstream connect errors
   gcs_access        — GCS/S3 bucket access denied or not found when fetching
                       sandbox assets (credential/IAM issue)
   named_test_fail   — a specific Go test emitted "--- FAIL: TestName"
@@ -143,8 +143,8 @@ def analyse(repo: str, fetch_limit: int, sample: int, workflow: str) -> dict:
                             "--jq", "[.jobs[] | select(.conclusion==\"failure\") | {id,name}]")
         except SystemExit:
             results.append({"run_id": run_id, "branch": branch, "event": event,
-                            "category": "unknown", "detail": None, "job": None})
-            category_counts["unknown"] += 1
+                            "category": "log_fetch_failed", "detail": None, "job": None})
+            category_counts["log_fetch_failed"] += 1
             continue
 
         if not jobs:
@@ -188,7 +188,7 @@ def print_report(data: dict) -> None:
 
     labels = {
         "no_free_workers":  "No free workers         (envtest resource contention)",
-        "e2e_timeout":      "E2e timeout / 503       (kind cluster infrastructure)",
+        "e2e_timeout":      "E2e timeout             (actor/condition wait; upstream connect)",
         "gcs_access":       "GCS/S3 access denied    (credential / IAM)",
         "license_check":    "License check diff      (hack/verify/licenses.sh)",
         "verify_fail":      "Other verify failure    (hack/verify-all.sh)",
