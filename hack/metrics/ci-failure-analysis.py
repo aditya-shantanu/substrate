@@ -27,8 +27,8 @@ from failed runs and classifies each failure into one of several categories:
   gcs_access        — GCS/S3 bucket access denied or not found when fetching
                       sandbox assets (credential/IAM issue)
   named_test_fail   — a specific Go test emitted "--- FAIL: TestName"
-  license_check     — hack/verify/licenses.sh detects uncommitted LICENSES changes
-  verify_fail       — other hack/verify-all.sh step failed
+  verify_fail       — hack/verify-all.sh reported "Verification failed" or a diff
+  license_check     — hack/verify/licenses.sh specifically produced a diff
   log_fetch_failed  — job log could not be fetched (expired, rate-limited, etc.)
   unknown           — log fetched but could not be classified
 
@@ -84,12 +84,19 @@ def _gh_text(*args: str) -> Optional[str]:
 # ── failure classification ────────────────────────────────────────────────────
 
 # Ordered: first match wins.
-# Infrastructure patterns come before named_test_fail so that an envtest run
-# that dies on "no free workers available" is not mis-attributed to the Go
-# test that happened to print "--- FAIL:" before crashing. Generic timeout
-# strings ("deadline exceeded", "connection reset") are intentionally omitted
-# from e2e_timeout: they appear in ordinary unit-test output and would
-# over-trigger when this pattern fires before named_test_fail.
+#
+# - Infrastructure patterns (no_free_workers, e2e_timeout, gcs_access) come
+#   first so that an envtest run that dies on "no free workers available" is not
+#   mis-attributed to the Go test that printed "--- FAIL:" before crashing.
+# - named_test_fail comes before verify_fail: if a specific test name is
+#   available it is more useful than a generic "verify failed". verify_fail's
+#   old `hack/verify` substring matched the Actions command-echo line
+#   ("Run hack/verify-all.sh"), causing almost every verify job to be swallowed
+#   as verify_fail even when a named Go test was the real cause. The pattern
+#   is now narrowed to match only explicit failure output from verify scripts.
+# - Generic timeout strings ("deadline exceeded", "connection reset") are
+#   intentionally omitted from e2e_timeout: they appear in ordinary unit-test
+#   output and would over-trigger when infra patterns fire before named_test_fail.
 _PATTERNS = [
     ("no_free_workers", re.compile(r'no free workers available', re.IGNORECASE)),
     ("e2e_timeout",     re.compile(
@@ -99,8 +106,8 @@ _PATTERNS = [
         r'|upstream connect error', re.IGNORECASE)),
     ("gcs_access",      re.compile(r'AccessDenied|NoSuchBucket|storage\.objects\.get', re.IGNORECASE)),
     ("license_check",   re.compile(r'verify/licenses\.sh resulted in a diff', re.IGNORECASE)),
-    ("verify_fail",     re.compile(r'hack/verify|resulted in a diff', re.IGNORECASE)),
     ("named_test_fail", re.compile(r'^--- FAIL: (\S+)', re.MULTILINE)),
+    ("verify_fail",     re.compile(r'Verification failed|resulted in a diff', re.IGNORECASE)),
 ]
 
 
