@@ -111,8 +111,13 @@ _PATTERNS = [
 ]
 
 
+# Extracted so analyse() can findall() all failing test names without
+# re-searching the log after classify() already determined the category.
+_NAMED_TEST_RE = next(p for _, p in _PATTERNS if _ == "named_test_fail")
+
+
 def classify(log: str) -> tuple[str, Optional[str]]:
-    """Return (category, detail). detail is the test name for named_test_fail."""
+    """Return (category, detail). detail is the first failing test for named_test_fail."""
     for category, pattern in _PATTERNS:
         m = pattern.search(log)
         if m:
@@ -169,8 +174,9 @@ def analyse(repo: str, fetch_limit: int, sample: int, workflow: str) -> dict:
         else:
             category, detail = classify(log)
         category_counts[category] += 1
-        if category == "named_test_fail" and detail:
-            test_fail_counts[detail] += 1
+        if category == "named_test_fail" and log is not None:
+            for test in _NAMED_TEST_RE.findall(log):
+                test_fail_counts[test] += 1
         by_category[category].append({"run_id": run_id, "branch": branch,
                                       "event": event, "job": job["name"],
                                       "detail": detail})
