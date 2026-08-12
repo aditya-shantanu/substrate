@@ -40,6 +40,7 @@ Thumbs.db
 .copilot/
 .cursor/
 .gemini/
+!.gemini/styleguide.md
 .goose/
 .kiro/
 .opencode/
