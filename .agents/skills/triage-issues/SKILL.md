@@ -110,6 +110,13 @@ capacity, or researching unknowns before any code is written, it is `kind/design
 Keywords: "Design discussion", "Investigate", "Explore options", "Identify what",
 "Measure", "Research".
 
+The clearest way to distinguish `kind/design` from `kind/feature`:
+- **`kind/feature`**: you could open a PR today — the *what* and *how* are known.
+- **`kind/design`**: a decision or investigation must happen first; a PR cannot be written yet.
+
+When in doubt, ask: *"Could someone reasonably start coding this issue right now?"*
+If yes → `kind/feature`. If no → `kind/design`.
+
 **4. Is it a code quality improvement with no behavior change?**
 Refactoring, renaming, consolidating duplicated code, removing dead code → `kind/cleanup`.
 
