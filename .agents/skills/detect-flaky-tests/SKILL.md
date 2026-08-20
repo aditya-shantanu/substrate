@@ -2,9 +2,10 @@
 name: detect-flaky-tests
 description: >
   Detects flaky Go tests by analyzing GitHub Actions workflow runs across the last 7 days
-  and all PRs. For each newly-detected flaky test, opens a GitHub issue with full evidence
-  and a draft fix PR. Does not touch BigQuery, dashboards, or any external storage —
-  those are cron-job concerns layered on top.
+  and all PRs — covering both the run-tests job (unit/integration) and the e2e-test job
+  (gVisor and microVM lanes). For each newly-detected flaky test or infra issue, opens a
+  GitHub issue with full evidence and a draft fix PR. Does not touch BigQuery, dashboards,
+  or any external storage — those are cron-job concerns layered on top.
 ---
 
 # Detect Flaky Tests
@@ -25,60 +26,119 @@ A test is flagged only when **all three** conditions hold in the 7-day window:
 | `pass_count >= 2` | One pass could be a pre-fix lucky run |
 | `0.05 < fail_rate < 0.95` | Outside this band it is either reliably broken or reliably passing |
 
+---
+
 ## Step 1 — Collect workflow run IDs (last 7 days)
 
 ```bash
-# List completed runs of pr-workflow for the last 7 days
 SINCE=$(date -u -v-7d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
 gh api "repos/agent-substrate/substrate/actions/workflows/pr-workflow.yaml/runs?status=completed&per_page=100&created=>=$SINCE" \
   --jq '.workflow_runs[] | {id: .id, conclusion: .conclusion, head_sha: .head_sha, created_at: .created_at}'
 ```
 
-Collect the run IDs. You only need runs that completed (success or failure — both contain test output).
+Collect all run IDs. Process both successful and failed runs — both contain test output.
 
-## Step 2 — Download and parse test logs per run
+---
 
-For each run ID, find the `run-tests` job and download its log:
+## Step 2 — Download and parse logs: three job targets per run
+
+For each run, you need logs from **three jobs**:
+
+| Job name | Coverage |
+|---|---|
+| `run-tests` | Unit + integration tests (`go test -race -v ./...`) |
+| `e2e-test` (gVisor lane) | E2E suite, gVisor sandbox class |
+| `e2e-test` (microVM lane) | E2E suite, microVM sandbox class (`E2E_SANDBOX_CLASS=microvm`) |
 
 ```bash
-# Get job ID for the run-tests job
+# List all jobs for a run
 gh api "repos/agent-substrate/substrate/actions/runs/<RUN_ID>/jobs" \
-  --jq '.jobs[] | select(.name == "run-tests") | {id: .id, conclusion: .conclusion}'
+  --jq '.jobs[] | {id: .id, name: .name, conclusion: .conclusion}'
 
-# Download the log (returns a redirect to a zip)
-gh api "repos/agent-substrate/substrate/actions/jobs/<JOB_ID>/logs" > /tmp/run_<RUN_ID>.log
+# Download log for a specific job
+gh api "repos/agent-substrate/substrate/actions/jobs/<JOB_ID>/logs" > /tmp/job_<JOB_ID>.log
 ```
 
-Parse `go test -v` output. Each test result appears as one of:
-```
---- PASS: TestFoo (0.12s)
---- FAIL: TestBar (1.23s)
---- SKIP: TestBaz (0.00s)
-```
+There may be multiple jobs named `e2e-test` in the same run (matrix). Distinguish them by
+inspecting the log for `E2E_SANDBOX_CLASS=microvm` (microVM lane) vs. its absence (gVisor lane),
+or by the step names in the job detail.
 
-Extract `(PASS|FAIL)` and the test name. Ignore SKIP. The package is on the preceding
-`=== RUN   TestFoo` line's context or from `ok  \tgithub.com/agent-substrate/substrate/...`
-lines above.
-
-Quick extraction pattern (adapt as needed):
+Parse `go test -v` output from each log:
 ```bash
-grep -E '^--- (PASS|FAIL): ' /tmp/run_<RUN_ID>.log \
-  | awk '{print $2, $3}' \
-  | sed 's/://'
+grep -E '^--- (PASS|FAIL): ' /tmp/job_<JOB_ID>.log \
+  | awk '{print $2, $3}' | sed 's/://'
 ```
 
-## Step 3 — Aggregate across all runs
+Track results per (test_name, job_type) where job_type is one of:
+`unit`, `e2e-gvisor`, `e2e-microvm`.
 
-Build a per-test-name table:
+---
 
-| test_name | package | fail_count | pass_count | total_runs |
+## Step 3 — Infra issue triage (do this BEFORE aggregating flakiness)
+
+An infra failure is when the job itself breaks before or during setup — not when a test
+produces FAIL output. Infra failures must be identified and reported separately; they do
+NOT count toward a test's fail_count.
+
+### How to detect an infra failure
+
+A job log is an **infra failure** (not a test failure) when it contains ANY of:
+
+| Signal | Example log pattern |
+|---|---|
+| Go module proxy error | `INTERNAL_ERROR`, `proxy.golang.org: dial`, `go mod download: ...500` |
+| kind cluster creation failure | `ERROR: failed to create cluster`, `node(s) not ready`, `timed out waiting for the condition` |
+| Image pull failure | `failed to pull image`, `ErrImagePull`, `ImagePullBackOff` |
+| Docker/containerd failure | `failed to start containerd`, `Error response from daemon` |
+| OOM / out of disk | `OOMKilled`, `No space left on device` |
+| Network/DNS failure in setup | `dial tcp: lookup`, `connection refused` during setup steps (not inside a test) |
+| No test output at all | Log ends before any `--- PASS` or `--- FAIL` line appears |
+| Setup step non-zero exit | A step before the `go test` or `hack/run-e2e-kind.sh` command fails |
+
+**Critical rule:** If a job log contains `--- FAIL: TestFoo` AND infra error patterns, you
+must determine which came first chronologically. If the infra error appears before the first
+test ran, treat the whole job as an infra failure (zero test results). If tests started
+running and then an infra error interrupted them mid-run, count only the completed test
+results and note the truncation.
+
+### Triple-check protocol
+
+For any run where you suspect an infra issue, verify it three ways:
+
+1. **Pattern match**: does the log contain one of the signals above?
+2. **Timeline check**: does the error appear before `=== RUN   Test` lines, or between test completions?
+3. **Cross-run consistency**: did the same infra error appear in ≥2 other runs around the same time? If yes, it is definitely infrastructure. If it appeared only once, it may be a transient fluke — still classify as infra but flag lower confidence.
+
+### Infra issue aggregation
+
+Collect infra failures separately:
+
+| infra_pattern | job_type | fail_count | example_run_ids |
+|---|---|---|---|
+| `proxy.golang.org INTERNAL_ERROR` | unit | 4 | [run_1, run_2, ...] |
+| `kind cluster: node(s) not ready` | e2e-gvisor | 2 | [run_5, ...] |
+
+An infra pattern that appears in ≥2 runs warrants a GitHub issue (Step 5b).
+
+---
+
+## Step 4 — Aggregate test flakiness across runs
+
+Using only the runs NOT classified as infra failures, build a per-test table:
+
+| test_name | job_type | fail_count | pass_count | total_runs |
 |---|---|---|---|---|
+
+**Treat each lane independently.** A test that is flaky only in `e2e-gvisor` is still
+flagged — it does not need to be flaky in `e2e-microvm` too.
 
 Apply the threshold: `fail_count >= 2 AND pass_count >= 2 AND 0.05 < fail_rate < 0.95`.
 
-## Step 4 — Deduplicate against open issues
+---
 
-Before creating a new issue, check whether one already exists:
+## Step 5a — Create issues for flaky tests
+
+Before creating, check for an existing open issue:
 
 ```bash
 gh issue list \
@@ -89,10 +149,7 @@ gh issue list \
   --json number,title
 ```
 
-Only proceed to issue creation and fix PR if no open issue title matches
-`flaky: <TEST_NAME>`.
-
-## Step 5 — Create a GitHub issue for each new flaky test
+If none exists, create:
 
 ```bash
 gh issue create \
@@ -103,7 +160,7 @@ gh issue create \
 ## Flaky test detected
 
 **Test:** `<TEST_NAME>`
-**Package:** `<PACKAGE>`
+**Job:** `<e2e-gvisor | e2e-microvm | unit>`
 
 ### Evidence (last 7 days)
 
@@ -113,47 +170,97 @@ gh issue create \
 | Failures | <FAIL_COUNT> |
 | Passes | <PASS_COUNT> |
 | Flake rate | <FLAKE_RATE>% |
+| Infra-failure runs excluded | <INFRA_EXCLUDED> |
 
 ### Failing run examples
-
 <links to 2-3 failing runs>
 
 ### Passing run examples
-
 <links to 1-2 passing runs>
 
-### Next steps
+### Infra triage
+Infra failures were excluded before computing this flake rate. The remaining
+failures cannot be explained by cluster setup, image pull, or proxy errors.
 
-A draft fix PR will be (or has been) opened by the detect-flaky-tests agent.
-If the fix is incorrect or the flake is environment-specific, close this issue
-and add a comment explaining why.
+A draft fix PR will be opened by the detect-flaky-tests agent.
 BODY
 )"
 ```
 
-Record the issue URL for the fix PR description.
+---
+
+## Step 5b — Create issues for recurring infra failures
+
+For each infra pattern appearing in ≥2 runs:
+
+```bash
+gh issue list \
+  --repo agent-substrate/substrate \
+  --state open \
+  --search "infra: <PATTERN_SUMMARY>" \
+  --json number,title
+```
+
+If none exists, create:
+
+```bash
+gh issue create \
+  --repo agent-substrate/substrate \
+  --title "infra: <PATTERN_SUMMARY>" \
+  --label "kind/bug,area/dev-infra" \
+  --body "$(cat <<'BODY'
+## Recurring infrastructure failure in CI
+
+**Pattern:** `<infra error pattern>`
+**Job type:** `<unit | e2e-gvisor | e2e-microvm>`
+
+### Evidence
+
+| Metric | Value |
+|---|---|
+| Occurrences in last 7 days | <COUNT> |
+| Example runs | <links> |
+
+### Impact
+
+This failure causes entire CI jobs to abort before tests run. It inflates
+apparent failure rates and masks real test flakiness. Fixing it will improve
+flakiness signal quality.
+
+### Log excerpt
+\`\`\`
+<paste 3-5 lines of the actual error from the log>
+\`\`\`
+BODY
+)"
+```
+
+---
 
 ## Step 6 — Open a draft fix PR for each new flaky test
 
-Read the test source file. Diagnose the likely cause using the patterns below, then
-apply the fix in a new branch and open a draft PR.
+Read the test source file. Diagnose the likely cause using the patterns below (unit tests
+and e2e tests share most root causes, but e2e has additional patterns):
 
 ### Common Go flakiness patterns and fixes
 
 | Pattern | Symptoms | Fix |
 |---|---|---|
-| **Timing / sleep** | Test sleeps for fixed duration then asserts state | Replace `time.Sleep` with `require.Eventually` or `testutil.WaitFor` |
-| **Shared global state** | Test modifies a package-level var without restoring it | Move state into test-local var; use `t.Cleanup` to restore |
-| **Port conflicts** | Test binds `:0` but then hardcodes the port in a second connection | Use the listener's actual address from `ln.Addr()` |
-| **Goroutine leak** | Test spawns goroutines that outlive the test and race the next one | Add `t.Cleanup(cancel)` and wait for goroutines to exit |
-| **File system races** | Parallel tests write to the same temp path | Use `t.TempDir()` (unique per test) instead of a shared path |
-| **Context not cancelled** | Long-running operation not stopped; bleeds into the next test | Pass `t.Context()` (Go 1.21+) or create + cancel a context in `t.Cleanup` |
-| **Order dependency** | Test assumes prior test ran and left data | Make each test self-contained; use `t.Cleanup` to reset state |
+| **Timing / sleep** | `time.Sleep` before an assertion | Replace with `require.Eventually` or `testutil.WaitFor` |
+| **Shared global state** | Package-level var mutated without cleanup | Move to test-local; `t.Cleanup` to restore |
+| **Port conflicts** | Hardcoded port or race on ephemeral port | Use `ln.Addr()` from the actual listener |
+| **Goroutine leak** | Goroutines from one test race the next | `t.Cleanup(cancel)` + wait for goroutines to exit |
+| **File system races** | Shared temp path across parallel tests | Use `t.TempDir()` |
+| **Context not cancelled** | Long operation outlives test | `t.Context()` (Go 1.21+) or `t.Cleanup(cancel)` |
+| **Order dependency** | Test relies on prior test's side effects | Make each test self-contained |
+| **E2E: actor/pod not ready** | Test proceeds before actor reaches Running state | Poll with `require.Eventually` on status, increase timeout with justification |
+| **E2E: resource cleanup race** | Prior test's namespace/actor not fully deleted before next test | Add explicit `WaitForDeletion` in `t.Cleanup` |
+| **E2E: network policy timing** | Policy applied but not yet enforced at assertion time | Retry the connectivity check, not just the policy application |
 
 Steps for the fix PR:
 
 1. Create a branch: `fix/flaky-<test-name-kebab>` from `main`
-2. Edit the test file to apply the fix
+2. Apply the fix
 3. Commit: `fix(tests): resolve flakiness in <TestName>\n\nFixes #<issue_number>`
 4. Open a **draft** PR:
 
@@ -165,7 +272,7 @@ gh pr create \
   --body "$(cat <<'BODY'
 ## Summary
 
-Fixes the flaky test `<TestName>` in `<package>`.
+Fixes the flaky test `<TestName>` in `<package>` (`<job_type>` lane).
 
 **Root cause:** <one sentence>
 **Fix:** <one sentence>
@@ -174,39 +281,51 @@ Closes #<issue_number>
 
 ## Evidence
 
-Flake rate over last 7 days: <FLAKE_RATE>%
+Flake rate over last 7 days: <FLAKE_RATE>% (<FAIL_COUNT> fail / <PASS_COUNT> pass)
+Infra-failure runs excluded from count: <INFRA_EXCLUDED>
 
 Failing runs: <links>
 Passing runs: <links>
 
 ## Test plan
 
-- [ ] Run `go test -race -count=10 ./path/to/package/...` locally to verify the fix is
-      stable under repeated execution
+- [ ] Run `go test -race -count=10 ./path/to/package/...` locally for unit tests
+- [ ] For e2e: re-run the affected suite 3+ times against a kind cluster
 BODY
 )"
 ```
 
+Do not open a fix PR for infra issues — those require infra investigation, not test code changes.
+
+---
+
 ## Step 7 — Report
 
-Output a summary table of what was done:
+Output two tables:
 
-```
-| Test | Package | Flake rate | Issue | Fix PR | Action |
-|---|---|---|---|---|---|
-| TestFoo | pkg/foo | 40% | #NNN | #MMM | created |
-| TestBar | pkg/bar | 25% | #OOO | — | issue only (existing PR) |
-```
+### Flaky tests
 
-If no flaky tests are found, output: `No new flaky tests detected in the last 7 days.`
+| Test | Job | Flake rate | Fail/Pass | Infra excluded | Issue | Fix PR | Action |
+|---|---|---|---|---|---|---|---|
+| TestFoo | e2e-gvisor | 40% | 4/6 | 2 runs | #NNN | #MMM | created |
+
+### Infra issues
+
+| Pattern | Job | Occurrences | Issue | Action |
+|---|---|---|---|---|
+| `proxy.golang.org INTERNAL_ERROR` | unit | 4 | #OOO | created |
+
+If nothing found in either category: `No new flaky tests or infra issues detected.`
+
+---
 
 ## Notes
 
 - This skill does NOT write to BigQuery, update a dashboard, or perform any storage
   operations. Those are handled by the cron job that invokes this skill.
-- Do not flag tests that only fail on `e2e-test` jobs (environment-specific failures
-  are expected); focus on `run-tests` job output unless told otherwise.
-- If log download fails for a run (e.g. logs expired), skip that run and note it in
-  the report.
-- The `--add-label` flag may fail if `area/tests` does not exist on the repo; fall
-  back to omitting labels and add a comment instead.
+- If log download fails for a run (e.g. logs expired after 90 days), skip that run and
+  note it in the report.
+- The `--add-label` flag may fail if a label does not exist on the repo; fall back to
+  omitting labels and add a comment instead.
+- E2E flakiness in one lane (gVisor or microVM) is flagged independently — a test does
+  not need to be flaky in both lanes to warrant an issue.
