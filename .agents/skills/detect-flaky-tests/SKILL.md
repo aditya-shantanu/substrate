@@ -32,23 +32,26 @@ A test is flagged only when **all three** conditions hold in the 7-day window:
 
 ```bash
 SINCE=$(date -u -v-7d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
-gh api "repos/agent-substrate/substrate/actions/workflows/pr-workflow.yaml/runs?status=completed&per_page=100&created=>=$SINCE" \
+gh api --paginate \
+  "repos/agent-substrate/substrate/actions/workflows/pr-workflow.yaml/runs?status=completed&per_page=100&created=>=$SINCE" \
   --jq '.workflow_runs[] | {id: .id, conclusion: .conclusion, head_sha: .head_sha, created_at: .created_at}'
 ```
+
+`--paginate` is required: a typical week has several hundred completed runs (600+ as of
+August 2026), far more than one page of 100.
 
 Collect all run IDs. Process both successful and failed runs — both contain test output.
 
 ---
 
-## Step 2 — Download and parse logs: three job targets per run
+## Step 2 — Download and parse logs: two jobs, three lanes per run
 
-For each run, you need logs from **three jobs**:
+For each run, you need logs from **two jobs**:
 
 | Job name | Coverage |
 |---|---|
 | `run-tests` | Unit + integration tests (`go test -race -v ./...`) |
-| `e2e-test` (gVisor lane) | E2E suite, gVisor sandbox class |
-| `e2e-test` (microVM lane) | E2E suite, microVM sandbox class (`E2E_SANDBOX_CLASS=microvm`) |
+| `e2e-test` | E2E suite, both sandbox classes — two sequential steps in the one job |
 
 ```bash
 # List all jobs for a run
@@ -59,9 +62,13 @@ gh api "repos/agent-substrate/substrate/actions/runs/<RUN_ID>/jobs" \
 gh api "repos/agent-substrate/substrate/actions/jobs/<JOB_ID>/logs" > /tmp/job_<JOB_ID>.log
 ```
 
-There may be multiple jobs named `e2e-test` in the same run (matrix). Distinguish them by
-inspecting the log for `E2E_SANDBOX_CLASS=microvm` (microVM lane) vs. its absence (gVisor lane),
-or by the step names in the job detail.
+The two e2e lanes are NOT a matrix — `e2e-test` is a single job that runs the step
+"Run E2E tests (gVisor)" followed by "Run E2E tests (micro-VM)" (same
+`hack/run-e2e-kind.sh` command, the second with `E2E_SANDBOX_CLASS: microvm`). Split the
+one `e2e-test` job log at the "Run E2E tests (micro-VM)" step boundary: PASS/FAIL lines
+before it belong to the gVisor lane, lines after it to the microVM lane. Because the
+steps are sequential, a gVisor-lane failure means the micro-VM step never ran — record
+no microVM results for that run rather than counting them as failures.
 
 Parse `go test -v` output from each log:
 ```bash
