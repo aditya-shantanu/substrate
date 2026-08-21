@@ -57,18 +57,6 @@ Apply all areas that are touched. Most issues need one or two; a few need more.
 | `area/benchmarking` | Performance benchmarks and capacity measurements (`benchmarking/`) |
 | `area/reliability` | Reliability, stability, error recovery, and uptime concerns |
 
-`area/benchmarking` and `area/reliability` do not exist yet — create them first:
-```bash
-gh label create "area/benchmarking" \
-  --repo agent-substrate/substrate \
-  --description "Performance benchmarks and capacity measurement" \
-  --color "f9d0c4"
-gh label create "area/reliability" \
-  --repo agent-substrate/substrate \
-  --description "Reliability, stability, error recovery, and uptime" \
-  --color "e4e669"
-```
-
 ### `prio/` — priority
 
 Only apply when the issue body or a maintainer comment makes the priority evident.
@@ -133,14 +121,14 @@ necessarily land. A bug in actor scheduling reported via the API is `area/api` +
 
 ### Step 1 — Create missing labels (once)
 
-Check whether `kind/design`, `area/benchmarking`, and `area/reliability` exist before creating them:
+Check whether `kind/design` exists before creating it:
 
 ```bash
 gh label list --repo agent-substrate/substrate --json name \
-  --jq '[.[].name] | contains(["kind/design", "area/benchmarking", "area/reliability"])'
+  --jq '[.[].name] | contains(["kind/design"])'
 ```
 
-Create each if not present using the `gh label create` commands above.
+Create it if not present using the `gh label create` command above.
 
 ### Step 2 — Fetch unlabeled issues first
 
