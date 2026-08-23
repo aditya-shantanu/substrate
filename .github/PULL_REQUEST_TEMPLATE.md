@@ -6,10 +6,3 @@ Fixes #<issue_number>
 ## What changed and why
 
 <!-- Brief description of the change and the reasoning behind it -->
-
-## Checklist
-
-- [ ] Issue is linked above
-- [ ] Tests pass locally (`go test ./...`)
-- [ ] Root-gated tests pass if applicable (`hack/run-root-tests.sh`)
-- [ ] Documentation updated if behavior changed
