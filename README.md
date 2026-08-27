@@ -135,6 +135,11 @@ curl -X POST -H "Host: my-counter-1.demo.actors.resources.substrate.ate.dev" -i 
    go run ./tools/setup-gcp bootstrap
    ```
 
+   On a fresh project this step also creates the atelet Workload Identity IAM
+   grants that snapshots depend on — see
+   [what `create iam` actually grants](tools/setup-gcp/README.md#what-create-iam-actually-grants)
+   to audit them or apply them manually.
+
 4. Deploy the Agent Substrate system to your cluster:
    ```bash
    ./hack/install-ate.sh --deploy-ate-system
