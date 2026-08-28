@@ -65,6 +65,26 @@ go run ./tools/setup-gcp enable apis [flags]
 
 Creates a GKE cluster configured for Agent Substrate.
 
+> [!WARNING]
+> Agent Substrate requires two Kubernetes beta APIs —
+> `certificates.k8s.io/v1beta1/podcertificaterequests` and
+> `certificates.k8s.io/v1beta1/clustertrustbundles` — and GKE only honors
+> `enableK8sBetaApis` **at cluster creation**. Enabling them later on an
+> existing cluster is not recoverable in place: the tool's reconcile path
+> issues the update, but the APIs do not become served — the cluster must be
+> **recreated** with them enabled. `create cluster` sets them for you; if you
+> bring your own cluster, create it with both APIs enabled from the start,
+> e.g.:
+>
+> ```bash
+> gcloud container clusters create "${CLUSTER_NAME}" ... \
+>   --enable-kubernetes-unstable-apis=certificates.k8s.io/v1beta1/podcertificaterequests,certificates.k8s.io/v1beta1/clustertrustbundles
+> ```
+>
+> The symptom of a cluster without them: the install hangs at "Waiting for
+> podcertificate ClusterTrustBundles to be ready" and `kubectl get
+> clustertrustbundles` reports the resource type is not served.
+
 ```bash
 go run ./tools/setup-gcp create cluster [flags]
 ```
