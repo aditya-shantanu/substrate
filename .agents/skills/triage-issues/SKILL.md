@@ -1,6 +1,6 @@
 ---
 name: triage-issues
-description: Triages open GitHub issues by applying the correct labels. Use when asked to triage issues, label issues, or organize the issue backlog. Processes unlabeled issues first, then reviews labeled issues for correctness.
+description: Triages open GitHub issues by applying the correct labels. Use when asked to triage issues, label issues, or organize the issue backlog. Processes unlabeled issues first, then reviews labeled issues for correctness. Proposes all changes for approval before applying anything, and writes an undo script for each run.
 ---
 
 # Triage Issues
@@ -9,6 +9,14 @@ Triage means: read each issue, decide the right labels from the taxonomy below, 
 apply them with `gh issue edit`. Do not remove labels a human has already added unless
 they are clearly wrong. Do not add priority labels unless the issue body or discussion
 makes the priority obvious.
+
+Two hard rules govern every run:
+
+1. **Propose before applying.** Classify everything first and present the full set of
+   proposed changes as a summary for the user to validate. Apply nothing — no labels,
+   no label creation — until the user approves.
+2. **Record an undo.** While applying approved changes, build an undo script that
+   reverses exactly what this run did, and hand the user the command to run it.
 
 ## Label taxonomy
 
@@ -25,7 +33,8 @@ Priority and status labels are optional.
 | `kind/docs` | Documentation only — missing, outdated, or incorrect docs. |
 | `kind/design` | Design discussions, investigations, research, and open questions that must be resolved before implementation. Includes "Design discussion:", "Identify what X should be", "Measure/benchmark X", "Explore options". |
 
-`kind/design` does not exist yet — create it first:
+`kind/design` does not exist yet — include its creation in the proposal, and create it
+during the apply step with:
 ```bash
 gh label create "kind/design" \
   --repo agent-substrate/substrate \
@@ -56,6 +65,15 @@ Apply all areas that are touched. Most issues need one or two; a few need more.
 | `area/demos` | Demo applications in `demos/` |
 | `area/benchmarking` | Performance benchmarks and capacity measurements (`benchmarking/`) |
 | `area/reliability` | Reliability, stability, error recovery, and uptime concerns |
+
+`area/benchmarking` does not exist yet — include its creation in the proposal, and
+create it during the apply step with:
+```bash
+gh label create "area/benchmarking" \
+  --repo agent-substrate/substrate \
+  --description "Performance benchmarks and capacity measurements" \
+  --color "d4c5f9"
+```
 
 ### `prio/` — priority
 
@@ -119,18 +137,23 @@ necessarily land. A bug in actor scheduling reported via the API is `area/api` +
 
 ## Process
 
-### Step 1 — Create missing labels (once)
+Steps 1–3 are read-only. Nothing is written to GitHub until the user approves the
+proposal in Step 3.
 
-Check whether `kind/design` exists before creating it:
+### Step 1 — Check for missing labels
+
+Check whether `kind/design` and `area/benchmarking` exist:
 
 ```bash
 gh label list --repo agent-substrate/substrate --json name \
-  --jq '[.[].name] | contains(["kind/design"])'
+  --jq '[.[].name] | contains(["kind/design", "area/benchmarking"])'
 ```
 
-Create it if not present using the `gh label create` command above.
+Do not create anything yet. If either is missing, list its creation in the proposal.
 
-### Step 2 — Fetch unlabeled issues first
+### Step 2 — Fetch and classify issues
+
+Fetch unlabeled issues first:
 
 ```bash
 gh issue list --repo agent-substrate/substrate \
@@ -139,9 +162,50 @@ gh issue list --repo agent-substrate/substrate \
   --jq '[.[] | select(.labels | length == 0)]'
 ```
 
-### Step 3 — Classify and apply labels
+Classify each one using the guide above. Then scan already-labeled issues for
+obvious gaps:
+- Issues with a `kind/` label but no `area/` label
+- Issues with `area/` labels but no `kind/` label
+- Issues that look like `kind/design` but are filed as `kind/feature`
 
-For each issue, read the title and body, classify using the guide above, then apply:
+Do not propose changes to labels that look reasonable even if you might have chosen
+differently. Only correct clear mismatches (for example, a bug filed as
+`kind/feature`, or a design discussion with no `kind/` label at all).
+
+Only propose labels an issue does not already have, so the undo record in Step 4
+removes exactly what this run added and nothing a human applied earlier.
+
+### Step 3 — Present the proposal and wait for approval
+
+Output a summary of every change you intend to make, then **stop and wait**. Do not
+apply anything in the same turn as the proposal.
+
+```
+## Proposed changes
+
+Labels to create: kind/design, area/benchmarking
+
+| Issue | Title (truncated) | Labels to add |
+|---|---|---|
+| #900 | Implement chain of authenticator... | kind/feature, area/identity, area/api-machinery |
+| #874 | Design discussion: WorkerPool vs... | kind/design, area/scheduling |
+
+### Uncertain (best guess included above, please confirm)
+- #812 — could be kind/bug or kind/design: unclear whether the behavior is intended.
+
+Reply to approve all, or list the issue numbers to change or skip.
+```
+
+List every uncertain issue with the question you could not resolve from the text
+alone. Do not leave those out of the proposal — include your best guess and flag it.
+
+If the user asks for corrections, update the proposal and confirm again. Apply only
+what the user approved.
+
+### Step 4 — Apply approved changes and record the undo
+
+Create any approved missing labels with the `gh label create` commands above, then
+apply labels to each approved issue:
 
 ```bash
 gh issue edit <number> \
@@ -151,20 +215,31 @@ gh issue edit <number> \
 
 Use `--add-label`, not `--label`, so you don't overwrite existing labels.
 
-### Step 4 — Review already-labeled issues
+As you apply, build an undo script at `/tmp/triage-issues-undo-<YYYYMMDD-HHMMSS>.sh`
+containing one line per successfully applied change, reversing it:
 
-After clearing the unlabeled backlog, scan labeled issues for obvious gaps:
-- Issues with a `kind/` label but no `area/` label
-- Issues with `area/` labels but no `kind/` label
-- Issues that look like `kind/design` but are filed as `kind/feature`
+```bash
+#!/usr/bin/env bash
+# Undo record for triage-issues run on 2026-09-04 14:03 UTC.
+# Removes only the labels this run added; labels applied by humans are untouched.
+set -euo pipefail
+gh issue edit 900 --repo agent-substrate/substrate --remove-label "kind/feature,area/identity,area/api-machinery"
+gh issue edit 874 --repo agent-substrate/substrate --remove-label "kind/design,area/scheduling"
+# Label deletions must come last: deleting a label strips it from all issues.
+# Only present if this run created the label.
+gh label delete "kind/design" --repo agent-substrate/substrate --yes
+```
 
-Do not change labels that look reasonable even if you might have chosen differently.
-Only correct clear mismatches (for example, a bug filed as `kind/feature`, or a
-design discussion with no `kind/` label at all).
+Rules for the undo script:
+- Record only changes that actually succeeded, not the full proposal.
+- Include a `--remove-label` line per issue listing exactly the labels this run added.
+- Include `gh label delete` only for labels this run created, and place those lines
+  after all `--remove-label` lines.
+- Make it executable: `chmod +x <script>`.
 
 ### Step 5 — Report
 
-After triaging, output a table:
+After applying, output a table of what was actually done:
 
 ```
 | Issue | Title (truncated) | Labels applied |
@@ -172,9 +247,12 @@ After triaging, output a table:
 | #900 | Implement chain of authenticator... | kind/feature, area/identity, area/api-machinery |
 ```
 
-List any issues you were uncertain about separately, with the question you could not
-resolve from the text alone. Do not leave those unlabeled — apply your best guess and
-flag it.
+Note any approved changes that failed to apply. Then point at the undo record:
+
+```
+To undo everything this run changed:
+  bash /tmp/triage-issues-undo-20260904-140312.sh
+```
 
 ---
 
