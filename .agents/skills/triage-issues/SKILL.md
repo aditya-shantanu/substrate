@@ -33,12 +33,12 @@ Priority and status labels are optional.
 | `kind/docs` | Documentation only — missing, outdated, or incorrect docs. |
 | `kind/design` | Design discussions, investigations, research, and open questions that must be resolved before implementation. Includes "Design discussion:", "Identify what X should be", "Measure/benchmark X", "Explore options". |
 
-`kind/design` does not exist yet — include its creation in the proposal, and create it
-during the apply step with:
+If any label in this taxonomy does not exist on the repo yet, include its creation in
+the proposal and create it during the apply step with:
 ```bash
-gh label create "kind/design" \
+gh label create "<label>" \
   --repo agent-substrate/substrate \
-  --description "Design discussion, investigation, or research required before implementation" \
+  --description "<short description matching the taxonomy table>" \
   --color "c5def5"
 ```
 
@@ -65,15 +65,6 @@ Apply all areas that are touched. Most issues need one or two; a few need more.
 | `area/demos` | Demo applications in `demos/` |
 | `area/benchmarking` | Performance benchmarks and capacity measurements (`benchmarking/`) |
 | `area/reliability` | Reliability, stability, error recovery, and uptime concerns |
-
-`area/benchmarking` does not exist yet — include its creation in the proposal, and
-create it during the apply step with:
-```bash
-gh label create "area/benchmarking" \
-  --repo agent-substrate/substrate \
-  --description "Performance benchmarks and capacity measurements" \
-  --color "d4c5f9"
-```
 
 ### `prio/` — priority
 
@@ -142,14 +133,14 @@ proposal in Step 3.
 
 ### Step 1 — Check for missing labels
 
-Check whether `kind/design` and `area/benchmarking` exist:
+List the repo's labels and compare against the taxonomy above:
 
 ```bash
-gh label list --repo agent-substrate/substrate --json name \
-  --jq '[.[].name] | contains(["kind/design", "area/benchmarking"])'
+gh label list --repo agent-substrate/substrate --limit 100 --json name --jq '.[].name'
 ```
 
-Do not create anything yet. If either is missing, list its creation in the proposal.
+Do not create anything yet. If any taxonomy label is missing, list its creation in
+the proposal.
 
 ### Step 2 — Fetch and classify issues
 
@@ -204,7 +195,7 @@ what the user approved.
 
 ### Step 4 — Apply approved changes and record the undo
 
-Create any approved missing labels with the `gh label create` commands above, then
+Create any approved missing labels with the `gh label create` command above, then
 apply labels to each approved issue:
 
 ```bash
