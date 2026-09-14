@@ -1,0 +1,55 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Worker pool for the openclaw-fleet demo. The ActorTemplate is not a CRD: it
+# lives in openclaw-fleet-template.yaml.tmpl and is created through the ate
+# API with `kubectl ate create actor-template` (see deploy.sh).
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ate-demo-openclaw-fleet
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: openclaw-fleet
+  namespace: ate-demo-openclaw-fleet
+  labels:
+    workload: openclaw-fleet
+spec:
+  # The pool is the concurrency ceiling, not the fleet size: one actor runs
+  # per worker at a time (internal/ateomcapacity), so replicas caps how many
+  # employees can be MID-TURN simultaneously while the fleet itself is
+  # limited only by control-plane capacity. The demo test creates 10+ actors
+  # against these 5 workers to exercise exactly that oversubscription.
+  replicas: ${WORKER_REPLICAS}
+  workerImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
+  sandboxClass: gvisor
+  template:
+    nodeSelector:
+      ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+    # Limits advertise the per-worker capacity ceiling (an actor's limits
+    # must fit inside them); requests are what the kube-scheduler packs
+    # nodes by. OpenClaw is a full Node.js agent runtime, so memory is the
+    # binding dimension — see the actor template's resources.
+    resources:
+      limits:
+        cpu: "2"
+        memory: 2Gi
+      requests:
+        cpu: 500m
+        memory: 2Gi
