@@ -284,6 +284,87 @@ the files in this directory.
     working tree yields a `-dirty` version label that no node carries, so
     demo pools silently never schedule.
 
+## How these gaps compare to agent-sandbox
+
+The same six-requirement exercise was run against the
+[Kubernetes SIG agent-sandbox `openclaw-fleet-gke` example](https://github.com/kubernetes-sigs/agent-sandbox/tree/main/examples/openclaw-fleet-gke)
+(Sandbox / SandboxClaim / SandboxTemplate / SandboxWarmPool CRDs), also
+live-validated on GKE. Mapping the 13 gaps above onto that stack shows most
+of them are the cost of Substrate's core bet — an agent as a checkpointed
+process image under a bespoke control plane — while agent-sandbox's bet (an
+agent as a pod under ordinary Kubernetes) inherits everything Kubernetes
+already solves, and pays with a different gap list.
+
+### The 13 gaps above, on agent-sandbox
+
+| # | Gap here | On agent-sandbox | Why |
+|---|---|---|---|
+| 1 | OpenClaw can't survive gVisor restore (fatal) | Not a gap in its default tier | Native sleep is disk-tier: the pod is deleted and the app *reboots* — no checkpoint fidelity involved; OpenClaw provably survives it (22.3 s wake). Its memory tier (GKE Pod Snapshots) **fails open to a cold start**, never a crash. |
+| 2 | CPU-feature-pinned snapshots, feature-blind scheduling | Same trap, memory tier only, fail-open | Same "same machine series, homogeneous pool, pod-spec-is-the-cache-key" warnings — but a mismatch silently cold-starts instead of wedging; the disk tier is immune. |
+| 3 | Failed restore → wedged worker, undeletable actor, terminal CRASHED | Not a gap | No terminal states: level-triggered CRs with conditions; the claim controller falls back to cold start when a warm candidate misbehaves; pools replace bad spares. Failure degrades, nothing wedges. |
+| 4 | No idle preemption; saturation parks 5 s then 503s | Half shared | Saturation degrades to a cold start (5.7 s) instead of an error. Idle *detection* is caller-driven there too (portal sweeper + absolute `shutdownTime`) — both roadmaps list auto-suspend as planned. |
+| 5 | Immutable templates, lossy repoint, no rollout | Mostly solved | Templates are mutable CRs; `updateStrategy: Recreate` auto-rolls unclaimed warm spares; claimed sandboxes use a rate-limited rebuild (5.2 s downtime). Memory is lost either way, but disk/profile state survives by design. |
+| 6 | Secrets baked into template + golden snapshot | Not a gap | The blueprint is a full `corev1.PodSpec`: `secretKeyRef`/`envFrom`/projected volumes; rotation = rotate the Secret. (Only fleet-shared secrets fit the warm path.) |
+| 7 | No bulk APIs; ~2 s CLI overhead per call | Structurally absent | Everything is a CRD: `kubectl apply` N claims, list/watch, clientsets, Go/Python SDKs. Measured 174 ms warm claims, ~85 creates/s. |
+| 8 | No `kubectl-ate update actor` verb | Structurally absent | No bespoke CLI exists to be incomplete; kubectl over CRDs is complete by construction. |
+| 9 | No exec/cp/debug into actors | Not a gap | Sandbox pod = normal pod: `kubectl exec/cp/logs/debug` all work (which is why this demo needs a probe and that one doesn't). |
+| 10 | Volume capacity unenforced | Shared, with an escape hatch | Its sub-second bind-mount storage shape has the identical gap, documented; but per-sandbox `volumeClaimTemplates` + Filestore multishares give enforced isolation at the cost of ~15 s cold claims. |
+| 11 | Static pools, no autoscaling | Not a gap | `SandboxWarmPool` exposes `/scale` and plugs into HPA/KEDA (shipped examples); over-demand cold-starts rather than 503s. |
+| 12 | ClusterIP-only ingress | Not a gap | Ships a sandbox-router (path routing, WebSockets, TokenReview authz) + Gateway API + optional IAP; only identity→URL authorization is operator glue. |
+| 13 | Node-label/dataplane install footguns | Structurally absent | No node dataplane at all — one controller Deployment from release manifests; new nodes need nothing. |
+
+Scorecard: 10 of 13 are not gaps there (the Kubernetes-native dividend), two
+exist only in its optional GKE memory tier and fail open (#1, #2), one is
+shared as a documented trade-off (#10).
+
+### The gaps agent-sandbox has instead
+
+What this demo does natively that agent-sandbox does not — plus what its own
+live validation exposed:
+
+1. **Density.** One awake employee = one full gVisor pod, 24/7; no
+   multiplexing of idle-but-awake workloads (≥2,250 requested cores for
+   9,000 awake seats before a keystroke, vs. actors-over-workers here).
+   Multi-sandbox-per-pod is roadmap-only.
+2. **Memory-true sleep isn't the platform's.** Native suspend reboots the
+   app (22.3 s wake, session memory gone, vs. p50 1.22 s resume-mid-thought
+   measured here); the memory tier is GKE Pod Snapshots — manual triggers,
+   machine-series-pinned, template-edit-silently-cold-starts, GKE-only.
+3. **Late-bind storage lifecycle is unsupported glue with a data-loss
+   invariant.** Unbind-before-teardown lives only in example code; an
+   out-of-band pod delete wedges pods in Terminating or wipes the
+   employee's NFS workspace. No finalizer hook or binding CRD exists.
+4. **No in-platform idle detection / auto-suspend / scale-to-zero** (same
+   as here; sweeper lives in the example portal).
+5. **Warm claims forbid all per-user pod customization**: per-claim
+   env/volumes force cold starts, and there is no per-claim resource
+   sizing at all — per-employee CPU/memory tiers mean a separate template
+   and warm pool per size class.
+6. **Sub-second is conditional**: only while the warm pool has spares
+   (cold 5.7 s, first pull 27 s); refill throughput bounds batch
+   onboarding; the 10k-claim fleet shape is undocumented.
+7. **Stable per-user addressing is portal glue**: ExternalName alias +
+   two Services per employee vs. this system's zero-object wake-on-request
+   DNS — the one place Substrate is decisively ahead.
+8. **Example-glue to productionize**: single-replica portal with in-memory
+   state, a privileged hostPath-`/` storage daemon whose one shared token
+   authorizes deleting any workspace (and whose NetworkPolicy is silently
+   inert without Dataplane V2), and edge identity→sandbox authorization.
+
+### Synthesis
+
+The two gap lists are near-duals. Substrate's are *reliability and
+operability* gaps in a young bespoke plane (fatal restore bug, terminal
+states, missing verbs, no rollouts) under genuinely superior primitives
+(wake-on-request addressing, memory-true sleep, heavy density).
+agent-sandbox's are *economics and glue* gaps (no multiplexing, memory tier
+outsourced to GKE, portal/daemon/alias layer to harden) on a platform where
+failure degrades instead of wedging. For an OpenClaw-shaped fleet today,
+agent-sandbox can run it in production with known glue costs; Substrate
+cannot run OpenClaw at all until gap #1 is fixed — but once fixed,
+Substrate's density and wake semantics attack exactly the two gaps at the
+top of agent-sandbox's list.
+
 ## Teardown
 
 ```sh
