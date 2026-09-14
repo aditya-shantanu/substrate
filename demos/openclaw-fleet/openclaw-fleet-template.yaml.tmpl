@@ -32,11 +32,19 @@ containers:
 # The image must be digest-pinned: the golden snapshot is only valid for the
 # exact image it was taken from.
 #
+# The test probe (demos/openclaw-fleet/probe, on :8080 via atenet's CONNECT
+# ingress) runs INSIDE this container rather than as a sibling: Substrate
+# release-0.1 cannot FULL-restore an actor with a second application
+# container (gVisor "inconsistent private memory files on restore" — see the
+# README gap list). Substrate also has no exec/cp into actors, which is why
+# the test needs a probe at all.
+#
 # No readyz probe: OpenClaw's /healthz answers before the agent runtime is
 # actually ready, so the golden checkpoint relies on atecontroller's
 # fixed warm-up delay instead (see the always-on-agent architecture doc).
 - name: openclaw
   image: ${ACTOR_IMAGE}
+${COMMAND_OVERRIDE}
   env:
   # Literal values only: ActorTemplate env has no secretKeyRef, so these are
   # baked into the template AND into the golden snapshot. Treat the rendered
@@ -45,21 +53,11 @@ containers:
     value: "${GEMINI_API_KEY}"
   - name: OPENCLAW_GATEWAY_TOKEN
     value: "${OPENCLAW_GATEWAY_TOKEN}"
-  volumeMounts:
-  - name: workspace
-    mountPath: /workspace
-# Test instrumentation: Substrate has no exec/cp into actors, so the fleet
-# test asserts memory-state and volume-state guarantees through this probe
-# (demos/openclaw-fleet/probe). It answers on 8080 via atenet's CONNECT
-# ingress. ${TEMPLATE_REV} is the observable marker that a template repoint
-# actually took effect.
-- name: probe
-  image: ${PROBE_IMAGE}
-  command:
-  - /ko-app/probe
-  - --port=8080
-  - --workspace=/workspace
-  - --rev=${TEMPLATE_REV}
+  # The observable marker that a template repoint took effect (reported by
+  # the probe's /state as "rev"), and the demo's stand-in for any fleet-wide
+  # config change: v1 -> v2 differs only in this value.
+  - name: FLEET_TEMPLATE_REV
+    value: "${TEMPLATE_REV}"
   volumeMounts:
   - name: workspace
     mountPath: /workspace

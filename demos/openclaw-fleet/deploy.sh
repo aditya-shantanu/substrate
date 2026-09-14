@@ -37,7 +37,6 @@
 #   TEMPLATE_NAME         default openclaw-fleet-v1
 #   TEMPLATE_REV          default v1
 #   ACTOR_IMAGE           skip Cloud Build, use this digest-pinned image
-#   PROBE_IMAGE           skip ko build, use this digest-pinned image
 #   KO_DOCKER_REPO        for the probe build (default gcr.io/$PROJECT_ID/ate-images)
 
 set -o errexit -o nounset -o pipefail
@@ -78,14 +77,7 @@ if [ -z "${ACTOR_IMAGE:-}" ]; then
 fi
 echo "    ${ACTOR_IMAGE}"
 
-echo "[2/5] Probe image (ko)"
-if [ -z "${PROBE_IMAGE:-}" ]; then
-  command -v ko >/dev/null || die "ko not found (or set PROBE_IMAGE)"
-  PROBE_IMAGE="$(cd "${ROOT}" && ko build --base-import-paths ./demos/openclaw-fleet/probe)"
-fi
-echo "    ${PROBE_IMAGE}"
-
-echo "[3/5] Worker pool"
+echo "[2/5] Worker pool"
 # ko resolve builds ateom-gvisor from THIS checkout, so the worker matches the
 # installed control plane's version (a skewed ateom fails golden resume with
 # an opaque error). Requires KO_DOCKER_REPO to be pushable.
@@ -100,18 +92,28 @@ echo "[4/5] Atespace + ActorTemplate ${TEMPLATE_NAME} (rev ${TEMPLATE_REV})"
 kubectl ate create atespace "${ATESPACE}" 2>/dev/null || true
 # Templates are immutable: delete-and-recreate is the only update path.
 kubectl ate delete actor-template "${TEMPLATE_NAME}" -a "${ATESPACE}" 2>/dev/null || true
-sed -e "s|\${ATESPACE}|${ATESPACE}|g" \
+# PROBE_ONLY=true swaps the container command for the probe binary alone.
+# Needed until the gVisor/Substrate restore bug for large-image workloads is
+# fixed (see README "What does NOT work yet"): a real OpenClaw process never
+# survives its first restore, so lifecycle testing runs the probe as PID 1 on
+# the same actor image instead.
+if [ "${PROBE_ONLY:-false}" = "true" ]; then
+  CMD_OVERRIDE='  command:\n  - /usr/local/bin/fleet-probe\n  - --port=8080\n  - --workspace=/workspace'
+else
+  CMD_OVERRIDE=''
+fi
+sed -e "s|^\${COMMAND_OVERRIDE}$|${CMD_OVERRIDE}|" \
+    -e "s|\${ATESPACE}|${ATESPACE}|g" \
     -e "s|\${TEMPLATE_NAME}|${TEMPLATE_NAME}|g" \
     -e "s|\${TEMPLATE_REV}|${TEMPLATE_REV}|g" \
     -e "s|\${ACTOR_IMAGE}|${ACTOR_IMAGE}|g" \
-    -e "s|\${PROBE_IMAGE}|${PROBE_IMAGE}|g" \
     -e "s|\${GEMINI_API_KEY}|${GEMINI_API_KEY}|g" \
     -e "s|\${OPENCLAW_GATEWAY_TOKEN}|${OPENCLAW_GATEWAY_TOKEN}|g" \
     -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
     -e "s|\${WORKSPACE_CAPACITY}|${WORKSPACE_CAPACITY}|g" \
     -e "s|\${STORAGE_CLASS}|${STORAGE_CLASS}|g" \
     "${DEMO_DIR}/openclaw-fleet-template.yaml.tmpl" \
-  | kubectl ate create actor-template -a "${ATESPACE}" -f -
+  | kubectl ate create actor-template -f -
 
 echo "[5/5] Waiting for the golden snapshot (one per template, shared by every employee)"
 deadline=$((SECONDS + 600))

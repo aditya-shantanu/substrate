@@ -41,9 +41,13 @@ import (
 )
 
 func main() {
+	defaultRev := os.Getenv("FLEET_TEMPLATE_REV")
+	if defaultRev == "" {
+		defaultRev = "v1"
+	}
 	port := flag.Int("port", 8080, "Port to listen on (non-80: port 80 belongs to OpenClaw)")
 	workspace := flag.String("workspace", "/workspace", "Directory backed by the actor's external volume")
-	rev := flag.String("rev", "v1", "Template revision marker, used to verify template repoints")
+	rev := flag.String("rev", defaultRev, "Template revision marker, used to verify template repoints (default: $FLEET_TEMPLATE_REV)")
 	flag.Parse()
 
 	idBytes := make([]byte, 8)
