@@ -1,0 +1,96 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ActorTemplate (protojson-shaped ateapipb.ActorTemplate) for a per-employee
+# OpenClaw workspace. Applied with `kubectl ate create actor-template` by
+# deploy.sh, which substitutes every ${...} placeholder.
+#
+# ActorTemplates are immutable, so fleet updates mean rendering this file
+# again with a bumped ${TEMPLATE_NAME} / ${TEMPLATE_REV} and repointing
+# actors at the new template (rolling-update.sh). One golden snapshot is
+# taken per template and every employee's first activation restores from it.
+metadata:
+  atespace: ${ATESPACE}
+  name: ${TEMPLATE_NAME}
+workerSelector:
+  matchLabels:
+    workload: openclaw-fleet
+containers:
+# The real workload: stock OpenClaw with its OpenAI-compatible HTTP API
+# enabled, listening on port 80 — the primary actor port atenet routes to.
+# The image must be digest-pinned: the golden snapshot is only valid for the
+# exact image it was taken from.
+#
+# No readyz probe: OpenClaw's /healthz answers before the agent runtime is
+# actually ready, so the golden checkpoint relies on atecontroller's
+# fixed warm-up delay instead (see the always-on-agent architecture doc).
+- name: openclaw
+  image: ${ACTOR_IMAGE}
+  env:
+  # Literal values only: ActorTemplate env has no secretKeyRef, so these are
+  # baked into the template AND into the golden snapshot. Treat the rendered
+  # manifest as a secret; key rotation requires a new template + re-golden.
+  - name: GEMINI_API_KEY
+    value: "${GEMINI_API_KEY}"
+  - name: OPENCLAW_GATEWAY_TOKEN
+    value: "${OPENCLAW_GATEWAY_TOKEN}"
+  volumeMounts:
+  - name: workspace
+    mountPath: /workspace
+# Test instrumentation: Substrate has no exec/cp into actors, so the fleet
+# test asserts memory-state and volume-state guarantees through this probe
+# (demos/openclaw-fleet/probe). It answers on 8080 via atenet's CONNECT
+# ingress. ${TEMPLATE_REV} is the observable marker that a template repoint
+# actually took effect.
+- name: probe
+  image: ${PROBE_IMAGE}
+  command:
+  - /ko-app/probe
+  - --port=8080
+  - --workspace=/workspace
+  - --rev=${TEMPLATE_REV}
+  volumeMounts:
+  - name: workspace
+    mountPath: /workspace
+# Sandbox size: an actor occupies its whole worker, so this must fit inside
+# the pool's per-worker limits (openclaw-fleet.yaml.tmpl). Sized for a full
+# Node.js OpenClaw runtime. Quantities are strings in the proto.
+resources:
+  limits:
+  - name: cpu
+    quantity: "1"
+  - name: memory
+    quantity: 1536Mi
+snapshotsConfig:
+  # FULL scope: a suspend captures live process memory plus the rootfs delta,
+  # so a woken employee resumes mid-thought (conversation state, JIT-warmed
+  # runtime) rather than cold-booting. The external workspace volume is NOT
+  # part of the snapshot — it persists on its own and is reattached on
+  # resume, which is exactly what a 20Gi/user NAS workspace needs (tarring
+  # 20Gi into every suspend would be the wrong regime entirely).
+  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
+  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
+  storageLocation: gs://${BUCKET_NAME}/openclaw-fleet/
+sandboxConfig:
+  sandboxClass: SANDBOX_CLASS_GVISOR
+  configName: gvisor-default
+volumes:
+# One CSI volume per employee, provisioned at actor creation and deleted with
+# the actor. With csi-driver-nfs each volume is a subdirectory of a single
+# NFS/Filestore share — thousands of employees on one share, no per-user
+# PV/PVC objects and no attach-limit cliffs.
+- name: workspace
+  externalVolumeTemplate:
+    capacity: ${WORKSPACE_CAPACITY}
+    storageClassName: ${STORAGE_CLASS}
