@@ -128,8 +128,11 @@ batch_ms=$(( $(now_ms) - t0 ))
 n_registered="$(kubectl ate get actors -a "${ATESPACE}" -o json | jq "[.actors[] | select(.metadata.name | startswith(\"${EMP}-b\"))] | length")"
 [ "${n_registered}" -eq "${BATCH_N}" ] && ok "${BATCH_N} actors registered in ${batch_ms}ms (no bulk API: client-side fan-out)" \
                                         || fail "only ${n_registered}/${BATCH_N} actors registered"
-# Touch each once; with fewer workers than actors this forces the control
-# plane to multiplex. Record per-actor first-touch latency.
+# Touch each actor once, then suspend it — the cycle a channel gateway with
+# an idle-suspender drives. The suspend is NOT optional: Substrate never
+# preempts an idle-but-awake actor, so without caller-driven suspends the
+# (BATCH_N+1)th activation parks for its 5s budget and 503s once the pool's
+# workers are all occupied. Verified live; see the README gap list.
 touch_fail=0
 for i in $(seq 1 "${BATCH_N}"); do
   t1=$(now_ms)
@@ -138,8 +141,9 @@ for i in $(seq 1 "${BATCH_N}"); do
   else
     echo "    ${EMP}-b${i} FIRST-TOUCH FAILED"; touch_fail=$((touch_fail+1))
   fi
+  kubectl ate suspend actor "${EMP}-b${i}" -a "${ATESPACE}" >/dev/null 2>&1 || true
 done
-[ "${touch_fail}" -eq 0 ] && ok "all ${BATCH_N} oversubscribed actors activated on demand" \
+[ "${touch_fail}" -eq 0 ] && ok "all ${BATCH_N} employees cycled through the smaller worker pool (touch+suspend)" \
                           || fail "${touch_fail}/${BATCH_N} actors failed first touch"
 
 echo "== §5 per-employee workspace (external CSI volume)"

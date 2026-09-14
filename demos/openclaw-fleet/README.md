@@ -11,14 +11,14 @@ proving the same six fleet requirements with an asserting test script
 [always-on-agent](https://github.com/agent-substrate/always-on-agent)
 integration (same actor image recipe; no OpenClaw source changes).
 
-| # | Fleet requirement | Substrate mechanism | Verdict |
+| # | Fleet requirement | Substrate mechanism | Verdict (live-tested) |
 |---|---|---|---|
-| 1 | Fast creation & activation; batch onboarding | `CreateActor` = a DB registration; first request restores the template's **golden snapshot** into a pre-warmed worker | ✅ create; ⚠️ activation is seconds (not sub-second) for a real OpenClaw actor; ❌ no bulk API |
-| 2 | Deletion releases every resource | `DeleteActor --any-state` frees the worker, deletes the per-actor CSI volume and every snapshot under the actor's UID prefix | ✅ verified |
-| 3 | Sleep releases compute; wake-up measured; state preserved | `SuspendActor` checkpoints **live memory + rootfs** to GCS and frees the worker; the next request auto-resumes (atenet ext_proc) | ✅ verified — same `boot_id`, in-memory counter intact; ⚠️ idle *policy* is yours to run |
-| 4 | Fleet-wide image/config updates, CPU/mem resizes | none natively — ActorTemplates are **immutable**; the only path is create-template-v2 + repoint each suspended actor (`UpdateActor`), which **discards memory state** | ❌ needs Substrate work ([gaps](#what-does-not-work-yet-substrate-gaps)) |
-| 5 | Per-employee ~20 GB NAS workspace, thousands of users | `externalVolumeTemplate` → one CSI volume per actor; with `csi-driver-nfs` each volume is a **subdirectory of one NFS/Filestore share**; excluded from snapshots, reattached on resume | ✅ verified, with caveats (no quota enforcement) |
-| 6 | Distinct, stable address per employee | `<actor>.<atespace>.actors.resources.substrate.ate.dev`, Host-routed by atenet, **wake-on-request** built in — no per-employee Service/alias objects at all | ✅ verified — Substrate's strongest answer |
+| 1 | Fast creation & activation; batch onboarding | `CreateActor` = a DB registration (~2 ms); first request restores the template's **golden snapshot** into a pre-warmed worker | ✅ create; ✅ activation 1.4–2.9 s for the probe workload — but ❌ **a real OpenClaw actor cannot restore at all today** (gap #1); ❌ no bulk API |
+| 2 | Deletion releases every resource | `DeleteActor --any-state` frees the worker, deletes the per-actor CSI volume and every snapshot under the actor's UID prefix | ✅ verified (zero residue) — but wedges after failed restores (gap #3) |
+| 3 | Sleep releases compute; wake-up measured; state preserved | `SuspendActor` checkpoints **live memory + rootfs** to GCS and frees the worker; the next request auto-resumes (atenet ext_proc) | ✅ mechanism verified — same `boot_id`, in-memory counter intact, wake p50 1.22 s; ⚠️ idle *policy* is yours to run (gap #4); ❌ blocked for OpenClaw itself (gap #1) |
+| 4 | Fleet-wide image/config updates, CPU/mem resizes | none natively — ActorTemplates are **immutable**; the only path is create-template-v2 + repoint each suspended actor (`UpdateActor`), which **discards memory state** | ❌ needs Substrate work; repoint workaround verified (4–5 s downtime, volume survives, memory lost) |
+| 5 | Per-employee ~20 GB NAS workspace, thousands of users | `externalVolumeTemplate` → one CSI volume per actor; with `csi-driver-nfs` each volume is a **subdirectory of one NFS/Filestore share**; excluded from snapshots, reattached on resume | ✅ verified incl. suspend/resume reattach and cross-employee isolation; ⚠️ no quota enforcement |
+| 6 | Distinct, stable address per employee | `<actor>.<atespace>.actors.resources.substrate.ate.dev`, Host-routed by atenet, **wake-on-request** built in — no per-employee Service/alias objects at all | ✅ verified across create/suspend/wake/repoint — Substrate's strongest answer |
 
 The central design difference from the Kubernetes-native (agent-sandbox)
 blueprint: there, a *pod* is the unit of sleep, so waking means rescheduling
@@ -137,8 +137,14 @@ restores from. Onboarding N employees costs N database rows, not N boots.
 ### 2. Run the asserting test
 
 ```sh
-BUCKET_NAME=<snapshot-bucket> ./run-test-gke.sh
+BUCKET_NAME=<snapshot-bucket> PROBE_ONLY=true ./run-test-gke.sh
 ```
+
+`PROBE_ONLY=true` (both here and on `deploy.sh`) runs the baked-in probe
+binary as PID 1 instead of OpenClaw — required until gap #1 below is fixed,
+since a Node.js OpenClaw process never survives its first restore. Drop the
+flag once the gVisor memory-file bug is resolved; every assertion except the
+port-80 OpenClaw check is identical in both modes.
 
 ### 3. Fleet update (the honest version)
 
@@ -153,8 +159,28 @@ see the gaps section.
 
 ## Measured results
 
-<!-- MEASURED-RESULTS: filled from the live validation run -->
-*(pending live run — see PR/branch notes)*
+Live validation 14 Sep 2026: GKE `1.36.4-gke.1082000` (us-east4-a), Substrate
+`release-0.1` at `v0.1.0-2-gf151db26` installed by `hack/install-ate.sh`,
+worker pool of 5 on 2× `c2d-standard-8`, gVisor nightly `2026-09-02` asset,
+in-cluster NFS via `--setup-csi=nfs`, 20 Gi external volume per employee.
+`run-test-gke.sh`: **17/17 assertions passed** — in `PROBE_ONLY=true` mode,
+because a real OpenClaw process cannot survive restore today (gap #1 below);
+the lifecycle numbers are for the probe workload on the same actor image.
+
+| Metric | Measured | Notes |
+|---|---|---|
+| `CreateActor` (register employee) | **~2 ms** handler; ~2.0 s wall | wall time is kubectl-ate startup + port-forward, not the control plane |
+| Batch-register 10 employees | 3.2 s | no bulk API; client-side fan-out |
+| First activation (golden restore → HTTP served) | 1.4–2.9 s | end-to-end through atenet |
+| Wake-on-request after suspend | **p50 1.22 s, max 1.23 s** (n=5) | pure HTTP; no CLI in the path |
+| Suspend (checkpoint + free worker) | p50 2.44 s wall (n=5) | includes ~1.5 s CLI overhead |
+| 10 employees over 5 workers | 1.2–1.7 s per first-touch | requires caller-driven suspends (gap #4) |
+| Template-v2 repoint downtime | 4.1–5.0 s | memory state discarded by design |
+| Deletion | zero residue | actor list, GCS snapshot prefix verified |
+
+For a real OpenClaw actor, add its Node.js restore cost — always-on-agent
+measured ~2.9 s P50 handler / 3.3–4.7 s end-to-end for a 55–61 MiB live-memory
+snapshot — once gap #1 is fixed.
 
 ## What works
 
@@ -177,41 +203,86 @@ see the gaps section.
 
 ## What does NOT work yet (Substrate gaps)
 
-Ordered by how hard they bite this use case:
+Ordered by how hard they bite this use case. Items 1–4 were **discovered or
+confirmed during this demo's live validation**; each is reproducible with
+the files in this directory.
 
-1. **No fleet update story.** ActorTemplates are immutable, there is no
+1. **A real OpenClaw actor cannot be restored — FATAL for this use case
+   today.** The golden checkpoint succeeds, but every first resume fails
+   with gVisor `FATAL ERROR: ... inconsistent private memory files on
+   restore: savedMFOwners = [pause:/], mfmap = map[openclaw:/ ...]` — the
+   checkpoint attributes the container's private memory file to the pause
+   container, restore expects it on the app container. Reproduced across:
+   Intel `c3-standard-4` and AMD `c2d-standard-8` nodes; gVisor nightly
+   assets `2026-09-02` and `2026-09-13`; `release-0.1` head and `c48b3a3c`;
+   one and two app containers; with and without external volumes; `tini`,
+   shell wrapper, or bare `node` as PID 1. Small Go binaries on the *same
+   1.2 GB actor image* restore perfectly (that is what `PROBE_ONLY` mode
+   exploits), so the trigger is the workload/image scale, most likely the
+   overlay/memory-file "waste small" accounting in the pinned gVisor
+   nightlies. Consequence: **every Node.js-class agent is unusable with
+   suspend/resume on today's release-0.1 + pinned assets.** Also note the
+   asset coupling: the `gvisor.tar.zstd` bundles contain Substrate-specific
+   binaries (`checkpointgofer`, `gvisor_sentry`, prewarmer), exist only
+   from nightly 2026-09-02 onward, so there is no older/stock runsc to pin
+   as a workaround.
+2. **Snapshots are CPU-feature-pinned and Substrate schedules blind to it.**
+   Two of three freshly-created GKE `c3-standard-4` nodes (same zone, same
+   machine type, same Xeon 8481C model!) lacked `tsc_deadline_timer`; a
+   golden taken on the third node failed FeatureSet validation on the other
+   two. Substrate has no CPU-feature-aware placement, no
+   checkpoint-compatibility check at scheduling time, and no remediation —
+   requests just 500. Worker pools must be kept feature-homogeneous by hand
+   (this demo does it with node labels), and one heterogeneous node can
+   poison a fleet's snapshots.
+3. **Failed restores wedge, poison the pool, and end in data loss.** An
+   actor whose restore fails is left `RESUMING` **while still holding its
+   worker** (saturating the pool → `no free workers available` for everyone
+   else), `DeleteActor --any-state` then fails with
+   `TERMINAL_FILE_SYSTEM_ERROR ... sandbox-assets.json: no such file`, and
+   the only recovery is deleting the worker *pod*, after which the actor is
+   terminal `CRASHED` (memory state gone). There is no automatic cleanup,
+   retry-with-different-worker, or fencing.
+4. **No idle preemption: multiplexing is entirely caller-driven.** With 5
+   workers and 11 registered employees, the 6th activation parks for its
+   5 s budget and 503s — an idle-but-awake actor is never suspended to make
+   room. Verified live; `run-test-gke.sh` §1b only passes because it
+   suspends after every touch, exactly the loop the always-on-agent
+   idle-suspender runs. Density claims assume this loop exists; ship it or
+   size pools for peak-concurrent-awake.
+5. **No fleet update story.** ActorTemplates are immutable, there is no
    rollout primitive, and repointing an actor (`UpdateActor`) forces a
    data-only restore — memory state is discarded fleet-wide on every image
    or config change. Resizes (`resources.limits`) are also template-bound
    and take effect only on cold boot. Roadmap lists "ActorDeployment"; until
    then [`rolling-update.sh`](rolling-update.sh) is the state of the art.
-2. **Secrets are baked into the golden snapshot.** Template env is
+6. **Secrets are baked into the golden snapshot.** Template env is
    literal-only (no `secretKeyRef` since upstream #835); a provider-key
    rotation means new template + re-golden + lossy fleet migration. Egress
    credential injection is the missing tier.
-3. **No idle-suspend policy in the control plane.** Suspension is
-   caller-driven; every deployment must run its own idle detector (the
-   always-on-agent gateway plugin is the reference implementation).
-4. **No bulk APIs.** Onboarding thousands = client-side `CreateActor`
-   fan-out; offboarding likewise.
-5. **Activation is seconds, not sub-second, for real agents.** The
-   sub-second figures hold for near-empty actors; a full Node.js OpenClaw
-   restore is a 55–60 MiB memory image (~3 s handler time, 3–5 s end-to-end
-   as measured in always-on-agent). Still far better than a cold boot, but
-   size expectations accordingly.
-6. **No `kubectl-ate update actor`** — the RPC exists, the CLI verb doesn't
+7. **No bulk APIs.** Onboarding thousands = client-side `CreateActor`
+   fan-out; offboarding likewise. Also ~2 s of CLI/port-forward overhead per
+   `kubectl ate` invocation dwarfs the ~2 ms RPC — fleet tooling should hold
+   one connection.
+8. **No `kubectl-ate update actor`** — the RPC exists, the CLI verb doesn't
    (this demo carries [`tools/update-actor`](tools/update-actor/)).
-7. **No exec/cp/debug path into actors** — hence the probe sidecar pattern
-   this demo uses for testing; operators will want something first-class.
-8. **Volume capacity is bookkeeping, not enforcement**, with the NFS driver:
-   nothing stops an employee filling the shared share past their 20 Gi.
-   (Filestore multishares or an enforcing CSI driver would fix this.)
-9. **Static worker pools.** No autoscaling; concurrent-active demand beyond
-   the pool parks for ≤5 s, then 503s. Sizing is on you (see the
-   always-on-agent density model: P99-peak, not average).
-10. **In-cluster-only ingress.** atenet-router is ClusterIP; the external
+9. **No exec/cp/debug path into actors** — hence the probe pattern this
+   demo uses for testing; operators will want something first-class.
+10. **Volume capacity is bookkeeping, not enforcement**, with the NFS
+    driver: nothing stops an employee filling the shared share past their
+    20 Gi. (Filestore multishares or an enforcing CSI driver would fix
+    this.)
+11. **Static worker pools.** No autoscaling; concurrent-active demand
+    beyond the pool parks for ≤5 s, then 503s. Sizing is on you (see the
+    always-on-agent density model: P99-peak, not average).
+12. **In-cluster-only ingress.** atenet-router is ClusterIP; the external
     per-employee URL (LB, TLS, IAP/SSO) is entirely left to the operator —
-    the agent-sandbox blueprint's Gateway-API layer has no counterpart here.
+    the agent-sandbox blueprint's Gateway-API layer has no counterpart
+    here.
+13. Minor: `hack/install-ate.sh` labels only currently-present nodes
+    (nodes added later run no dataplane until labeled by hand), and a dirty
+    working tree yields a `-dirty` version label that no node carries, so
+    demo pools silently never schedule.
 
 ## Teardown
 
