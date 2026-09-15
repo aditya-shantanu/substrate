@@ -207,6 +207,30 @@ Ordered by how hard they bite this use case. Items 1–4 were **discovered or
 confirmed during this demo's live validation**; each is reproducible with
 the files in this directory.
 
+> **Re-validated against `main@26c38616`** (75 commits past release-0.1,
+> 2026-09-14, fresh GKE cluster, c2d-standard-8): **every gap below still
+> stands.** Live retest: gap #1 reproduces byte-for-byte (`savedMFOwners =
+> [_pause:/], mfmap = map[openclaw:/…]`) — the `-direct` removal from
+> `runsc restore` (#1549) is a throughput fix and the `_pause` rename
+> (#1496) doesn't change the outcome; the gVisor asset is still nightly
+> 2026-09-02. Gap #3 reproduces identically (same
+> `TERMINAL_FILE_SYSTEM_ERROR`, actor wedged holding its worker). The
+> probe-only control restores perfectly on main, confirming the failure
+> remains workload-class-specific. Code review confirms gaps #2 and #4–#13
+> unchanged (still no UpdateActorTemplate/rollout API, literal-only env,
+> no bulk RPCs, no update/exec CLI verbs, no quota enforcement, no
+> autoscaling productization, 5 s parking budget, install-time-only node
+> labeling). Two notes: main **removes Host/DNS-based actor routing**
+> entirely (ingress now requires an explicit `ate-target-actor:
+> <atespace>/<actor>` header — per-actor DNS names are gone, making the
+> stable-address story *more* dependent on an operator-run fronting proxy),
+> and main does add fleet-relevant groundwork this demo doesn't use yet:
+> EgressPolicy enforcement, a 3-tier atespace authz model, actor
+> usage-event streams, and per-actor JWT/cert minting on the control API.
+> Porting this demo to main also requires: `--template` instead of
+> `--template-ref`, the new single-object CLI JSON shape, and re-goldening
+> across the `pause`→`_pause` boundary.
+
 1. **A real OpenClaw actor cannot be restored — FATAL for this use case
    today.** The golden checkpoint succeeds, but every first resume fails
    with gVisor `FATAL ERROR: ... inconsistent private memory files on
