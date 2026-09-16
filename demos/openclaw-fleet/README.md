@@ -13,9 +13,9 @@ integration (same actor image recipe; no OpenClaw source changes).
 
 | # | Fleet requirement | Substrate mechanism | Verdict (live-tested) |
 |---|---|---|---|
-| 1 | Fast creation & activation; batch onboarding | `CreateActor` = a DB registration (~2 ms); first request restores the template's **golden snapshot** into a pre-warmed worker | ✅ create; ✅ activation 1.4–2.9 s for the probe workload — but ❌ **a real OpenClaw actor cannot restore at all today** (gap #1); ❌ no bulk API |
+| 1 | Fast creation & activation; batch onboarding | `CreateActor` = a DB registration (~2 ms); first request restores the template's **golden snapshot** into a pre-warmed worker | ✅ create; ✅ activation 4 s for real OpenClaw (1.4–2.9 s for a small binary); ❌ no bulk API |
 | 2 | Deletion releases every resource | `DeleteActor --any-state` frees the worker, deletes the per-actor CSI volume and every snapshot under the actor's UID prefix | ✅ verified (zero residue) — but wedges after failed restores (gap #3) |
-| 3 | Sleep releases compute; wake-up measured; state preserved | `SuspendActor` checkpoints **live memory + rootfs** to GCS and frees the worker; the next request auto-resumes (atenet ext_proc) | ✅ mechanism verified — same `boot_id`, in-memory counter intact, wake p50 1.22 s; ⚠️ idle *policy* is yours to run (gap #4); ❌ blocked for OpenClaw itself (gap #1) |
+| 3 | Sleep releases compute; wake-up measured; state preserved | `SuspendActor` checkpoints **live memory + rootfs** to GCS and frees the worker; the next request auto-resumes (atenet ext_proc) | ✅ verified with real OpenClaw — wake-on-request p50 ~3.5 s, memory intact; ⚠️ idle *policy* is yours to run (gap #4) |
 | 4 | Fleet-wide image/config updates, CPU/mem resizes | none natively — ActorTemplates are **immutable**; the only path is create-template-v2 + repoint each suspended actor (`UpdateActor`), which **discards memory state** | ❌ needs Substrate work; repoint workaround verified (4–5 s downtime, volume survives, memory lost) |
 | 5 | Per-employee ~20 GB NAS workspace, thousands of users | `externalVolumeTemplate` → one CSI volume per actor; with `csi-driver-nfs` each volume is a **subdirectory of one NFS/Filestore share**; excluded from snapshots, reattached on resume | ✅ verified incl. suspend/resume reattach and cross-employee isolation; ⚠️ no quota enforcement |
 | 6 | Distinct, stable address per employee | `<actor>.<atespace>.actors.resources.substrate.ate.dev`, Host-routed by atenet, **wake-on-request** built in — no per-employee Service/alias objects at all | ✅ verified across create/suspend/wake/repoint — Substrate's strongest answer |
@@ -137,14 +137,14 @@ restores from. Onboarding N employees costs N database rows, not N boots.
 ### 2. Run the asserting test
 
 ```sh
-BUCKET_NAME=<snapshot-bucket> PROBE_ONLY=true ./run-test-gke.sh
+BUCKET_NAME=<snapshot-bucket> ./run-test-gke.sh
 ```
 
-`PROBE_ONLY=true` (both here and on `deploy.sh`) runs the baked-in probe
-binary as PID 1 instead of OpenClaw — required until gap #1 below is fixed,
-since a Node.js OpenClaw process never survives its first restore. Drop the
-flag once the gVisor memory-file bug is resolved; every assertion except the
-port-80 OpenClaw check is identical in both modes.
+This runs the real OpenClaw actor end to end. `PROBE_ONLY=true` (on both
+`deploy.sh` and the test) is a diagnostic mode that runs only the baked-in
+probe binary as PID 1 — useful for isolating platform behavior from
+workload behavior, which is exactly how the dead-golden failure below was
+first localized.
 
 ### 3. Fleet update (the honest version)
 
@@ -159,28 +159,30 @@ see the gaps section.
 
 ## Measured results
 
-Live validation 14 Sep 2026: GKE `1.36.4-gke.1082000` (us-east4-a), Substrate
-`release-0.1` at `v0.1.0-2-gf151db26` installed by `hack/install-ate.sh`,
-worker pool of 5 on 2× `c2d-standard-8`, gVisor nightly `2026-09-02` asset,
-in-cluster NFS via `--setup-csi=nfs`, 20 Gi external volume per employee.
-`run-test-gke.sh`: **17/17 assertions passed** — in `PROBE_ONLY=true` mode,
-because a real OpenClaw process cannot survive restore today (gap #1 below);
-the lifecycle numbers are for the probe workload on the same actor image.
+Live validation 2026-09-16 on GKE `1.36.4-gke.1082000` (us-east4-a, 3×
+`c2d-standard-8`), Substrate `release-0.1` at `v0.1.0-5-g4ae77803` installed
+by `hack/install-ate.sh`, gVisor nightly `2026-09-02` asset, worker pool of
+5, in-cluster NFS via `--setup-csi=nfs`, **real OpenClaw actor** (stock
+2026.8.2 image + fleet config, run with the uid-0/cwd-`/` fixes described in
+the gap list). `run-test-gke.sh`: **18/18 assertions passed**, no
+`PROBE_ONLY`.
 
 | Metric | Measured | Notes |
 |---|---|---|
-| `CreateActor` (register employee) | **~2 ms** handler; ~2.0 s wall | wall time is kubectl-ate startup + port-forward, not the control plane |
-| Batch-register 10 employees | 3.2 s | no bulk API; client-side fan-out |
-| First activation (golden restore → HTTP served) | 1.4–2.9 s | end-to-end through atenet |
-| Wake-on-request after suspend | **p50 1.22 s, max 1.23 s** (n=5) | pure HTTP; no CLI in the path |
-| Suspend (checkpoint + free worker) | p50 2.44 s wall (n=5) | includes ~1.5 s CLI overhead |
-| 10 employees over 5 workers | 1.2–1.7 s per first-touch | requires caller-driven suspends (gap #4) |
-| Template-v2 repoint downtime | 4.1–5.0 s | memory state discarded by design |
-| Deletion | zero residue | actor list, GCS snapshot prefix verified |
+| `CreateActor` (register employee) | **~2 ms** handler; ~1.9 s wall | wall time is kubectl-ate startup + port-forward, not the control plane |
+| Batch-register 10 employees | 2.1 s | no bulk API; client-side fan-out |
+| First activation (golden restore → OpenClaw serving on :80) | **3.8–3.9 s** | end-to-end through atenet; HTTP 401 = token auth enforced |
+| Wake-on-request after suspend | **3.6 s** (3.3–3.7 s across cycles) | same `boot_id`, in-memory counter intact; matches the unmodified always-on-agent template's 3.3–3.7 s on this cluster |
+| Suspend (checkpoint + free worker) | 3.6 s wall | includes ~1.5 s CLI overhead |
+| 10 employees over 5 workers | 3.4–4.5 s per first-touch | requires caller-driven suspends (gap #4) |
+| Template-v2 repoint downtime | 6.3 s | data-only restore = real cold boot; memory discarded by design |
+| Deletion | zero residue | actor list + GCS snapshot prefix verified |
+| Golden snapshot size (`pages.img.zstd`) | **60.6 MiB live** vs **20 KiB dead** | the dead-golden signature — see gap #1 |
 
-For a real OpenClaw actor, add its Node.js restore cost — always-on-agent
-measured ~2.9 s P50 handler / 3.3–4.7 s end-to-end for a 55–61 MiB live-memory
-snapshot — once gap #1 is fixed.
+For scale: the earlier `PROBE_ONLY` runs (a small Go binary as the whole
+actor) woke in 1.2 s, so the full Node.js OpenClaw runtime costs ~2.4 s of
+extra restore time per wake — size expectations on the real workload, not
+on empty-actor figures.
 
 ## What works
 
@@ -207,49 +209,49 @@ Ordered by how hard they bite this use case. Items 1–4 were **discovered or
 confirmed during this demo's live validation**; each is reproducible with
 the files in this directory.
 
-> **Re-validated against `main@26c38616`** (75 commits past release-0.1,
-> 2026-09-14, fresh GKE cluster, c2d-standard-8): **every gap below still
-> stands.** Live retest: gap #1 reproduces byte-for-byte (`savedMFOwners =
-> [_pause:/], mfmap = map[openclaw:/…]`) — the `-direct` removal from
-> `runsc restore` (#1549) is a throughput fix and the `_pause` rename
-> (#1496) doesn't change the outcome; the gVisor asset is still nightly
-> 2026-09-02. Gap #3 reproduces identically (same
-> `TERMINAL_FILE_SYSTEM_ERROR`, actor wedged holding its worker). The
-> probe-only control restores perfectly on main, confirming the failure
-> remains workload-class-specific. Code review confirms gaps #2 and #4–#13
-> unchanged (still no UpdateActorTemplate/rollout API, literal-only env,
-> no bulk RPCs, no update/exec CLI verbs, no quota enforcement, no
-> autoscaling productization, 5 s parking budget, install-time-only node
-> labeling). Two notes: main **removes Host/DNS-based actor routing**
-> entirely (ingress now requires an explicit `ate-target-actor:
-> <atespace>/<actor>` header — per-actor DNS names are gone, making the
-> stable-address story *more* dependent on an operator-run fronting proxy),
-> and main does add fleet-relevant groundwork this demo doesn't use yet:
-> EgressPolicy enforcement, a 3-tier atespace authz model, actor
-> usage-event streams, and per-actor JWT/cert minting on the control API.
-> Porting this demo to main also requires: `--template` instead of
-> `--template-ref`, the new single-object CLI JSON shape, and re-goldening
-> across the `pause`→`_pause` boundary.
+> **Correction (2026-09-16).** An earlier revision of this list claimed a
+> fatal gVisor bug: "a real OpenClaw actor cannot be restored". That was
+> wrong, and a colleague running the same gVisor asset successfully called
+> it: the golden snapshot had been captured from a sandbox whose OpenClaw
+> process had **already exited**. Root cause, proven on a fresh GKE 1.36.4
+> cluster: Substrate starts app containers as **uid 0 with cwd `/`** — it
+> honors the image's ENTRYPOINT/CMD and ENV but *not* its `USER` or
+> `WORKDIR` (`internal/ocispec/ocispec.go:86-92`). The stock image's CMD is
+> the relative `node openclaw.mjs gateway`, so from `/` Node died instantly
+> (`Error: Cannot find module '/openclaw.mjs'`, verbatim in the golden
+> actor's worker log); my absolute-path variants died on OpenClaw's config
+> guard because uid 0 resolves `HOME=/root` and never finds the baked
+> `/home/node/.openclaw/openclaw.json`. On the very same cluster the
+> unmodified always-on-agent template — which sets `HOME=/home/node` and
+> runs `node /app/openclaw.mjs gateway --allow-unconfigured …` — produced a
+> **60.1 MiB** golden and restored in 4.0 s, while mine produced a **20 KiB**
+> golden that failed every restore. The GKE-version hypothesis (1.36.4 vs
+> the colleague's 1.35.7) is therefore refuted. The demo's template and
+> entrypoint are fixed accordingly, and the earlier "re-validated on main"
+> note is moot for item 1: the failure reproduced on main because the bug
+> was in this template, not the platform. What *is* a platform gap is
+> everything that let a dead golden ship silently — item 1 below.
 
-1. **A real OpenClaw actor cannot be restored — FATAL for this use case
-   today.** The golden checkpoint succeeds, but every first resume fails
-   with gVisor `FATAL ERROR: ... inconsistent private memory files on
-   restore: savedMFOwners = [pause:/], mfmap = map[openclaw:/ ...]` — the
-   checkpoint attributes the container's private memory file to the pause
-   container, restore expects it on the app container. Reproduced across:
-   Intel `c3-standard-4` and AMD `c2d-standard-8` nodes; gVisor nightly
-   assets `2026-09-02` and `2026-09-13`; `release-0.1` head and `c48b3a3c`;
-   one and two app containers; with and without external volumes; `tini`,
-   shell wrapper, or bare `node` as PID 1. Small Go binaries on the *same
-   1.2 GB actor image* restore perfectly (that is what `PROBE_ONLY` mode
-   exploits), so the trigger is the workload/image scale, most likely the
-   overlay/memory-file "waste small" accounting in the pinned gVisor
-   nightlies. Consequence: **every Node.js-class agent is unusable with
-   suspend/resume on today's release-0.1 + pinned assets.** Also note the
-   asset coupling: the `gvisor.tar.zstd` bundles contain Substrate-specific
-   binaries (`checkpointgofer`, `gvisor_sentry`, prewarmer), exist only
-   from nightly 2026-09-02 onward, so there is no older/stock runsc to pin
-   as a workaround.
+1. **A dead golden is indistinguishable from a live one — and nothing stops
+   it shipping.** Nothing watches the app process after `runsc start` (no
+   wait, no liveness, no exit→CRASHED path — `cmd/ateom-gvisor/main.go`
+   returns right after start); the golden is a single `runsc checkpoint
+   _pause` with no app-container state check, and any non-empty file list
+   counts as success; `GoldenSnapshotStatus` exposes **no size or health**,
+   so a pause-only ~20–110 KiB golden is marked Ready exactly like a 60 MiB
+   live one. Every restore then fails with gVisor's `inconsistent private
+   memory files on restore: savedMFOwners = [_pause:/], mfmap =
+   map[<app>:/…]` — a message that points at gVisor, not at the exited
+   process. Compounding it: Substrate's OCI spec ignores image `USER` and
+   `WORKDIR`, which is precisely the kind of drift that makes a
+   Docker-tested image die under Substrate. Wanted upstream: honor (or at
+   least surface) image `USER`/`WORKDIR`; refuse or flag a golden whose
+   app containers have exited; expose golden size in template status; and
+   a `readyz`-free liveness gate before checkpoint. Until then: **always
+   check `pages.img.zstd` size in GCS after creating a template** (tens of
+   KiB = dead; tens of MiB = live) and read the golden actor's worker-pod
+   logs during the 20 s warmup.
+
 2. **Snapshots are CPU-feature-pinned and Substrate schedules blind to it.**
    Two of three freshly-created GKE `c3-standard-4` nodes (same zone, same
    machine type, same Xeon 8481C model!) lacked `tsc_deadline_timer`; a
@@ -260,13 +262,16 @@ the files in this directory.
    (this demo does it with node labels), and one heterogeneous node can
    poison a fleet's snapshots.
 3. **Failed restores wedge, poison the pool, and end in data loss.** An
-   actor whose restore fails is left `RESUMING` **while still holding its
-   worker** (saturating the pool → `no free workers available` for everyone
-   else), `DeleteActor --any-state` then fails with
+   actor whose restore fails (here: because of the dead golden, but the
+   same holds for any restore error) is left `RESUMING` **while still
+   holding its worker** (saturating the pool → `no free workers available`
+   for everyone else); `DeleteActor --any-state` then fails with
    `TERMINAL_FILE_SYSTEM_ERROR ... sandbox-assets.json: no such file`, and
    the only recovery is deleting the worker *pod*, after which the actor is
-   terminal `CRASHED` (memory state gone). There is no automatic cleanup,
-   retry-with-different-worker, or fencing.
+   terminal `CRASHED`. There is no automatic cleanup, cold-boot fallback
+   (`workflow_resume.go` cold-boots only when *no* snapshot URI exists),
+   retry-on-different-worker, or fencing. Reproduced again on 2026-09-16.
+
 4. **No idle preemption: multiplexing is entirely caller-driven.** With 5
    workers and 11 registered employees, the 6th activation parks for its
    5 s budget and 503s — an idle-but-awake actor is never suspended to make
@@ -323,7 +328,7 @@ already solves, and pays with a different gap list.
 
 | # | Gap here | On agent-sandbox | Why |
 |---|---|---|---|
-| 1 | OpenClaw can't survive gVisor restore (fatal) | Not a gap in its default tier | Native sleep is disk-tier: the pod is deleted and the app *reboots* — no checkpoint fidelity involved; OpenClaw provably survives it (22.3 s wake). Its memory tier (GKE Pod Snapshots) **fails open to a cold start**, never a crash. |
+| 1 | Dead golden ships silently (no liveness gate, no size/health status; image USER/WORKDIR ignored) | Structurally absent | agent-sandbox runs a normal pod: image USER/WORKDIR honored, a crashed container is visible (`CrashLoopBackOff`, restarts, events) and a pool replaces bad spares; there is no checkpoint step to capture a dead process in. |
 | 2 | CPU-feature-pinned snapshots, feature-blind scheduling | Same trap, memory tier only, fail-open | Same "same machine series, homogeneous pool, pod-spec-is-the-cache-key" warnings — but a mismatch silently cold-starts instead of wedging; the disk tier is immune. |
 | 3 | Failed restore → wedged worker, undeletable actor, terminal CRASHED | Not a gap | No terminal states: level-triggered CRs with conditions; the claim controller falls back to cold start when a warm candidate misbehaves; pools replace bad spares. Failure degrades, nothing wedges. |
 | 4 | No idle preemption; saturation parks 5 s then 503s | Half shared | Saturation degrades to a cold start (5.7 s) instead of an error. Idle *detection* is caller-driven there too (portal sweeper + absolute `shutdownTime`) — both roadmaps list auto-suspend as planned. |
@@ -385,9 +390,9 @@ agent-sandbox's are *economics and glue* gaps (no multiplexing, memory tier
 outsourced to GKE, portal/daemon/alias layer to harden) on a platform where
 failure degrades instead of wedging. For an OpenClaw-shaped fleet today,
 agent-sandbox can run it in production with known glue costs; Substrate
-cannot run OpenClaw at all until gap #1 is fixed — but once fixed,
-Substrate's density and wake semantics attack exactly the two gaps at the
-top of agent-sandbox's list.
+runs OpenClaw today (4 s activation, ~3.5 s wake) once the template
+respects its uid-0/cwd-`/` container contract — and its density and wake
+semantics attack exactly the two gaps at the top of agent-sandbox's list.
 
 ## Teardown
 

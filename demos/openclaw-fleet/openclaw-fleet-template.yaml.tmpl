@@ -33,11 +33,11 @@ containers:
 # exact image it was taken from.
 #
 # The test probe (demos/openclaw-fleet/probe, on :8080 via atenet's CONNECT
-# ingress) runs INSIDE this container rather than as a sibling: Substrate
-# release-0.1 cannot FULL-restore an actor with a second application
-# container (gVisor "inconsistent private memory files on restore" — see the
-# README gap list). Substrate also has no exec/cp into actors, which is why
-# the test needs a probe at all.
+# ingress) runs INSIDE this container, started by the image's entrypoint
+# beside OpenClaw. Substrate has no exec/cp into actors, which is why the
+# test needs a probe at all. (An earlier revision blamed a multi-container
+# restore bug for this shape; the real failure was the OpenClaw process
+# exiting before the golden checkpoint — see the README.)
 #
 # No readyz probe: OpenClaw's /healthz answers before the agent runtime is
 # actually ready, so the golden checkpoint relies on atecontroller's
@@ -46,6 +46,12 @@ containers:
   image: ${ACTOR_IMAGE}
 ${COMMAND_OVERRIDE}
   env:
+  # Substrate runs containers as uid 0 with cwd "/" (image USER/WORKDIR are
+  # not honored), so HOME must be explicit or OpenClaw resolves /root and
+  # never finds the baked /home/node/.openclaw config — it then exits within
+  # seconds and the golden is captured from a dead sandbox (see README).
+  - name: HOME
+    value: /home/node
   # Literal values only: ActorTemplate env has no secretKeyRef, so these are
   # baked into the template AND into the golden snapshot. Treat the rendered
   # manifest as a secret; key rotation requires a new template + re-golden.

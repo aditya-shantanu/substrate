@@ -71,7 +71,7 @@ probe_curl() { # probe_curl <actor> <path> [curl args...]
 }
 actor_state() { # actor_state <actor> -> e.g. ACTOR_STATE_RUNNING
   kubectl ate get actors -a "${ATESPACE}" -o json \
-    | jq -r ".actors[] | select(.metadata.name==\"$1\") | .status.state // .state // empty"
+    | jq -r "(.actors // [])[] | select(.metadata.name==\"$1\") | .status.state // .state // empty"
 }
 
 echo "== §0 preflight"
@@ -107,9 +107,8 @@ boot_id_1="$(jq -r .boot_id <<<"${state_json}" 2>/dev/null || true)"
                       || fail "actor never served on probe port"
 # OpenClaw itself (port 80, Host-routed) must answer: any HTTP status proves
 # the agent runtime is up; 401 additionally proves token auth is enforced.
-# Skipped in PROBE_ONLY mode (see README: OpenClaw cannot restore on the
-# current Substrate/gVisor combination, so lifecycle testing runs the probe
-# binary as PID 1 on the same actor image).
+# Skipped in PROBE_ONLY diagnostic mode (probe binary as PID 1, no OpenClaw
+# process to answer on port 80).
 if [ "${PROBE_ONLY:-false}" = "true" ]; then
   echo "  SKIP: OpenClaw port-80 check (PROBE_ONLY mode)"
 else
@@ -125,7 +124,7 @@ for i in $(seq 1 "${BATCH_N}"); do
 done
 wait
 batch_ms=$(( $(now_ms) - t0 ))
-n_registered="$(kubectl ate get actors -a "${ATESPACE}" -o json | jq "[.actors[] | select(.metadata.name | startswith(\"${EMP}-b\"))] | length")"
+n_registered="$(kubectl ate get actors -a "${ATESPACE}" -o json | jq "[(.actors // [])[] | select(.metadata.name | startswith(\"${EMP}-b\"))] | length")"
 [ "${n_registered}" -eq "${BATCH_N}" ] && ok "${BATCH_N} actors registered in ${batch_ms}ms (no bulk API: client-side fan-out)" \
                                         || fail "only ${n_registered}/${BATCH_N} actors registered"
 # Touch each actor once, then suspend it — the cycle a channel gateway with
@@ -183,7 +182,15 @@ if [ -z "${TEMPLATE_V2_SKIPPED:-}" ]; then
   t0=$(now_ms)
   (cd "${ROOT}" && go run ./demos/openclaw-fleet/tools/update-actor \
     --atespace "${ATESPACE}" --template-ref "${TEMPLATE_NAME_V2}" "${EMP}")
-  rebuilt="$(probe_curl "${EMP}" /state || true)"
+  # A repointed actor restores data-only, i.e. a real cold boot of OpenClaw
+  # (seconds, not a memory restore), so poll like §1 does rather than
+  # trusting a single request.
+  rebuilt=""
+  for _ in $(seq 1 60); do
+    rebuilt="$(probe_curl "${EMP}" /state || true)"
+    [ -n "${rebuilt}" ] && jq -e .boot_id <<<"${rebuilt}" >/dev/null 2>&1 && break
+    sleep 1
+  done
   rebuild_ms=$(( $(now_ms) - t0 ))
   rev="$(jq -r .rev <<<"${rebuilt}" 2>/dev/null || true)"
   boot_id_3="$(jq -r .boot_id <<<"${rebuilt}" 2>/dev/null || true)"
@@ -210,7 +217,7 @@ actor_uid="$(kubectl ate get actors -a "${ATESPACE}" -o json | jq -r ".actors[] 
 kubectl ate delete actor "${EMP}" -a "${ATESPACE}" --any-state
 for i in $(seq 1 "${BATCH_N}"); do kubectl ate delete actor "${EMP}-b${i}" -a "${ATESPACE}" --any-state & done; wait
 sleep 10
-n_left="$(kubectl ate get actors -a "${ATESPACE}" -o json | jq "[.actors[] | select(.metadata.name | startswith(\"${EMP}\"))] | length")"
+n_left="$(kubectl ate get actors -a "${ATESPACE}" -o json | jq "[(.actors // [])[] | select(.metadata.name | startswith(\"${EMP}\"))] | length")"
 [ "${n_left}" -eq 0 ] && ok "all $((BATCH_N+1)) actors deleted from the control plane" || fail "${n_left} actors still listed"
 if [ -n "${BUCKET_NAME:-}" ] && [ -n "${actor_uid}" ]; then
   residue="$(gcloud storage ls "gs://${BUCKET_NAME}/openclaw-fleet/**" 2>/dev/null | grep -c "${actor_uid}" || true)"

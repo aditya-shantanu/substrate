@@ -92,11 +92,9 @@ echo "[4/5] Atespace + ActorTemplate ${TEMPLATE_NAME} (rev ${TEMPLATE_REV})"
 kubectl ate create atespace "${ATESPACE}" 2>/dev/null || true
 # Templates are immutable: delete-and-recreate is the only update path.
 kubectl ate delete actor-template "${TEMPLATE_NAME}" -a "${ATESPACE}" 2>/dev/null || true
-# PROBE_ONLY=true swaps the container command for the probe binary alone.
-# Needed until the gVisor/Substrate restore bug for large-image workloads is
-# fixed (see README "What does NOT work yet"): a real OpenClaw process never
-# survives its first restore, so lifecycle testing runs the probe as PID 1 on
-# the same actor image instead.
+# PROBE_ONLY=true swaps the container command for the probe binary alone —
+# a diagnostic mode that separates platform behavior from workload behavior
+# (it is how the dead-golden failure in the README was first localized).
 if [ "${PROBE_ONLY:-false}" = "true" ]; then
   CMD_OVERRIDE='  command:\n  - /usr/local/bin/fleet-probe\n  - --port=8080\n  - --workspace=/workspace'
 else
