@@ -174,7 +174,7 @@ the gap list). `run-test-gke.sh`: **18/18 assertions passed**, no
 | First activation (golden restore → OpenClaw serving on :80) | **3.8–3.9 s** | end-to-end through atenet; HTTP 401 = token auth enforced |
 | Wake-on-request after suspend | **3.6 s** (3.3–3.7 s across cycles) | same `boot_id`, in-memory counter intact; matches the unmodified always-on-agent template's 3.3–3.7 s on this cluster |
 | Suspend (checkpoint + free worker) | 3.6 s wall | includes ~1.5 s CLI overhead |
-| 10 employees over 5 workers | 3.4–4.5 s per first-touch | requires caller-driven suspends (gap #4) |
+| 10 employees over 5 workers | 3.1–3.7 s per first-touch | requires caller-driven suspends (gap #4) |
 | Template-v2 repoint downtime | 6.3 s | data-only restore = real cold boot; memory discarded by design |
 | Deletion | zero residue | actor list + GCS snapshot prefix verified |
 | Golden snapshot size (`pages.img.zstd`) | **60.6 MiB live** vs **20 KiB dead** | the dead-golden signature — see gap #1 |
