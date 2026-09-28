@@ -133,6 +133,14 @@ func (r *runtime) iterate() {
 		slog.Info("agent session completed the full script; starting over",
 			slog.String("actor", u.actorName))
 	}
+
+	if u.consecutiveFailures >= maxConsecutiveStepFailures {
+		slog.Warn("agent session wedged; deleting its actor and starting a fresh session",
+			slog.String("actor", u.actorName),
+			slog.Int("consecutive_failures", u.consecutiveFailures))
+		u.suspendAndDelete(context.Background())
+		r.users.Delete(gid)
+	}
 }
 
 // startUser creates the session's actor, waits for its sandbox to serve,
@@ -187,7 +195,16 @@ type sessionUser struct {
 	templateName string
 	stepIndex    int
 	cleanedUp    bool
+	// consecutiveFailures counts steps that failed back to back. After
+	// maxConsecutiveStepFailures the runtime replaces the actor: a CRASHED
+	// actor never recovers on its own, and without replacement it would
+	// wedge its VU for the rest of the run.
+	consecutiveFailures int
 }
+
+// maxConsecutiveStepFailures is how many failed steps in a row a session
+// tolerates before its actor is deleted and recreated.
+const maxConsecutiveStepFailures = 3
 
 func (u *sessionUser) ref() *ateapipb.ObjectRef {
 	return &ateapipb.ObjectRef{Atespace: u.cfg.Atespace, Name: u.actorName}
@@ -222,6 +239,7 @@ func (u *sessionUser) runStep(ctx context.Context, step Step) {
 			}
 		}
 		if err != nil {
+			u.consecutiveFailures++
 			bmetrics.RecordFailure("http", metricName, agentSessionUserClass, time.Since(stepStart), err.Error())
 			slog.Warn("agent session step failed",
 				slog.String("actor", u.actorName),
@@ -232,6 +250,7 @@ func (u *sessionUser) runStep(ctx context.Context, step Step) {
 			return
 		}
 	}
+	u.consecutiveFailures = 0
 	bmetrics.RecordSuccess("http", metricName, agentSessionUserClass, time.Since(stepStart), 0)
 
 	u.hibernate(ctx)
@@ -265,8 +284,11 @@ func (u *sessionUser) execOp(ctx context.Context, o op) error {
 			&gluttonpb.ReadDiskRequest{Key: o.key, ReadMode: gluttonpb.ReadMode_READ_MODE_DATA},
 			&gluttonpb.ReadDiskResponse{})
 	case opFillRAM:
+		// OVERWRITE grows the array on first touch and re-randomizes it in
+		// place on later laps; TRUNCATE would reallocate and transiently
+		// double the guest heap, which OOMs a tightly-sized sandbox.
 		return u.postProto(ctx, glutton.WriteRAMRoute,
-			&gluttonpb.WriteRAMRequest{Key: o.key, Size: fmt.Sprintf("%d", o.bytes), WriteMode: gluttonpb.WriteMode_WRITE_MODE_TRUNCATE},
+			&gluttonpb.WriteRAMRequest{Key: o.key, Size: fmt.Sprintf("%d", o.bytes), WriteMode: gluttonpb.WriteMode_WRITE_MODE_OVERWRITE},
 			&gluttonpb.WriteRAMResponse{})
 	case opChurnRAM:
 		return u.postProto(ctx, glutton.WriteRAMRoute,

@@ -184,11 +184,13 @@ the stock glutton binary; steps are sequences of glutton RPCs:
 | 19_package_artifact | building the release package | disk read; 1s CPU; 24Mi disk write |
 | 20_commit_and_summarize | committing + summarizing | 256Ki disk write; 24Mi shipped back out; RAM walk |
 
-Deploy with at least `--actor-memory 512Mi` (the script peaks ~96Mi resident
-RAM + ~110Mi of tmpfs files; `TestSessionBudgets` guards the bound):
+Deploy with `--actor-memory 1Gi` (the script holds ~96Mi of RAM arrays +
+~110Mi of tmpfs files, and observed guest peak with allocator transients is
+~320Mi; 512Mi OOMs. `TestSessionBudgets` guards the script's side of the
+bound):
 
 ```sh
-./benchmarking/deploy_locust.sh --deploy --sandbox-class gvisor --actor-memory 512Mi
+./benchmarking/deploy_locust.sh --deploy --sandbox-class gvisor --actor-memory 1Gi
 ./benchmarking/locust/deploy.sh --deploy --user-class agentsession
 ```
 

@@ -25,9 +25,11 @@
 # not cold-boot. That is also what makes the resume latency this benchmark
 # measures the interesting number.
 #
-# The session script peaks around 96Mi resident RAM plus ~110Mi of files in
-# /tmp (tmpfs, so also memory). Deploy with --actor-memory 512Mi or more;
-# the default 256Mi will OOM mid-session (guarded by TestSessionBudgets).
+# The session script holds ~96Mi of resident RAM arrays plus ~110Mi of files
+# in /tmp (tmpfs, so also memory); with the guest kernel, kata-agent, and Go
+# allocator transients on top, observed guest peak is ~320Mi. Deploy with
+# --actor-memory 1Gi; 512Mi OOMs under allocator churn (guarded by
+# TestSessionBudgets).
 metadata:
   atespace: benchmark-workloads
   name: agentsession
