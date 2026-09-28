@@ -184,13 +184,15 @@ the stock glutton binary; steps are sequences of glutton RPCs:
 | 19_package_artifact | building the release package | disk read; 1s CPU; 24Mi disk write |
 | 20_commit_and_summarize | committing + summarizing | 256Ki disk write; 24Mi shipped back out; RAM walk |
 
-Deploy with `--actor-memory 1Gi` (the script holds ~96Mi of RAM arrays +
-~110Mi of tmpfs files, and observed guest peak with allocator transients is
-~320Mi; 512Mi OOMs. `TestSessionBudgets` guards the script's side of the
-bound):
+The template is not in the default workload set because it needs bigger
+actors than the shared 256Mi default: the script holds ~96Mi of RAM arrays +
+~110Mi of tmpfs files, and the observed guest peak with allocator transients
+is ~320Mi (512Mi OOMs — deploy with 1Gi). `TestSessionBudgets` bounds the
+script-declared bytes only, so script edits that grow the working set fail
+the test and force this guidance to be revisited. Deploy it explicitly:
 
 ```sh
-./benchmarking/deploy_locust.sh --deploy --sandbox-class gvisor --actor-memory 1Gi
+WORKLOAD_TEMPLATES=agentsession ./benchmarking/deploy_locust.sh --deploy --sandbox-class gvisor --actor-memory 1Gi
 ./benchmarking/locust/deploy.sh --deploy --user-class agentsession
 ```
 
@@ -208,9 +210,9 @@ bound):
 
 #### Agent-Session Reported Metrics
 
-* `WakeFirstTouch`: latency of the first request after each suspension — in
-  implicit mode this **is** the user-visible parking wake latency, the
-  benchmark's headline number.
+* `WakeFirstTouch`: latency of a dedicated ping sent before each step's ops —
+  in implicit mode that ping is what triggers the parked wake, so this row
+  **is** the user-visible wake latency, unpolluted by the step's own work.
 * `Step_<name>` (e.g. `Step_06_first_build`): wall time of that step's ops,
   think gap excluded.
 * `SuspendActor` / `ResumeActor` / `CreateActor` / `DeleteActor`: control-plane

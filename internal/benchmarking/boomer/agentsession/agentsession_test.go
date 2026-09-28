@@ -83,10 +83,12 @@ func opName(k opKind) string {
 	}
 }
 
-// TestSessionBudgets keeps the script inside a 512Mi actor: resident RAM
-// (largest fill per key) and cumulative disk (largest object per key) both
-// bounded. If a script edit grows past these, the actor memory limit in the
-// template must grow with it.
+// TestSessionBudgets bounds the bytes the script itself declares: resident
+// RAM (largest fill per key) and disk (largest object per key). It does NOT
+// model the guest's real peak — kernel, kata-agent, and allocator transients
+// sit on top — so the budgets are deliberately far below the 1Gi the
+// template calls for. A script edit that outgrows them must come with a
+// fresh look at the actor memory guidance.
 func TestSessionBudgets(t *testing.T) {
 	const (
 		ramBudget  = 128 << 20 // bytes
@@ -158,6 +160,16 @@ func TestExecOpAgainstFake(t *testing.T) {
 	}
 	if got := len(fakeSrv.RecordedPaths()); got != opCount {
 		t.Errorf("fake served %d requests, want %d", got, opCount)
+	}
+	for _, n := range fakeSrv.RecordedIngestSizes() {
+		if n > 1<<10 {
+			t.Errorf("ingest payload of %d bytes reached the server, cap is %d", n, 1<<10)
+		}
+	}
+	for _, ms := range fakeSrv.RecordedBurnMillis() {
+		if ms != 1 {
+			t.Errorf("burn of %dms reached the server, override is 1ms", ms)
+		}
 	}
 }
 

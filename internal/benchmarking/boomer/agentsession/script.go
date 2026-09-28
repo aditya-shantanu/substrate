@@ -112,9 +112,13 @@ const (
 	testDataBlob = "test_fixtures"   // fixtures written by the test steps
 )
 
-// Session is the default 20-step coding-agent session. Total worked bytes
-// stay comfortably inside a 512Mi actor: peak resident RAM ≈ 96Mi
-// (contextRAM 32Mi + compilerRAM 64Mi) and cumulative disk ≈ 110Mi.
+// Session is the default 20-step coding-agent session. The script itself
+// declares ≈96Mi of resident RAM (contextRAM 32Mi + compilerRAM 64Mi) and
+// ≈110Mi of files; the guest peak on top of that (kernel, kata-agent, Go
+// allocator transients) has been observed around 320Mi, which is why the
+// template calls for 1Gi actors. TestSessionBudgets bounds only the
+// script-declared bytes, so edits that grow the working set fail the test
+// and force the memory guidance to be revisited.
 //
 // The narrative: the agent is told to fetch a repository, get it building,
 // fix a failing test, extend the test suite, refactor, and package the

@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	goruntime "runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -352,6 +353,11 @@ func (s *Service) BurnCPU(ctx context.Context, req *gluttonpb.BurnCPURequest) (*
 	parallelism := int(req.GetParallelism())
 	if parallelism < 1 {
 		parallelism = 1
+	}
+	// Cap the goroutine count: past a few per CPU the burn gains nothing,
+	// and an uncapped value lets a single request spawn without bound.
+	if maxPar := goruntime.NumCPU() * 4; parallelism > maxPar {
+		parallelism = maxPar
 	}
 	deadline := time.Now().Add(time.Duration(req.GetDurationMs()) * time.Millisecond)
 

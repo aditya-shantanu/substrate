@@ -35,7 +35,10 @@ POOL_MANIFEST="${MANIFEST_DIR}/workloads.yaml.tmpl"
 # through the ate API in the benchmark-workloads atespace. WORKLOAD_TEMPLATES
 # overrides the default set — the usermem and kernelmem templates (for the
 # matching locust tests) are not deployed by default.
-read -r -a TEMPLATES <<<"${WORKLOAD_TEMPLATES:-sleep glutton glutton-durdir-data glutton-durdir-full agentsession}"
+# agentsession is not in the default set: it needs --actor-memory 1Gi, and
+# the shared default is 256Mi. Deploy it explicitly, like usermem/kernelmem:
+#   WORKLOAD_TEMPLATES=agentsession ./benchmarking/workloads/deploy.sh --deploy --actor-memory 1Gi ...
+read -r -a TEMPLATES <<<"${WORKLOAD_TEMPLATES:-sleep glutton glutton-durdir-data glutton-durdir-full}"
 
 if [[ ! -f "${POOL_MANIFEST}" ]]; then
   echo "Error: ${POOL_MANIFEST} not found in $(pwd)" >&2

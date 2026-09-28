@@ -78,16 +78,41 @@ func initAgentSession(cfg *userclass.Config) (taskFn func(), shutdown func(conte
 		cfg.Tracer = otel.Tracer("substrate-boomer/agentsession")
 	}
 	rt := &runtime{cfg: cfg, steps: Session()}
+	rt.ingestBuf = makeIngestBuf(rt.steps)
 	return rt.iterate, rt.shutdown
+}
+
+// makeIngestBuf pre-generates one random payload sized to the script's
+// largest ingest. Generating bytes per op would count client-side
+// crypto/rand time inside the step timings and allocate tens of MiB per VU
+// per op; glutton only writes the payload, so every session can safely
+// slice the same buffer.
+func makeIngestBuf(steps []Step) []byte {
+	var maxBytes int64
+	for _, s := range steps {
+		for _, o := range s.Ops {
+			if o.kind == opIngest && o.bytes > maxBytes {
+				maxBytes = o.bytes
+			}
+		}
+	}
+	buf := make([]byte, maxBytes)
+	if _, err := rand.Read(buf); err != nil {
+		// Payload content is irrelevant to the benchmark; zeros still move
+		// the same bytes over the wire.
+		slog.Warn("failed to randomize ingest payload; using zeros", slog.String("err", err.Error()))
+	}
+	return buf
 }
 
 // runtime is the per-worker state shared by every boomer goroutine. Each
 // goroutine keeps its own session in users, keyed by goroutine ID, because
 // boomer offers no per-VU context.
 type runtime struct {
-	cfg   *userclass.Config
-	steps []Step
-	users sync.Map // goroutineID -> *sessionUser
+	cfg       *userclass.Config
+	steps     []Step
+	ingestBuf []byte   // shared read-only ingest payload, sized to the largest ingest op
+	users     sync.Map // goroutineID -> *sessionUser
 }
 
 // think returns the suspended "LLM thinking" gap before step s, which is the
@@ -126,12 +151,12 @@ func (r *runtime) iterate() {
 	// The LLM is "thinking": the actor stays suspended for the gap.
 	time.Sleep(r.think(step))
 
-	u.runStep(context.Background(), step)
-
-	u.stepIndex = (u.stepIndex + 1) % len(r.steps)
-	if u.stepIndex == 0 {
-		slog.Info("agent session completed the full script; starting over",
-			slog.String("actor", u.actorName))
+	if u.runStep(context.Background(), step) {
+		u.stepIndex = (u.stepIndex + 1) % len(r.steps)
+		if u.stepIndex == 0 {
+			slog.Info("agent session completed the full script; starting over",
+				slog.String("actor", u.actorName))
+		}
 	}
 
 	if u.consecutiveFailures >= maxConsecutiveStepFailures {
@@ -157,6 +182,7 @@ func (r *runtime) startUser(ctx context.Context) (*sessionUser, error) {
 		cfg:          r.cfg,
 		actorName:    "agent-" + uuid.NewString(),
 		templateName: tmpl,
+		ingestBuf:    r.ingestBuf,
 	}
 	slog.Info("Creating agent session",
 		slog.String("actor", u.actorName), slog.String("template", tmpl))
@@ -171,8 +197,8 @@ func (r *runtime) startUser(ctx context.Context) (*sessionUser, error) {
 		return nil, fmt.Errorf("createActor: %w", err)
 	}
 	if err := u.waitServing(ctx); err != nil {
+		// suspendAndDelete decrements the user gauge; no extra decrement here.
 		u.suspendAndDelete(ctx)
-		bmetrics.UpdateUsers(agentSessionUserClass, -1)
 		return nil, fmt.Errorf("waitServing: %w", err)
 	}
 	// Park the fresh actor; step 01 wakes it like any other step.
@@ -195,6 +221,8 @@ type sessionUser struct {
 	templateName string
 	stepIndex    int
 	cleanedUp    bool
+	// ingestBuf is the runtime's shared read-only ingest payload.
+	ingestBuf []byte
 	// consecutiveFailures counts steps that failed back to back. After
 	// maxConsecutiveStepFailures the runtime replaces the actor: a CRASHED
 	// actor never recovers on its own, and without replacement it would
@@ -211,34 +239,40 @@ func (u *sessionUser) ref() *ateapipb.ObjectRef {
 }
 
 // runStep wakes the actor, executes the step's ops in order, and suspends
-// it again. In implicit resume mode no ResumeActor RPC is issued: the first
-// op's request through the router performs the wake, and its latency is
-// recorded as WakeFirstTouch.
-func (u *sessionUser) runStep(ctx context.Context, step Step) {
+// it again, reporting whether everything succeeded. The wake is measured by
+// a dedicated ping sent ahead of the step's ops and recorded as
+// WakeFirstTouch; in implicit resume mode that ping is also what triggers
+// the parked wake, so the row measures the wake alone rather than the wake
+// plus whatever heavy op happens to lead the step.
+func (u *sessionUser) runStep(ctx context.Context, step Step) bool {
 	dyn := u.cfg.Dyn.Load()
 
 	if dyn.ResumeMode == dynconfig.ResumeModeExplicit {
 		if !u.resume(ctx) {
-			return // don't talk to a sandbox that isn't running
+			// A CRASHED actor fails resume on every step; count it so the
+			// replacement threshold can fire.
+			u.consecutiveFailures++
+			return false
 		}
 	}
+
+	wakeStart := time.Now()
+	if err := u.execOp(ctx, ping()); err != nil {
+		u.consecutiveFailures++
+		bmetrics.RecordFailure("http", "WakeFirstTouch", agentSessionUserClass, time.Since(wakeStart), err.Error())
+		slog.Warn("agent session wake failed",
+			slog.String("actor", u.actorName),
+			slog.String("step", step.Name),
+			slog.String("err", err.Error()))
+		u.hibernate(ctx)
+		return false
+	}
+	bmetrics.RecordSuccess("http", "WakeFirstTouch", agentSessionUserClass, time.Since(wakeStart), 0)
 
 	metricName := "Step_" + step.Name
 	stepStart := time.Now()
 	for i, o := range step.Ops {
-		opStart := time.Now()
-		err := u.execOp(ctx, o)
-		if i == 0 {
-			// First touch after suspension: in implicit mode this includes
-			// the parked wake, which is the benchmark's headline number.
-			latency := time.Since(opStart)
-			if err != nil {
-				bmetrics.RecordFailure("http", "WakeFirstTouch", agentSessionUserClass, latency, err.Error())
-			} else {
-				bmetrics.RecordSuccess("http", "WakeFirstTouch", agentSessionUserClass, latency, 0)
-			}
-		}
-		if err != nil {
+		if err := u.execOp(ctx, o); err != nil {
 			u.consecutiveFailures++
 			bmetrics.RecordFailure("http", metricName, agentSessionUserClass, time.Since(stepStart), err.Error())
 			slog.Warn("agent session step failed",
@@ -247,25 +281,27 @@ func (u *sessionUser) runStep(ctx context.Context, step Step) {
 				slog.Int("op", i),
 				slog.String("err", err.Error()))
 			u.hibernate(ctx)
-			return
+			return false
 		}
 	}
 	u.consecutiveFailures = 0
 	bmetrics.RecordSuccess("http", metricName, agentSessionUserClass, time.Since(stepStart), 0)
 
 	u.hibernate(ctx)
+	return true
 }
 
 // execOp performs one scripted op as a glutton RPC through the router.
 func (u *sessionUser) execOp(ctx context.Context, o op) error {
 	switch o.kind {
 	case opIngest:
-		payload := make([]byte, o.bytes)
-		if _, err := rand.Read(payload); err != nil {
-			return fmt.Errorf("generate payload: %w", err)
+		payload := u.ingestBuf
+		if int64(len(payload)) < o.bytes {
+			// Fallback for callers (tests) that built the user by hand.
+			payload = make([]byte, o.bytes)
 		}
 		return u.postProto(ctx, glutton.IngestRoute,
-			&gluttonpb.IngestRequest{Key: o.key, Payload: payload},
+			&gluttonpb.IngestRequest{Key: o.key, Payload: payload[:o.bytes]},
 			&gluttonpb.IngestResponse{})
 	case opBurnCPU:
 		return u.postProto(ctx, glutton.BurnCPURoute,
