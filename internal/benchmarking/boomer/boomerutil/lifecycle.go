@@ -89,8 +89,9 @@ func ClassifyLifecycleFailure(err error) FailureAction {
 		// A misconfigured run. The replacement is created the same way and
 		// fails the same way.
 		return RetryLater
+	default:
+		return ReplaceIfPersistent
 	}
-	return ReplaceIfPersistent
 }
 
 // IsCrashed reports whether err is ateapi's ResumeActor verdict on an actor

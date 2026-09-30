@@ -96,8 +96,9 @@ type Step struct {
 }
 
 const (
-	kib = int64(1) << 10
-	mib = int64(1) << 20
+	_   = iota
+	kib = int64(1) << (10 * iota)
+	mib
 )
 
 // Sandbox object names, so the script reads like a filesystem.

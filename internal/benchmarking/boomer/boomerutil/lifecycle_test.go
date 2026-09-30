@@ -17,6 +17,8 @@ package boomerutil
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -68,18 +70,21 @@ func TestIsCrashedVsConflict(t *testing.T) {
 }
 
 // queue returns a call that pops errs in order and succeeds once drained,
-// counting the attempts.
-func queue(errs ...error) (call func() error, attempts *int) {
-	n := 0
+// counting the attempts. Safe for concurrent callers.
+func queue(errs ...error) (call func() error, attempts *atomic.Int64) {
+	var mu sync.Mutex
+	attempts = new(atomic.Int64)
 	return func() error {
-		n++
+		attempts.Add(1)
+		mu.Lock()
+		defer mu.Unlock()
 		if len(errs) == 0 {
 			return nil
 		}
 		err := errs[0]
 		errs = errs[1:]
 		return err
-	}, &n
+	}, attempts
 }
 
 func TestRetryOnConflictRetriesThenSucceeds(t *testing.T) {
@@ -88,8 +93,8 @@ func TestRetryOnConflictRetriesThenSucceeds(t *testing.T) {
 	if err := RetryOnConflict(context.Background(), call); err != nil {
 		t.Fatalf("RetryOnConflict = %v, want nil after conflicts clear", err)
 	}
-	if *attempts != 3 {
-		t.Errorf("attempts = %d, want 3 (two conflicts, then success)", *attempts)
+	if attempts.Load() != 3 {
+		t.Errorf("attempts = %d, want 3 (two conflicts, then success)", attempts.Load())
 	}
 	if elapsed := time.Since(start); elapsed < ConflictRetryBackoff {
 		t.Errorf("elapsed = %v, want >= %v (second retry must back off)", elapsed, ConflictRetryBackoff)
@@ -102,8 +107,8 @@ func TestRetryOnConflictPassesOtherErrorsThrough(t *testing.T) {
 	if err := RetryOnConflict(context.Background(), call); !errors.Is(err, want) {
 		t.Fatalf("RetryOnConflict = %v, want %v", err, want)
 	}
-	if *attempts != 1 {
-		t.Errorf("attempts = %d, want 1 (no retry for non-conflict errors)", *attempts)
+	if attempts.Load() != 1 {
+		t.Errorf("attempts = %d, want 1 (no retry for non-conflict errors)", attempts.Load())
 	}
 }
 
@@ -116,8 +121,8 @@ func TestRetryOnConflictGivesUp(t *testing.T) {
 	if err := RetryOnConflict(context.Background(), call); !IsConcurrentUpdateConflict(err) {
 		t.Fatalf("RetryOnConflict = %v, want the last conflict", err)
 	}
-	if *attempts != ConflictRetryAttempts {
-		t.Errorf("attempts = %d, want %d", *attempts, ConflictRetryAttempts)
+	if attempts.Load() != ConflictRetryAttempts {
+		t.Errorf("attempts = %d, want %d", attempts.Load(), ConflictRetryAttempts)
 	}
 }
 
@@ -130,7 +135,7 @@ func TestRetryOnConflictHonorsContext(t *testing.T) {
 	}
 	// The first retry is immediate; the second sees the canceled context
 	// instead of sleeping.
-	if *attempts != 2 {
-		t.Errorf("attempts = %d, want 2 after cancellation", *attempts)
+	if attempts.Load() != 2 {
+		t.Errorf("attempts = %d, want 2 after cancellation", attempts.Load())
 	}
 }
