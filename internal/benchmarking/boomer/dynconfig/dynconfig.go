@@ -69,7 +69,6 @@ type Config struct {
 	SweperfNumCycles      int    // number of cycles to partition steps into; 0 falls back to default
 	SweperfPollIntervalMs int    // /status poll interval in ms; 0 falls back to default
 
-	AgentSessionTemplate   string  // ActorTemplate name for the agentsession workload; "" falls back to default
 	AgentSessionThinkScale float64 // multiplier on the script's per-step think times; 0 reads as 1.0
 }
 
@@ -120,7 +119,6 @@ type payload struct {
 	SweperfNumCycles      *float64 `json:"sweperf_num_cycles"`
 	SweperfPollIntervalMs *float64 `json:"sweperf_poll_interval_ms"`
 
-	AgentSessionTemplate   *string  `json:"agentsession_template"`
 	AgentSessionThinkScale *float64 `json:"agentsession_think_scale"`
 }
 
@@ -287,9 +285,6 @@ func (p payload) merge(current Config) Config {
 	if p.SweperfPollIntervalMs != nil {
 		out.SweperfPollIntervalMs = int(*p.SweperfPollIntervalMs)
 	}
-	if p.AgentSessionTemplate != nil {
-		out.AgentSessionTemplate = *p.AgentSessionTemplate
-	}
 	if p.AgentSessionThinkScale != nil {
 		out.AgentSessionThinkScale = *p.AgentSessionThinkScale
 	}
@@ -369,7 +364,6 @@ func StartPoll(
 					slog.Int("sweperf_total_steps", next.SweperfTotalSteps),
 					slog.Int("sweperf_num_cycles", next.SweperfNumCycles),
 					slog.Int("sweperf_poll_interval_ms", next.SweperfPollIntervalMs),
-					slog.String("agentsession_template", next.AgentSessionTemplate),
 					slog.Float64("agentsession_think_scale", next.AgentSessionThinkScale),
 				)
 			}
@@ -418,7 +412,6 @@ func SubscribeSpawn(url string, holder *Holder, sampler ProbabilityUpdater, fetc
 			slog.Int("sweperf_total_steps", next.SweperfTotalSteps),
 			slog.Int("sweperf_num_cycles", next.SweperfNumCycles),
 			slog.Int("sweperf_poll_interval_ms", next.SweperfPollIntervalMs),
-			slog.String("agentsession_template", next.AgentSessionTemplate),
 			slog.Float64("agentsession_think_scale", next.AgentSessionThinkScale),
 		)
 	})

@@ -21,14 +21,6 @@ from locust.argument_parser import LocustArgumentParser
 @events.init_command_line_parser.add_listener
 def add_agentsession_arguments(parser: LocustArgumentParser) -> None:
     parser.add_argument(
-        "--agentsession-template",
-        type=str,
-        default="agentsession",
-        env_var="LOCUST_AGENTSESSION_TEMPLATE",
-        help="ActorTemplate name for the agent-session workload (default: agentsession)",
-        include_in_web_ui=True,
-    )
-    parser.add_argument(
         "--agentsession-think-scale",
         type=float,
         default=1.0,

@@ -47,6 +47,7 @@ import (
 	gluttonpb "github.com/agent-substrate/substrate/internal/proto/glutton"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	"google.golang.org/grpc"
@@ -60,11 +61,33 @@ const (
 	agentSessionUserClass = "AgentSessionUser"
 	// templateNS is the atespace holding the benchmark ActorTemplates.
 	templateNS = "benchmark-workloads"
-	// defaultTemplate is the ActorTemplate instantiated per session.
-	defaultTemplate = "agentsession"
+	// templateName is the ActorTemplate instantiated per session: the stock
+	// glutton actor. The script needs it deployed with --actor-memory 1Gi
+	// (see benchmarking/README.md).
+	templateName = "glutton"
+
+	// controlRPCTimeout bounds every control-plane RPC. The router HTTP
+	// client already times out at 30s; without a deadline here a
+	// server-side hang in SuspendActor or DeleteActor would park the VU
+	// goroutine for the rest of the run.
+	controlRPCTimeout = 60 * time.Second
+
+	// maxConsecutiveStepFailures is how many ReplaceIfPersistent failures in
+	// a row a session tolerates before its actor is deleted and recreated.
+	maxConsecutiveStepFailures = 3
 )
 
+// burnRate is the per-goroutine sha256 iteration rate BurnCPU reports.
+// BurnCPU runs for a fixed wall-clock duration, so Step_* latency stays flat
+// when the sandbox is CPU-starved; this rate is what drops.
+var burnRate = prometheus.NewHistogram(prometheus.HistogramOpts{
+	Name:    "agentsession_burn_cpu_iterations_per_second",
+	Help:    "BurnCPU sha256 iterations per second per goroutine; drops under CPU contention while Step_* latency stays flat.",
+	Buckets: prometheus.ExponentialBuckets(256, 2, 16),
+})
+
 func init() {
+	prometheus.MustRegister(burnRate)
 	userclass.Add(userclass.Entry{
 		Name:       "agentsession",
 		LocustFile: "agentsession.py",
@@ -159,7 +182,7 @@ func (r *runtime) iterate() {
 		}
 	}
 
-	if u.consecutiveFailures >= maxConsecutiveStepFailures {
+	if u.broken {
 		slog.Warn("agent session wedged; deleting its actor and starting a fresh session",
 			slog.String("actor", u.actorName),
 			slog.Int("consecutive_failures", u.consecutiveFailures))
@@ -172,20 +195,12 @@ func (r *runtime) iterate() {
 // then suspends it so the first scripted step begins — like every later
 // step — with a wake from suspension.
 func (r *runtime) startUser(ctx context.Context) (*sessionUser, error) {
-	dyn := r.cfg.Dyn.Load()
-	tmpl := dyn.AgentSessionTemplate
-	if tmpl == "" {
-		tmpl = defaultTemplate
-	}
-
 	u := &sessionUser{
-		cfg:          r.cfg,
-		actorName:    "agent-" + uuid.NewString(),
-		templateName: tmpl,
-		ingestBuf:    r.ingestBuf,
+		cfg:       r.cfg,
+		actorName: "agent-" + uuid.NewString(),
+		ingestBuf: r.ingestBuf,
 	}
-	slog.Info("Creating agent session",
-		slog.String("actor", u.actorName), slog.String("template", tmpl))
+	slog.Info("Creating agent session", slog.String("actor", u.actorName))
 	bmetrics.UpdateUsers(agentSessionUserClass, 1)
 
 	if err := u.ensureAtespace(ctx); err != nil {
@@ -201,7 +216,8 @@ func (r *runtime) startUser(ctx context.Context) (*sessionUser, error) {
 		u.suspendAndDelete(ctx)
 		return nil, fmt.Errorf("waitServing: %w", err)
 	}
-	// Park the fresh actor; step 01 wakes it like any other step.
+	// Park the fresh actor; step 01 wakes it like any other step. A failed
+	// park is re-driven at the top of the first step.
 	u.hibernate(ctx)
 	return u, nil
 }
@@ -216,23 +232,46 @@ func (r *runtime) shutdown(ctx context.Context) {
 // sessionUser is one coding-agent session: a single actor plus its progress
 // through the script. Owned by one boomer goroutine; no locking needed.
 type sessionUser struct {
-	cfg          *userclass.Config
-	actorName    string
-	templateName string
-	stepIndex    int
-	cleanedUp    bool
+	cfg       *userclass.Config
+	actorName string
+	stepIndex int
+	cleanedUp bool
 	// ingestBuf is the runtime's shared read-only ingest payload.
 	ingestBuf []byte
-	// consecutiveFailures counts steps that failed back to back. After
-	// maxConsecutiveStepFailures the runtime replaces the actor: a CRASHED
-	// actor never recovers on its own, and without replacement it would
-	// wedge its VU for the rest of the run.
+	// hibernatePending is set by a failed Pause/Suspend: the actor is
+	// stranded RUNNING or SUSPENDING. Waking it from there would misreport
+	// WakeFirstTouch, so runStep finishes the hibernate first.
+	hibernatePending bool
+	// consecutiveFailures counts ReplaceIfPersistent failures since the
+	// last successful step; see noteFailure.
 	consecutiveFailures int
+	// broken is set once the actor should be replaced: a CRASHED or
+	// otherwise stuck actor never recovers on its own, and without
+	// replacement it would wedge its VU for the rest of the run.
+	broken bool
 }
 
-// maxConsecutiveStepFailures is how many failed steps in a row a session
-// tolerates before its actor is deleted and recreated.
-const maxConsecutiveStepFailures = 3
+// noteFailure classifies a failed step or lifecycle call and marks the actor
+// broken when a replacement is warranted. Cluster-wide errors (no capacity,
+// ate-api-server restarting) are not the actor's fault and do not count.
+func (u *sessionUser) noteFailure(err error) {
+	switch boomerutil.ClassifyLifecycleFailure(err) {
+	case boomerutil.ReplaceNow:
+		u.broken = true
+	case boomerutil.RetryLater:
+	default:
+		u.consecutiveFailures++
+		if u.consecutiveFailures >= maxConsecutiveStepFailures {
+			u.broken = true
+		}
+	}
+}
+
+// noteSuccess clears the failure count: the actor just completed a whole
+// step, so the earlier failures were transient after all.
+func (u *sessionUser) noteSuccess() {
+	u.consecutiveFailures = 0
+}
 
 func (u *sessionUser) ref() *ateapipb.ObjectRef {
 	return &ateapipb.ObjectRef{Atespace: u.cfg.Atespace, Name: u.actorName}
@@ -245,20 +284,26 @@ func (u *sessionUser) ref() *ateapipb.ObjectRef {
 // the parked wake, so the row measures the wake alone rather than the wake
 // plus whatever heavy op happens to lead the step.
 func (u *sessionUser) runStep(ctx context.Context, step Step) bool {
-	dyn := u.cfg.Dyn.Load()
+	// A failed hibernate left the actor awake. In implicit mode the wake
+	// ping would return in a few ms and be booked as a WakeFirstTouch
+	// success; in explicit mode ResumeActor would fail FailedPrecondition.
+	// SuspendActor and PauseActor are re-entrant, so finish the hibernate
+	// and pick the step up next iteration.
+	if u.hibernatePending {
+		u.hibernate(ctx)
+		return false
+	}
 
-	if dyn.ResumeMode == dynconfig.ResumeModeExplicit {
-		if !u.resume(ctx) {
-			// A CRASHED actor fails resume on every step; count it so the
-			// replacement threshold can fire.
-			u.consecutiveFailures++
+	if u.cfg.Dyn.Load().ResumeMode == dynconfig.ResumeModeExplicit {
+		if err := u.resume(ctx); err != nil {
+			u.noteFailure(err)
 			return false
 		}
 	}
 
 	wakeStart := time.Now()
 	if err := u.execOp(ctx, ping()); err != nil {
-		u.consecutiveFailures++
+		u.noteFailure(err)
 		bmetrics.RecordFailure("http", "WakeFirstTouch", agentSessionUserClass, time.Since(wakeStart), err.Error())
 		slog.Warn("agent session wake failed",
 			slog.String("actor", u.actorName),
@@ -273,7 +318,7 @@ func (u *sessionUser) runStep(ctx context.Context, step Step) bool {
 	stepStart := time.Now()
 	for i, o := range step.Ops {
 		if err := u.execOp(ctx, o); err != nil {
-			u.consecutiveFailures++
+			u.noteFailure(err)
 			bmetrics.RecordFailure("http", metricName, agentSessionUserClass, time.Since(stepStart), err.Error())
 			slog.Warn("agent session step failed",
 				slog.String("actor", u.actorName),
@@ -284,7 +329,7 @@ func (u *sessionUser) runStep(ctx context.Context, step Step) bool {
 			return false
 		}
 	}
-	u.consecutiveFailures = 0
+	u.noteSuccess()
 	bmetrics.RecordSuccess("http", metricName, agentSessionUserClass, time.Since(stepStart), 0)
 
 	u.hibernate(ctx)
@@ -304,9 +349,13 @@ func (u *sessionUser) execOp(ctx context.Context, o op) error {
 			&gluttonpb.IngestRequest{Key: o.key, Payload: payload[:o.bytes]},
 			&gluttonpb.IngestResponse{})
 	case opBurnCPU:
-		return u.postProto(ctx, glutton.BurnCPURoute,
-			&gluttonpb.BurnCPURequest{DurationMs: o.millis, Parallelism: o.parallel},
-			&gluttonpb.BurnCPUResponse{})
+		resp := &gluttonpb.BurnCPUResponse{}
+		if err := u.postProto(ctx, glutton.BurnCPURoute,
+			&gluttonpb.BurnCPURequest{DurationMs: o.millis, Parallelism: o.parallel}, resp); err != nil {
+			return err
+		}
+		observeBurnRate(o, resp.GetIterations())
+		return nil
 	case opWriteDisk:
 		return u.postProto(ctx, glutton.WriteDiskRoute,
 			&gluttonpb.WriteDiskRequest{Key: o.key, Size: int32(o.bytes), WriteMode: gluttonpb.WriteMode_WRITE_MODE_TRUNCATE},
@@ -341,6 +390,23 @@ func (u *sessionUser) execOp(ctx context.Context, o op) error {
 	default:
 		return fmt.Errorf("unknown op kind %d", o.kind)
 	}
+}
+
+// observeBurnRate records a burn's iterations per goroutine-second.
+func observeBurnRate(o op, iterations int64) {
+	if rate, ok := burnRatePerGoroutine(o, iterations); ok {
+		burnRate.Observe(rate)
+	}
+}
+
+// burnRatePerGoroutine normalizes a BurnCPU result by the burn's goroutine
+// count and wall-clock seconds. A zero-duration burn has no rate.
+func burnRatePerGoroutine(o op, iterations int64) (float64, bool) {
+	if o.millis <= 0 {
+		return 0, false
+	}
+	goroutines := max(int64(o.parallel), 1)
+	return float64(iterations) / float64(goroutines) / (float64(o.millis) / 1000), true
 }
 
 // postProto POSTs req to the actor's route through the router and
@@ -395,7 +461,7 @@ func (u *sessionUser) create(ctx context.Context) error {
 		_, err := u.cfg.APIStub.CreateActor(callCtx, &ateapipb.CreateActorRequest{
 			Actor: &ateapipb.Actor{
 				Metadata:      &ateapipb.ResourceMetadata{Atespace: u.cfg.Atespace, Name: u.actorName},
-				ActorTemplate: &ateapipb.ObjectRef{Atespace: templateNS, Name: u.templateName},
+				ActorTemplate: &ateapipb.ObjectRef{Atespace: templateNS, Name: templateName},
 			},
 		}, grpc.Trailer(tr))
 		return err
@@ -424,32 +490,44 @@ func (u *sessionUser) waitServing(ctx context.Context) error {
 	return fmt.Errorf("actor %s never served: %w", u.actorName, lastErr)
 }
 
-func (u *sessionUser) resume(ctx context.Context) bool {
+// resume issues ResumeActor, retrying concurrent-update conflicts inside
+// the traced call so the reported latency spans every attempt.
+func (u *sessionUser) resume(ctx context.Context) error {
 	err := u.tracedCall(ctx, "ResumeActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.ResumeActor(callCtx, &ateapipb.ResumeActorRequest{Actor: u.ref()}, grpc.Trailer(tr))
-		return err
+		return boomerutil.RetryOnConflict(callCtx, func() error {
+			_, err := u.cfg.APIStub.ResumeActor(callCtx, &ateapipb.ResumeActorRequest{Actor: u.ref()}, grpc.Trailer(tr))
+			return err
+		})
 	})
 	if err != nil {
+		if boomerutil.IsCrashed(err) {
+			bmetrics.RecordFailure("actor", "CrashCount", agentSessionUserClass, 0, "actor entered ACTOR_STATE_CRASHED")
+		}
 		slog.Error("ResumeActor failed", slog.String("actor", u.actorName), slog.String("err", err.Error()))
 	}
-	return err == nil
+	return err
 }
 
 // hibernate suspends (or pauses, per LifecycleMode) the actor at the end of
-// a step. Failures are recorded but not fatal: the next wake reports the
-// resulting state.
+// a step. A failure leaves hibernatePending set so the next step re-drives
+// it instead of waking a stranded actor.
 func (u *sessionUser) hibernate(ctx context.Context) {
+	var err error
 	if u.cfg.Dyn.Load().LifecycleMode == dynconfig.LifecycleModePause {
-		_ = u.tracedCall(ctx, "PauseActor", func(callCtx context.Context, tr *metadata.MD) error {
+		err = u.tracedCall(ctx, "PauseActor", func(callCtx context.Context, tr *metadata.MD) error {
 			_, err := u.cfg.APIStub.PauseActor(callCtx, &ateapipb.PauseActorRequest{Actor: u.ref()}, grpc.Trailer(tr))
 			return err
 		})
-		return
+	} else {
+		err = u.tracedCall(ctx, "SuspendActor", func(callCtx context.Context, tr *metadata.MD) error {
+			_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{Actor: u.ref()}, grpc.Trailer(tr))
+			return err
+		})
 	}
-	_ = u.tracedCall(ctx, "SuspendActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{Actor: u.ref()}, grpc.Trailer(tr))
-		return err
-	})
+	u.hibernatePending = err != nil
+	if err != nil {
+		u.noteFailure(err)
+	}
 }
 
 // suspendAndDelete releases the actor and its worker. Suspend first: a
@@ -459,7 +537,9 @@ func (u *sessionUser) suspendAndDelete(ctx context.Context) {
 	if u.cleanedUp {
 		return
 	}
-	_, _ = u.cfg.APIStub.SuspendActor(ctx, &ateapipb.SuspendActorRequest{Actor: u.ref()})
+	suspendCtx, cancel := context.WithTimeout(ctx, controlRPCTimeout)
+	_, _ = u.cfg.APIStub.SuspendActor(suspendCtx, &ateapipb.SuspendActorRequest{Actor: u.ref()})
+	cancel()
 	_ = u.tracedCall(ctx, "DeleteActor", func(callCtx context.Context, tr *metadata.MD) error {
 		_, err := u.cfg.APIStub.DeleteActor(callCtx, &ateapipb.DeleteActorRequest{Actor: u.ref(), AnyState: true}, grpc.Trailer(tr))
 		return err
@@ -468,10 +548,12 @@ func (u *sessionUser) suspendAndDelete(ctx context.Context) {
 	u.cleanedUp = true
 }
 
-// tracedCall runs one control-plane RPC under a span and records it as a
-// locust stats row of the same name, preferring the server-measured elapsed
-// time from the response trailer.
+// tracedCall runs one control-plane RPC under a span and a deadline, and
+// records it as a locust stats row of the same name, preferring the
+// server-measured elapsed time from the response trailer.
 func (u *sessionUser) tracedCall(ctx context.Context, name string, do func(context.Context, *metadata.MD) error) error {
+	ctx, cancel := context.WithTimeout(ctx, controlRPCTimeout)
+	defer cancel()
 	ctx, span := u.cfg.Tracer.Start(ctx, name)
 	defer span.End()
 

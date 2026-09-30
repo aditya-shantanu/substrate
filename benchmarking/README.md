@@ -158,8 +158,9 @@ exactly the oversubscription story this measures.
 The entire workload is the declarative script in
 [`internal/benchmarking/boomer/agentsession/script.go`](../internal/benchmarking/boomer/agentsession/script.go)
 — one table entry per step, naming what the agent is doing and the resource
-ops that act it out. To change the workload, edit the table. The actor runs
-the stock glutton binary; steps are sequences of glutton RPCs:
+ops that act it out. To change the workload, edit the table. Each session is
+an actor from the stock `glutton` template; steps are sequences of glutton
+RPCs:
 
 | Step | The agent is… | Sandbox effect |
 |---|---|---|
@@ -184,22 +185,20 @@ the stock glutton binary; steps are sequences of glutton RPCs:
 | 19_package_artifact | building the release package | disk read; 1s CPU; 24Mi disk write |
 | 20_commit_and_summarize | committing + summarizing | 256Ki disk write; 24Mi shipped back out; RAM walk |
 
-The template is not in the default workload set because it needs bigger
-actors than the shared 256Mi default: the script holds ~96Mi of RAM arrays +
-~110Mi of tmpfs files, and the observed guest peak with allocator transients
-is ~320Mi (512Mi OOMs — deploy with 1Gi). `TestSessionBudgets` bounds the
-script-declared bytes only, so script edits that grow the working set fail
-the test and force this guidance to be revisited. Deploy it explicitly:
+The script needs bigger actors than the 256Mi default: it holds ~96Mi of
+RAM arrays + ~110Mi of tmpfs files, and the observed guest peak with
+allocator transients is ~320Mi (512Mi OOMs). Deploy the workloads with
+`--actor-memory 1Gi`. `TestSessionBudgets` bounds the script-declared bytes
+only, so script edits that grow the working set fail the test and force this
+guidance to be revisited.
 
 ```sh
-WORKLOAD_TEMPLATES=agentsession ./benchmarking/deploy_locust.sh --deploy --sandbox-class gvisor --actor-memory 1Gi
+./benchmarking/deploy_locust.sh --deploy --sandbox-class gvisor --actor-memory 1Gi
 ./benchmarking/locust/deploy.sh --deploy --user-class agentsession
 ```
 
 #### Agent-Session Configuration Knobs
 
-* `--agentsession-template` — ActorTemplate to instantiate per session
-  (default `agentsession`).
 * `--agentsession-think-scale` — multiplier on every think gap; 0.5 makes the
   fleet twice as chatty, 4.0 models slow reasoning models (default 1.0). Each
   gap gets ±20% jitter so sessions don't move in lockstep.

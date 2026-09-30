@@ -32,7 +32,7 @@ if os.environ.get("LOCUST_NO_AGENTSESSION_USER") != "1":
     from common.boomer_config import init_boomer_config
 
     # Master serves /boomer-config so the boomer-worker workers can fetch
-    # runtime flag values (think-time scale, template, resume mode) the
+    # runtime flag values (think-time scale, resume mode) the
     # operator set in the web UI form. No-op on workers without a web UI.
     init_boomer_config()
 
