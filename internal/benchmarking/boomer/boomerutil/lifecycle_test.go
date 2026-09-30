@@ -88,13 +88,14 @@ func queue(errs ...error) (call func() error, attempts *atomic.Int64) {
 }
 
 func TestRetryOnConflictRetriesThenSucceeds(t *testing.T) {
-	call, attempts := queue(conflictErr(), conflictErr())
+	errs := []error{conflictErr(), conflictErr()}
+	call, attempts := queue(errs...)
 	start := time.Now()
 	if err := RetryOnConflict(context.Background(), call); err != nil {
 		t.Fatalf("RetryOnConflict = %v, want nil after conflicts clear", err)
 	}
-	if attempts.Load() != 3 {
-		t.Errorf("attempts = %d, want 3 (two conflicts, then success)", attempts.Load())
+	if want := int64(len(errs) + 1); attempts.Load() != want {
+		t.Errorf("attempts = %d, want %d (every conflict, then success)", attempts.Load(), want)
 	}
 	if elapsed := time.Since(start); elapsed < ConflictRetryBackoff {
 		t.Errorf("elapsed = %v, want >= %v (second retry must back off)", elapsed, ConflictRetryBackoff)
