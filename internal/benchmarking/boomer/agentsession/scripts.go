@@ -18,6 +18,7 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
+	"os"
 	"sort"
 	"strings"
 )
@@ -47,6 +48,22 @@ func Names() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// LoadFile reads a script from a YAML file on the worker, typically a
+// ConfigMap mounted by benchmarking/locust/deploy.sh --agentsession-script.
+// Unlike built-in variants the file name is not constrained: the script's
+// own name field is what the logs report.
+func LoadFile(path string) (*Script, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read agent-session script: %w", err)
+	}
+	s, err := Decode(data)
+	if err != nil {
+		return nil, fmt.Errorf("agent-session script %s: %w", path, err)
+	}
+	return s, nil
 }
 
 // Load returns the built-in script variant called name. The file's name

@@ -17,6 +17,8 @@ package agentsession
 import (
 	"context"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -275,6 +277,52 @@ func TestLoadScriptFollowsTheKnob(t *testing.T) {
 	rt.cfg.Dyn.Store(dynconfig.Config{AgentSessionScript: "no-such-script"})
 	if again, err := rt.loadScript(); err != nil || again != s {
 		t.Errorf("second loadScript = (%v, %v), want the cached script", again, err)
+	}
+}
+
+// TestLoadFile reads a script from disk and reports the path on errors.
+func TestLoadFile(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "tiny.yaml")
+	if err := os.WriteFile(good, []byte(validScript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := LoadFile(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Name != "tiny" || len(s.Steps) != 2 {
+		t.Errorf("LoadFile = %q with %d steps, want tiny with 2", s.Name, len(s.Steps))
+	}
+
+	bad := filepath.Join(dir, "bad.yaml")
+	if err := os.WriteFile(bad, []byte(strings.Replace(validScript, "- ping: {}", "- nap: {}", 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFile(bad); err == nil || !strings.Contains(err.Error(), bad) || !strings.Contains(err.Error(), "unknown op kind") {
+		t.Errorf("LoadFile(bad) = %v, want an error naming the file and the op", err)
+	}
+	if _, err := LoadFile(filepath.Join(dir, "missing.yaml")); err == nil {
+		t.Error("LoadFile of a missing path must fail")
+	}
+}
+
+// TestLoadScriptPrefersFile: a file path beats a built-in name.
+func TestLoadScriptPrefersFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tiny.yaml")
+	if err := os.WriteFile(path, []byte(validScript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rt := &runtime{cfg: &userclass.Config{Dyn: dynconfig.NewHolder(dynconfig.Config{
+		AgentSessionScript:     DefaultScript,
+		AgentSessionScriptFile: path,
+	})}}
+	s, err := rt.loadScript()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Name != "tiny" {
+		t.Errorf("loaded %q, want the file's script", s.Name)
 	}
 }
 

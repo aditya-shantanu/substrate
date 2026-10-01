@@ -150,32 +150,43 @@ type runtime struct {
 	templateErr error
 }
 
-// loadScript resolves the run's script on first use. It cannot happen at
-// Init: the operator's knob values arrive with the first spawn message,
-// after Init, so a load there would only ever see --config-json. A failed
-// load is retried on the next iteration, so correcting the knob in the web
-// UI and starting a new swarm recovers without a pod restart.
+// loadScript resolves the run's script on first use: a file named by
+// --agentsession-script-file wins, else the built-in variant named by
+// --agentsession-script, else the default. It cannot happen at Init: the
+// operator's knob values arrive with the first spawn message, after Init,
+// so a load there would only ever see --config-json. A failed load is
+// retried on the next iteration, so correcting the knob in the web UI and
+// starting a new swarm recovers without a pod restart.
 func (r *runtime) loadScript() (*Script, error) {
 	r.scriptMu.Lock()
 	defer r.scriptMu.Unlock()
 	if r.script != nil {
 		return r.script, nil
 	}
-	name := r.cfg.Dyn.Load().AgentSessionScript
-	if name == "" {
-		name = DefaultScript
+	dyn := r.cfg.Dyn.Load()
+	var s *Script
+	var err error
+	source := dyn.AgentSessionScriptFile
+	if source != "" {
+		s, err = LoadFile(source)
+	} else {
+		source = dyn.AgentSessionScript
+		if source == "" {
+			source = DefaultScript
+		}
+		s, err = Load(source)
 	}
-	s, err := Load(name)
 	if err != nil {
 		return nil, err
 	}
 	b := Budgets(s.Steps)
 	slog.Info("agentsession: loaded script",
 		slog.String("script", s.Name),
+		slog.String("source", source),
 		slog.Int("steps", len(s.Steps)),
-		slog.String("declared_ram", formatSize(b.RAM)),
-		slog.String("declared_disk", formatSize(b.Disk)),
-		slog.String("min_actor_memory", formatSize(s.MinActorMemory)))
+		slog.String("declared_ram", FormatSize(b.RAM)),
+		slog.String("declared_disk", FormatSize(b.Disk)),
+		slog.String("min_actor_memory", FormatSize(s.MinActorMemory)))
 	r.script = s
 	r.ingestBuf = makeIngestBuf(s.Steps)
 	return s, nil
@@ -205,10 +216,10 @@ func (r *runtime) checkTemplateMemory(ctx context.Context) error {
 	case !ok:
 		slog.Warn("agentsession: template sets no memory limit; cannot check it against the script",
 			slog.String("template", templateName),
-			slog.String("min_actor_memory", formatSize(r.script.MinActorMemory)))
+			slog.String("min_actor_memory", FormatSize(r.script.MinActorMemory)))
 	case limit < r.script.MinActorMemory:
 		r.templateErr = fmt.Errorf("template %s/%s memory limit %s is below script %q min_actor_memory %s; redeploy the workloads with --actor-memory %s",
-			templateNS, templateName, formatSize(limit), r.script.Name, formatSize(r.script.MinActorMemory), formatSize(r.script.MinActorMemory))
+			templateNS, templateName, FormatSize(limit), r.script.Name, FormatSize(r.script.MinActorMemory), FormatSize(r.script.MinActorMemory))
 		return r.templateErr
 	}
 	r.templateOK = true
