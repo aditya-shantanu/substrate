@@ -137,6 +137,11 @@ spec:
         env:
         - name: OTEL_EXPORTER_OTLP_ENDPOINT
           value: opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317
+        # Checksum of the operator-supplied agent-session script, if any.
+        # Not read by the worker: it is here so that deploying a different
+        # script changes the pod template and rolls the workers.
+        - name: AGENTSESSION_SCRIPT_SHA
+          value: "${AGENTSESSION_SCRIPT_SHA}"
         ports:
         - name: boomer-prom
           containerPort: 8001

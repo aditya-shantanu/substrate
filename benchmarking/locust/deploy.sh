@@ -105,18 +105,29 @@ if [[ ! -f "${SCRIPT_DIR}/tests/${BENCHMARK_USER_CLASS}.py" ]]; then
   echo "Error: no tests/${BENCHMARK_USER_CLASS}.py; --user-class must name a test file" >&2
   exit 1
 fi
-if [[ -n "${AGENTSESSION_SCRIPT}" && ! -f "${AGENTSESSION_SCRIPT}" ]]; then
-  echo "Error: --agentsession-script ${AGENTSESSION_SCRIPT}: no such file" >&2
-  exit 1
+if [[ -n "${AGENTSESSION_SCRIPT}" ]]; then
+  if [[ ! -f "${AGENTSESSION_SCRIPT}" ]]; then
+    echo "Error: --agentsession-script ${AGENTSESSION_SCRIPT}: no such file" >&2
+    exit 1
+  fi
+  # Absolute from here on: the validation step below runs from the repo
+  # root, and a relative path would resolve against that instead.
+  AGENTSESSION_SCRIPT="$(cd "$(dirname "${AGENTSESSION_SCRIPT}")" && pwd)/$(basename "${AGENTSESSION_SCRIPT}")"
 fi
 export BENCHMARK_USER_CLASS
 # Empty leaves the master's --agentsession-script-file default unset, so
 # workers run the built-in variant named by --agentsession-script.
 AGENTSESSION_SCRIPT_FILE=""
+# The script's checksum goes into the boomer container's env, so a redeploy
+# with a different script changes the pod template and rolls the pods.
+# Without it the manifest would be identical and the old workers would keep
+# running until something else restarted them.
+AGENTSESSION_SCRIPT_SHA=""
 if [[ -n "${AGENTSESSION_SCRIPT}" ]]; then
   AGENTSESSION_SCRIPT_FILE="${AGENTSESSION_SCRIPT_MOUNT}"
+  AGENTSESSION_SCRIPT_SHA="$( (sha256sum "${AGENTSESSION_SCRIPT}" 2>/dev/null || shasum -a 256 "${AGENTSESSION_SCRIPT}") | cut -c1-16)"
 fi
-export AGENTSESSION_SCRIPT_FILE
+export AGENTSESSION_SCRIPT_FILE AGENTSESSION_SCRIPT_SHA
 
 if [[ "${action}" == "deploy" ]]; then
   deploy

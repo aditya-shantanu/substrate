@@ -208,8 +208,9 @@ deployment fails loudly instead of showing up as OOM-flaky steps.
 
 * `--agentsession-script` — built-in script variant to run, by file name
   under `internal/benchmarking/boomer/agentsession/scripts/` (default
-  `coding-session`). Read once, on the worker's first iteration after the
-  swarm starts, then fixed for the worker's lifetime.
+  `coding-session`). Resolved when a session starts, so a change takes
+  effect for sessions started after the next swarm; sessions already
+  running finish on the script they started with.
 * `--agentsession-script-file` — path, on the boomer worker, of a script
   YAML to run instead of a built-in variant; wins over
   `--agentsession-script`. Normally set for you by
