@@ -24,6 +24,12 @@
 # Pause mode keeps checkpoints node-local; a paused actor resumes only on its
 # own node, so a hot node reports no room while siblings idle. That is part of
 # what this measures.
+#
+# size10 + a dedicated postgres node: the bundled size0 PostgreSQL allows 100
+# connections and each ateapi replica's pool defaults to one per CPU, which on
+# 88-core nodes exhausted it during the first run's ramp. The ramp is 5
+# sessions/s so first activations (create, golden restore, pause) stay well
+# under the resident slots.
 tests:
   - name: agentsession_1k_pause_microvm_roomy
     type: locust
@@ -40,11 +46,15 @@ tests:
     runnerCpu: "4"
     runnerMemory: "8Gi"
     ateArgs:
+      - "--cluster-size=size10"
+      - "--cordon-control-plane"
+      - "--podcert-workers-per-signer"
+      - "10"
       - "--rollout-timeout"
       - "600s"
     flags:
       - "-r"
-      - "20"
+      - "5"
       - "--resume-mode"
       - "implicit"
       - "--lifecycle-mode"
@@ -68,11 +78,15 @@ tests:
     runnerCpu: "4"
     runnerMemory: "8Gi"
     ateArgs:
+      - "--cluster-size=size10"
+      - "--cordon-control-plane"
+      - "--podcert-workers-per-signer"
+      - "10"
       - "--rollout-timeout"
       - "600s"
     flags:
       - "-r"
-      - "20"
+      - "5"
       - "--resume-mode"
       - "implicit"
       - "--lifecycle-mode"
