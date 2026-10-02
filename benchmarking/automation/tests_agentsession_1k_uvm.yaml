@@ -1,0 +1,83 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Agent-session (coding-agent) workload on micro-VM (bare metal): 1000 sessions, oversubscribed
+# against a fixed 3-worker base. Oversubscription X = sessions / resident slots,
+# slots = workerCount * workerMemory / actorMemory. Think-scale 15 puts the
+# active duty cycle near 4%, so ~40 sessions are resident at any moment.
+#
+# Two tests, same load, different base:
+#   roomy: 3 x 34Gi = 102 slots (X ~ 10), residents far below slots.
+#   tight: 3 x 12Gi =  36 slots (X ~ 28), residents close to slots, so
+#          no_free_worker, parking, and wake latency should start to move.
+# Pause mode keeps checkpoints node-local; a paused actor resumes only on its
+# own node, so a hot node reports no room while siblings idle. That is part of
+# what this measures.
+tests:
+  - name: agentsession_1k_pause_microvm_roomy
+    type: locust
+    description: "agentsession: 1000 sessions, pause, implicit wake, think x15, 102 resident slots, c3-highmem-192-metal"
+    targetCluster: dev
+    sandboxClass: microvm
+    file: /app/tests/agentsession.py
+    duration: 30m
+    users: 1000
+    workerCount: 3
+    workerMemory: "34Gi"
+    actorMemory: "1Gi"
+    workerWaitTimeout: 900
+    runnerCpu: "4"
+    runnerMemory: "8Gi"
+    ateArgs:
+      - "--rollout-timeout"
+      - "600s"
+    flags:
+      - "-r"
+      - "20"
+      - "--resume-mode"
+      - "implicit"
+      - "--lifecycle-mode"
+      - "pause"
+      - "--agentsession-think-scale"
+      - "15"
+      - "--trace-probability"
+      - "0.001"
+  - name: agentsession_1k_pause_microvm_tight
+    type: locust
+    description: "agentsession: 1000 sessions, pause, implicit wake, think x15, 36 resident slots, c3-highmem-192-metal"
+    targetCluster: dev
+    sandboxClass: microvm
+    file: /app/tests/agentsession.py
+    duration: 30m
+    users: 1000
+    workerCount: 3
+    workerMemory: "12Gi"
+    actorMemory: "1Gi"
+    workerWaitTimeout: 900
+    runnerCpu: "4"
+    runnerMemory: "8Gi"
+    ateArgs:
+      - "--rollout-timeout"
+      - "600s"
+    flags:
+      - "-r"
+      - "20"
+      - "--resume-mode"
+      - "implicit"
+      - "--lifecycle-mode"
+      - "pause"
+      - "--agentsession-think-scale"
+      - "15"
+      - "--trace-probability"
+      - "0.001"
