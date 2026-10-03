@@ -212,6 +212,65 @@ Findings:
    decoder). That matters once actors move between nodes; upstream #1955
    (client pool spread) is the in-flight work there.
 
+
+### B4a. C1+C2+C3 build, pause lifecycle, think-scale 15 (05:12-05:23 UTC)
+
+Build 0ccab235. Same configuration as B2.
+
+| series | n | p50 | p90 | p95 | p99 | max | fail |
+|---|---|---|---|---|---|---|---|
+| WakeFirstTouch (ms) | 1111 | 190 | 240 | 260 | 310 | 760 | 0 |
+| PauseActor (ms) | 1211 | 250 | 890 | 2000 | 3600 | 5800 | 0 |
+
+ateom-gvisor restore p50 0.164 (B2: 0.175); `egress_prepare` still 4 ms of
+wall time but now overlapped, `egress_join` 0. ateapi total 0.190 (B2
+0.196). Client-visible wake unchanged within noise, as expected: the pause
+path has no download and the mint was 2% of it. C2 kept (it is pure
+overlap); C1 has no effect on this path.
+
+### B4b. C1+C2+C3 build, suspend lifecycle, think-scale 15 (05:25-05:36 UTC)
+
+Same configuration as B3.
+
+| series | n | p50 | p90 | p95 | p99 | max | fail |
+|---|---|---|---|---|---|---|---|
+| WakeFirstTouch (ms) | 1096 | 190 | 250 | 270 | 340 | 420 | 0 |
+| SuspendActor (ms) | 1242 | 1800 | 4700 | 18000 | 60000 | 60000 | 48 |
+
+| layer | B3 (s) | B4b (s) |
+|---|---|---|
+| atelet restore (latest) total p50 / p90 / p99 | 1.179 / 1.931 / 3.347 | 0.182 / 0.236 / 0.327 |
+| of which download | 0.927 / 1.633 / 3.057 | (retained: hard links, under 1 ms) |
+| ateapi resume total p50 / p99 | 1.356 / 3.811 | 0.195 / 0.339 |
+
+`ate.actor.restore.source`: 987 retained, 16 download (the 16 are first
+activations of replacement actors after crashes, see below). A same-node
+suspend/resume wake is now the pause wake: 6x at p50, 10x at p99 against
+B3, and 0 wake failures.
+
+Suspend itself did not improve and shows two problems that need separating
+from C3: (a) one minute (05:27) in which every GCS upload took 20 to 58 s
+(`persist` p50 19.7 s in that minute, 1.0 to 1.4 s in every other minute),
+which produced the 60 s deadline failures; B3 showed the same shape at a
+smaller scale and it is on the GCS side, not the node (disk I/O pressure was
+under 5% at the time); (b) 16 `runsc checkpoint` exits with status 128 that
+crashed their actors; investigated below.
+
+The 16 checkpoint failures all fall in 05:28, the minute after the GCS
+stall, and nowhere else in the day (Cloud Logging over every run since
+04:10). runsc's stderr for them is `connecting to control server: connection
+refused`: the sandbox was already being torn down when `runsc checkpoint`
+ran, which is what a suspend whose context was canceled by the 60 s client
+deadline (contexts propagate ateapi to atelet to ateom) looks like while the
+backlog of 20 to 58 s uploads drained. C3 is not on that path (it runs after
+a successful upload) and the actors restored from retained copies all
+restored cleanly. Verdict: keep C3. Separate finding: a suspend canceled by
+its caller's deadline leaves the actor CRASHED rather than RUNNING or
+SUSPENDED (upstream #1665 family).
+
+C1 could not be measured here: with retained hits there is no manifest GET
+left to overlap. It will show on the multi-node runs, where misses download.
+
 ## Changes
 
 Each change: what, why, measured effect, verdict (keep / drop), submit?
@@ -270,7 +329,31 @@ runs in a goroutine started where it used to block and is joined just before
 activation; a new `egress_join` phase reports what is left on the critical
 path. Failure paths wait for the goroutine before cleanup. Same change in
 `RunWorkload`. Expected: about 4 ms p50, 13 ms p99 off every gVisor restore.
-Measured: pending (B4).
+Measured (B4a vs B2): ateom restore p50 0.175 to 0.164 s, egress_join 0;
+client wake unchanged within noise. Kept (pure overlap, no cost).
+
+### C3. atelet: restore from the node-local copy of the just-uploaded snapshot (0ccab235)
+
+Suspend renamed nothing and deleted everything: the checkpoint files were
+streamed to GCS from `checkpoint-state/` and then removed by the actor dir
+reset. They are now renamed into `<actor>/retained-snapshot/` together with
+the manifest and the exact snapshot URI; an EXTERNAL restore whose URI
+matches byte for byte hard-links them into `restore-state/` and skips both
+the manifest GET and the download. Any mismatch (other URI, missing file,
+unreadable manifest) logs a miss and downloads as before. The copy is
+replaced on each upload (old one removed in the background), left in place
+after a hit, removed on terminate, and gated by `--retain-uploaded-snapshots`
+(default on in this branch). Only `latest` snapshots are retained; goldens are
+restored by other actors. The restore log carries
+`ate.actor.restore.source=retained|download|local`.
+
+Expected: a same-node suspend/resume wake drops from about 0.78 s to about
+the pause figure (0.19 s), and suspend loses the `dirs_reset` delete of the
+uploaded files. Multi-node benefit depends on the scheduler picking the same
+node, which it does not try to do today (#1761/#589). Disk: one extra
+snapshot per suspended actor on its last node, no cap; an upstream version
+needs an age or budget GC. Measured (B4b vs B3): wake p50 1.2 s to 0.19 s, p99 3.4 s to 0.34 s,
+98.4% retained hits, zero wake failures. Kept.
 
 ## Candidates to submit
 
