@@ -541,10 +541,13 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 	//   * Correct runsc version is downloaded and placed on disk.
 	//   * All OCI bundles are set up, including for the pause container.
 
-	egress, err := s.tunnel.PrepareEgress(ctx, ateomstats.ActorAttributionFromRequest(req), req.GetEgressGateway())
-	if err != nil {
-		return nil, err
-	}
+	// The certificate mint overlaps the sandbox setup; it is joined just
+	// before tunnel.Activate, the only consumer. The deferred abandon covers a
+	// failure before the cleanup below is registered.
+	egressPrep := startEgressPrep(ctx, func(ctx context.Context) (*ateomtunnel.ActorEgress, error) {
+		return s.tunnel.PrepareEgress(ctx, attribution, req.GetEgressGateway())
+	})
+	defer egressPrep.abandon()
 	// Publish attribution before boot so stats can include startup usage.
 	if _, err := s.hostActor(ctx, attribution, req.GetActorDirs()); err != nil {
 		return nil, err
@@ -559,6 +562,8 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 	var containersToDelete []string
 	defer func() {
 		if retErr != nil {
+			// Settle the mint before the tunnel is deactivated.
+			egressPrep.abandon()
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
 			if err := s.tunnel.Deactivate(cleanupCtx, ateomstats.ActorAttributionFromRequest(req)); err != nil {
@@ -617,6 +622,10 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 	// Block until every wakeup-probe-enabled container reports 200.
 	if err := wakeupprobe.WaitAll(ctx, req.GetSpec().GetContainers(), ateomnet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(req.GetActorUid()))); err != nil {
 		return nil, fmt.Errorf("while waiting for container wakeup probe: %w", err)
+	}
+	egress, err := egressPrep.join()
+	if err != nil {
+		return nil, err
 	}
 	if err := s.tunnel.Activate(ateomstats.ActorAttributionFromRequest(req), s.sandboxDialer(req.GetActorUid()), egress); err != nil {
 		return nil, err
@@ -882,11 +891,17 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	//   * All OCI bundles are set up, including for the pause container.
 	//   * Checkpoint downloaded and placed on disk
 
-	egress, err := s.tunnel.PrepareEgress(ctx, attribution, req.GetEgressGateway())
-	timing.egressPrepare = lap(&tLast)
-	if err != nil {
-		return nil, err
-	}
+	// The certificate mint overlaps the sandbox setup; it is joined just
+	// before tunnel.Activate, the only consumer. The deferred abandon covers a
+	// failure before the cleanup below is registered, and runs ahead of the
+	// timing record so egress_prepare is reported on every exit.
+	egressPrep := startEgressPrep(ctx, func(ctx context.Context) (*ateomtunnel.ActorEgress, error) {
+		return s.tunnel.PrepareEgress(ctx, attribution, req.GetEgressGateway())
+	})
+	defer func() {
+		egressPrep.abandon()
+		timing.egressPrepare = egressPrep.elapsed
+	}()
 	_, err = s.hostActor(ctx, attribution, req.GetActorDirs())
 	timing.netSetup = lap(&tLast)
 	if err != nil {
@@ -902,6 +917,8 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	var containersToDelete []string
 	defer func() {
 		if retErr != nil {
+			// Settle the mint before the tunnel is deactivated.
+			egressPrep.abandon()
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
 			if err := s.tunnel.Deactivate(cleanupCtx, attribution); err != nil {
@@ -1011,6 +1028,11 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	timing.wakeupProbe = lap(&tLast)
 	if err != nil {
 		return nil, fmt.Errorf("while waiting for container wakeup probe: %w", err)
+	}
+	egress, err := egressPrep.join()
+	timing.egressJoin = lap(&tLast)
+	if err != nil {
+		return nil, err
 	}
 	err = s.tunnel.Activate(attribution, s.sandboxDialer(req.GetActorUid()), egress)
 	timing.activate = lap(&tLast)

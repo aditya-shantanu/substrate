@@ -1054,6 +1054,39 @@ func narrowFullCaptureToData(rec *sandboxAssetsRecord) error {
 	return nil
 }
 
+// fetchRestoreManifest reads the snapshot manifest stored beside the
+// checkpoint files: it lists the files to download and records the identity
+// of the actor that wrote the snapshot.
+func (s *AteomHerder) fetchRestoreManifest(ctx context.Context, req *ateletpb.RestoreRequest) (*sandboxAssetsRecord, error) {
+	var manifest []byte
+	switch req.GetType() {
+	case ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL:
+		uri, err := resources.ParseSnapshotURI(req.GetExternalConfig().GetSnapshotUri())
+		if err != nil {
+			return nil, err
+		}
+		manifestURI, err := uri.ObjectURI(sandboxManifestName)
+		if err != nil {
+			return nil, err
+		}
+		if manifest, err = objectstorage.FetchFromGCS(ctx, s.gcsClient, manifestURI); err != nil {
+			return nil, fmt.Errorf("while fetching snapshot manifest: %w", err)
+		}
+	case ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL:
+		var err error
+		if manifest, err = readSnapshotManifest(ateletpath.LocalSnapshotDir(req.GetActorUid(), req.GetLocalConfig().GetSnapshotName())); err != nil {
+			return nil, wrapFileSystemErr("while reading local snapshot manifest", err)
+		}
+	default:
+		return nil, fmt.Errorf("unexpected checkpoint type: %v", req.GetType())
+	}
+	rec, err := unmarshalSandboxRecord(manifest)
+	if err != nil {
+		return nil, fmt.Errorf("while unmarshalling sandbox record: %w", err)
+	}
+	return rec, nil
+}
+
 func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (resp *ateletpb.RestoreResponse, err error) {
 	if err := validateRestoreRequest(req); err != nil {
 		return nil, apierror.InvalidArgument("%v", err)
@@ -1070,6 +1103,10 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	runtimeRec, err := recordFromRequest(req.GetSandboxAssets())
 	if err != nil {
 		return nil, apierror.InvalidArgument("invalid sandbox_assets: %v", err)
+	}
+	spec, err := buildAteomWorkloadSpec(req.GetSpec())
+	if err != nil {
+		return nil, apierror.InvalidArgument("invalid workload spec: %v", err)
 	}
 
 	// Per-step timing so we can attribute resume latency between the rustfs
@@ -1129,52 +1166,15 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 
 	checkpointDir := ateletpath.RestoreStateDir(actorUID)
 
-	// Fetch the snapshot manifest stored beside the checkpoint images
-	// first: it lists the checkpoint files to download and records the actor
-	// identity used to label the restore's metrics.
-	tManifest := time.Now()
-	manifestDone := false
-	defer func() {
-		if !manifestDone {
-			dManifest = time.Since(tManifest)
-		}
-	}()
-	var sandboxRec *sandboxAssetsRecord
-	switch req.GetType() {
-	case ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL:
-		uri, err := resources.ParseSnapshotURI(req.GetExternalConfig().GetSnapshotUri())
-		if err != nil {
-			return nil, err
-		}
-		manifestURI, err := uri.ObjectURI(sandboxManifestName)
-		if err != nil {
-			return nil, err
-		}
-		manifest, err := objectstorage.FetchFromGCS(ctx, s.gcsClient, manifestURI)
-		if err != nil {
-			return nil, fmt.Errorf("while fetching snapshot manifest: %w", err)
-		}
-		if sandboxRec, err = unmarshalSandboxRecord(manifest); err != nil {
-			return nil, fmt.Errorf("while unmarshalling sandbox record: %w", err)
-		}
-	case ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL:
-		manifest, err := readSnapshotManifest(ateletpath.LocalSnapshotDir(actorUID, req.GetLocalConfig().GetSnapshotName()))
-		if err != nil {
-			return nil, wrapFileSystemErr("while reading local snapshot manifest", err)
-		}
-		if sandboxRec, err = unmarshalSandboxRecord(manifest); err != nil {
-			return nil, fmt.Errorf("while unmarshalling sandbox record: %w", err)
-		}
-	default:
-		return nil, fmt.Errorf("unexpected checkpoint type: %v", req.GetType())
+	// The dial is a cache hit or a lazy gRPC client, so it costs nothing to do
+	// before the legs below, and an unreachable target fails before any
+	// download starts.
+	tDial := time.Now()
+	client, err := s.dialAteom(ctx, req.GetTargetAteomUid())
+	dDial = time.Since(tDial)
+	if err != nil {
+		return nil, err
 	}
-
-	dManifest = time.Since(tManifest)
-	manifestDone = true
-
-	// The manifest is what tells a golden restore from a latest one, so the
-	// snapshot kind only becomes knowable here.
-	op.kind = restoreSnapshotKind(req, sandboxRec)
 
 	// Undo the Register if the restore fails.
 	defer func() {
@@ -1183,33 +1183,46 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		}
 	}()
 
-	// Download the memory snapshot and prepare the sandbox assets + OCI bundle
-	// CONCURRENTLY. They are independent — only the final ateom.RestoreWorkload
-	// needs both — so overlapping the GCS download (~0.5s warm) with the asset
-	// fetch + image unpack hides whichever leg is shorter, and on a cold node
-	// (uncached assets + image, ~2.5s unpack) that overlap is large.
+	// Two legs run CONCURRENTLY; only the final ateom.RestoreWorkload needs
+	// both. The fetch leg reads the snapshot manifest (one GCS GET on an
+	// external restore) and then downloads the checkpoint files it lists. The
+	// prep leg fetches the sandbox assets, registers the system-info volumes,
+	// and unpacks the OCI bundles; it needs only the request, so it does not
+	// wait for the manifest. Overlapping the GCS download (~0.5s warm) with
+	// the asset fetch + image unpack hides whichever leg is shorter, and on a
+	// cold node (uncached assets + image, ~2.5s unpack) that overlap is large.
 	// TODO(dberkov): the old pause checkpoint files are not deleted after they are
 	// copied to checkpointDir for the LOCAL case.
+	var sandboxRec *sandboxAssetsRecord
 	var assetPaths map[string]string
 	// One per leg: a single field written from both goroutines would race.
-	var downloadErr, prepErr error
-	var prepFailedPhase string
+	var fetchErr, prepErr error
+	var fetchFailedPhase, prepFailedPhase string
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() (err error) {
-		t := time.Now()
-		defer func() {
-			dDownload = time.Since(t)
-			downloadErr = err
-		}()
+		defer func() { fetchErr = err }()
+		tManifest := time.Now()
+		sandboxRec, err = s.fetchRestoreManifest(gctx, req)
+		dManifest = time.Since(tManifest)
+		if err != nil {
+			fetchFailedPhase = ateattr.SnapshotPhaseManifestFetch
+			return err
+		}
+		// The manifest is what tells a golden restore from a latest one, so the
+		// snapshot kind only becomes knowable here. Read after g.Wait.
+		op.kind = restoreSnapshotKind(req, sandboxRec)
+
+		tDownload := time.Now()
 		switch req.GetType() {
 		case ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL:
-			if err := s.downloadExternalCheckpoint(gctx, req.GetExternalConfig().GetSnapshotUri(), checkpointDir, sandboxRec.SnapshotFiles); err != nil {
-				return err
-			}
+			err = s.downloadExternalCheckpoint(gctx, req.GetExternalConfig().GetSnapshotUri(), checkpointDir, sandboxRec.SnapshotFiles)
 		case ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL:
-			if err := s.copyLocalCheckpoint(gctx, ateletpath.ActorPath(actorUID), req.GetLocalConfig().GetSnapshotName(), ateletpath.LocalCheckpointsDir(actorUID), checkpointDir, sandboxRec.SnapshotFiles); err != nil {
-				return err
-			}
+			err = s.copyLocalCheckpoint(gctx, ateletpath.ActorPath(actorUID), req.GetLocalConfig().GetSnapshotName(), ateletpath.LocalCheckpointsDir(actorUID), checkpointDir, sandboxRec.SnapshotFiles)
+		}
+		dDownload = time.Since(tDownload)
+		if err != nil {
+			fetchFailedPhase = ateattr.SnapshotPhaseDownload
+			return err
 		}
 		return nil
 	})
@@ -1239,7 +1252,12 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		return nil
 	})
 	if err := g.Wait(); err != nil {
-		if isCollateral(err, downloadErr) {
+		// Only the phase a collateral leg stopped in is cut short; the ones it
+		// completed before the cancel stay.
+		if isCollateral(err, fetchErr) {
+			if fetchFailedPhase == ateattr.SnapshotPhaseManifestFetch {
+				dManifest = 0
+			}
 			dDownload = 0
 		}
 		if isCollateral(err, prepErr) {
@@ -1249,20 +1267,8 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		return nil, err
 	}
 
-	tDial := time.Now()
-	client, err := s.dialAteom(ctx, req.GetTargetAteomUid())
-	dDial = time.Since(tDial)
-	if err != nil {
-		return nil, err
-	}
-
 	// Tell ateom to do runsc create + runsc restore for pause container and
 	// all application containers.
-	spec, err := buildAteomWorkloadSpec(req.GetSpec())
-	if err != nil {
-		return nil, apierror.InvalidArgument("invalid workload spec: %v", err)
-	}
-
 	// The ateom_restore phase is opaque from here; ateom logs its own breakdown of
 	// this call as "Actor restore phases".
 	tAteom := time.Now()

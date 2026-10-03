@@ -51,6 +51,7 @@ func TestRestoreTimingPhases(t *testing.T) {
 	timing := restoreTiming{
 		prep:          10 * time.Millisecond,
 		egressPrepare: 120 * time.Millisecond,
+		egressJoin:    1 * time.Millisecond,
 		netSetup:      30 * time.Millisecond,
 		// No durable volumes: the phase never ran.
 		durableDir:   0,
@@ -80,6 +81,7 @@ func TestRestoreTimingPhases(t *testing.T) {
 	for k, want := range map[string]float64{
 		"ateom.actor.restore.duration.prep":           0.01,
 		"ateom.actor.restore.duration.egress_prepare": 0.12,
+		"ateom.actor.restore.duration.egress_join":    0.001,
 		"ateom.actor.restore.duration.net_setup":      0.03,
 		"ateom.actor.restore.duration.pause_rootfs":   0.005,
 		"ateom.actor.restore.duration.pause_create":   0.2,

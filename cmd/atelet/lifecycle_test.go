@@ -17,17 +17,21 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/agent-substrate/substrate/cmd/atelet/internal/ateletpath"
 	"github.com/agent-substrate/substrate/internal/nodepath"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
+	"github.com/agent-substrate/substrate/pkg/objectstorage"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )
@@ -394,5 +398,132 @@ func TestRestoreUsesRequestSandboxAssets(t *testing.T) {
 	}
 	if got.PauseImage != restorePause {
 		t.Errorf("restored actor pause image = %q, want the request's %q", got.PauseImage, restorePause)
+	}
+}
+
+// externalRestoreFixture is what an EXTERNAL Restore needs on the node side:
+// a registry serving the app and pause images, a fake ateom, and a request
+// whose sandbox assets name the runsc bytes that assetStore serves.
+type externalRestoreFixture struct {
+	herder *AteomHerder
+	req    *ateletpb.RestoreRequest
+}
+
+func newExternalRestoreFixture(t *testing.T, snapshots *recordingObjectStorage, assetStore objectstorage.ObjectStorage) externalRestoreFixture {
+	t.Helper()
+	useTempNodeDirs(t)
+	serveFakeAteom(t, &fakeAteom{snapshotFiles: map[string]string{"checkpoint.img": "guest-memory"}})
+
+	host := imageVolumeTestRegistry(t)
+	image := host + "/actor:v1"
+	pushTestImage(t, image, singleFileLayer(t, "bin/app", "app"))
+	pause := host + "/pause:v1"
+	pushTestImage(t, pause, singleFileLayer(t, "pause", "pause-v1"))
+
+	runsc := []byte("runsc binary")
+	return externalRestoreFixture{
+		herder: &AteomHerder{
+			ateomDialer:       newAteomDialer(1),
+			imageCache:        newImageVolumeStore(t),
+			gcsClient:         snapshots,
+			anonGCSClient:     assetStore,
+			systemInfoVolumes: newSystemInfoVolumeRefresher(nil, nil),
+		},
+		req: &ateletpb.RestoreRequest{
+			Atespace:              "ate-demo",
+			ActorName:             "counter-1",
+			ActorUid:              snapshotOwnerUID,
+			ActorTemplateAtespace: "default",
+			ActorTemplateName:     "counter",
+			TargetAteomUid:        "ateom-uid-1",
+			SandboxAssets: &ateletpb.SandboxAssets{
+				SandboxClass: "gvisor",
+				PauseImage:   pause,
+				Assets: map[string]*ateletpb.ArchAssets{
+					runtime.GOARCH: {Files: map[string]*ateletpb.AssetFile{
+						runscAssetName: {
+							Url:    "gs://test-bucket/runsc",
+							Sha256: fmt.Sprintf("%x", sha256.Sum256(runsc)),
+						},
+					}},
+				},
+			},
+			Spec: &ateletpb.WorkloadSpec{
+				Containers: []*ateletpb.Container{{Name: "app", Image: image, Command: []string{"/bin/app"}}},
+			},
+			Scope: ateletpb.SnapshotScope_SNAPSHOT_SCOPE_FULL,
+			Type:  ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL,
+			Config: &ateletpb.RestoreRequest_ExternalConfig{
+				ExternalConfig: &ateletpb.ExternalRestoreConfiguration{SnapshotUri: testSnapshotURI},
+			},
+		},
+	}
+}
+
+// uploadTestSnapshot writes a one-file snapshot and its manifest under
+// testSnapshotURI, the way a suspend would.
+func uploadTestSnapshot(t *testing.T, store *recordingObjectStorage, pauseImage string) {
+	t.Helper()
+	ctx := context.Background()
+	payload := filepath.Join(t.TempDir(), "checkpoint.img")
+	if err := os.WriteFile(payload, []byte("guest-memory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := objectstorage.SendLocalFileToGCSWithZstd(ctx, store, testSnapshotURI+"/checkpoint.img.zstd", payload); err != nil {
+		t.Fatalf("uploading checkpoint: %v", err)
+	}
+	manifest, err := json.Marshal(&sandboxAssetsRecord{
+		SandboxClass:  "gvisor",
+		PauseImage:    pauseImage,
+		Atespace:      "ate-demo",
+		ActorName:     "counter-1",
+		SnapshotFiles: []string{"checkpoint.img"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := objectstorage.SendBytesToGCS(ctx, store, testSnapshotURI+"/"+sandboxManifestName, manifest); err != nil {
+		t.Fatalf("uploading manifest: %v", err)
+	}
+}
+
+// The manifest fetch and the sandbox prep run concurrently. When the manifest
+// is missing, the restore must report that, not the context cancellation the
+// prep leg sees as collateral, and must leave no system-info registration
+// behind.
+func TestRestoreReportsManifestErrorOverCollateral(t *testing.T) {
+	f := newExternalRestoreFixture(t, &recordingObjectStorage{}, fakeObjectStorage{data: []byte("runsc binary")})
+
+	_, err := f.herder.Restore(t.Context(), f.req)
+	if err == nil {
+		t.Fatal("Restore succeeded without a snapshot manifest")
+	}
+	if !strings.Contains(err.Error(), "while fetching snapshot manifest") || !errors.Is(err, objectstorage.ErrObjectNotFound) {
+		t.Errorf("Restore error = %v, want the manifest fetch failure", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Errorf("Restore reported the collateral cancellation instead of the manifest error: %v", err)
+	}
+	f.herder.systemInfoVolumes.mu.Lock()
+	_, registered := f.herder.systemInfoVolumes.actors[f.req.GetActorUid()]
+	f.herder.systemInfoVolumes.mu.Unlock()
+	if registered {
+		t.Error("failed Restore left the actor's system-info volumes registered")
+	}
+}
+
+// With a good manifest, a failure in the prep leg still surfaces as the
+// restore's error.
+func TestRestoreSurfacesPrepErrorAfterManifest(t *testing.T) {
+	snapshots := &recordingObjectStorage{}
+	f := newExternalRestoreFixture(t, snapshots, fakeObjectStorage{err: errors.New("asset store down")})
+	uploadTestSnapshot(t, snapshots, f.req.GetSandboxAssets().GetPauseImage())
+
+	_, err := f.herder.Restore(t.Context(), f.req)
+	if err == nil {
+		t.Fatal("Restore succeeded although the sandbox asset fetch failed")
+	}
+	if !strings.Contains(err.Error(), "asset store down") {
+		t.Errorf("Restore error = %v, want the sandbox asset failure", err)
 	}
 }

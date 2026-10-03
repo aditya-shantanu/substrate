@@ -28,13 +28,17 @@ import (
 // ate.snapshot.phase metric enum, and these are not values of it. "total" is
 // shared so the two layers' records agree on the denominator.
 //
-// Every phase of both operations is sequential, so the phases partition the
-// total up to the few microseconds between them. The app_* phases are summed
-// over the application containers, which are restored one after another; the
+// The phases are sequential and partition the total up to the few
+// microseconds between them, with one exception: egress_prepare is the wall
+// time of the certificate mint, which runs alongside net_setup through
+// wakeup_probe, and egress_join is the part of it left on the critical path
+// when the sandbox was ready first. The app_* phases are summed over the
+// application containers, which are restored one after another; the
 // container count rides along on the record so a reader can divide.
 const (
 	phasePrep          = "prep"
 	phaseEgressPrepare = "egress_prepare"
+	phaseEgressJoin    = "egress_join"
 	phaseNetSetup      = "net_setup"
 	phaseDurableDir    = "durable_dir"
 	phasePauseRootfs   = "pause_rootfs"
@@ -62,10 +66,10 @@ const containerCountKey = "ate.actor.container.count"
 // left at zero never ran. Under a Data scope pauseRestore and appRestore time
 // the cold start that stands in for the restore.
 type restoreTiming struct {
-	prep, egressPrepare, netSetup, durableDir time.Duration
-	pauseRootfs, pauseCreate, pauseRestore    time.Duration
-	appRootfs, appCreate, appRestore          time.Duration
-	wakeupProbe, activate, total              time.Duration
+	prep, egressPrepare, egressJoin, netSetup, durableDir time.Duration
+	pauseRootfs, pauseCreate, pauseRestore                time.Duration
+	appRootfs, appCreate, appRestore                      time.Duration
+	wakeupProbe, activate, total                          time.Duration
 }
 
 func (t restoreTiming) phases() []ateomphaselog.Phase {
@@ -81,6 +85,7 @@ func (t restoreTiming) phases() []ateomphaselog.Phase {
 		{Name: phaseAppCreate, D: t.appCreate},
 		{Name: phaseAppRestore, D: t.appRestore},
 		{Name: phaseWakeupProbe, D: t.wakeupProbe},
+		{Name: phaseEgressJoin, D: t.egressJoin},
 		{Name: phaseActivate, D: t.activate},
 		{Name: phaseTotal, D: t.total},
 	}
