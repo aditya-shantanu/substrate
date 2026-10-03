@@ -426,6 +426,116 @@ ceiling on the wake is the router's park budget running out; those are the
 over 10 s to 5.5 s, failures 110 to 0. C3 matters more on micro-VM than on
 gVisor because the snapshot is 2.7x larger.
 
+
+## Memory-backed per-actor state (E1, run on your go-ahead)
+
+Setup: `mount -t tmpfs -o size=400G,mode=0700 tmpfs /var/lib/ate/actors` in
+the worker node's root namespace, then the atelet pod on that node and the
+WorkerPool restarted so both see it (verified in their mount tables).
+Everything per actor (bundles, checkpoint-state, local-checkpoint,
+retained-snapshot, restore-state) is now in RAM; the sandbox assets, image
+cache and runsc logs stay on disk. gVisor pool back to one node.
+
+### B9a. tmpfs, gVisor, pause, think-scale 5 (14:01-14:08 UTC), compare B1
+
+| series | n | B1 p50 / p99 | B9a p50 / p90 / p99 / max | fail |
+|---|---|---|---|---|
+| WakeFirstTouch (ms) | 2274 | 220 / 10000 (34 fail) | 200 / 250 / 270 / 330 / 840 | 0 |
+| PauseActor (ms) | 2372 | 3900 / 44000 (34 fail) | 190 / 240 / 260 / 310 / 970 | 5 |
+
+Server side p50 / p90 / p99 (s): atelet checkpoint 0.194 / 0.234 / 0.284
+(ateom_checkpoint 0.170, dirs_reset 0.023); ateom-gvisor checkpoint 0.186
+(runsc checkpoint 0.133, teardown 0.051); atelet restore 0.191 / 0.243 /
+0.323; ateom restore 0.190 (app_restore 0.102, pause_create 0.037). I/O
+pressure on the node: zero for the whole run; tmpfs use 35 GB for 100
+actors. The 5 pause failures are 2 runsc checkpoint errors plus their
+follow-on FailedPreconditions, same family as before, unrelated to storage.
+
+The runsc checkpoint itself is no faster (133 ms vs 127 ms on disk; it is
+memcpy-bound). What disappeared is the queue: at 5.6 pauses/s the disk was
+asked for 1 GB/s and gave 0.9; RAM does not care. The pause p99 improved
+140x and the wake p99 30x at the same load, and the run that previously
+collapsed is now flat.
+
+
+### B9b. tmpfs, gVisor, pause, think-scale 15 (14:10-14:19 UTC), compare B4a
+
+| series | n | B4a p50 / p90 / p99 | B9b p50 / p90 / p99 / max | fail |
+|---|---|---|---|---|
+| WakeFirstTouch (ms) | 946 | 190 / 240 / 310 | 180 / 210 / 610 / 920 | 0 |
+| PauseActor (ms) | 1061 | 250 / 890 / 3600 | 150 / 210 / 650 / 1800 | 18 |
+
+atelet checkpoint p50 0.186 (B4a on disk: 0.23 at the client), restore
+p50 0.176. The wake p99 of 610 ms is the replacement actors' first
+activations after the failures below (a golden restore with a download).
+
+The 18 pause failures are 9 `runsc checkpoint` exit 128 plus their
+follow-on FailedPreconditions, and this time they are the storage change:
+the node's dmesg shows memcg OOM kills of `gvisor_sentry` with
+`shmem-rss` around 310 MB inside the actor's 1 GiB cgroup. Pages written to
+a tmpfs are charged as shmem to the writer's cgroup and are not
+reclaimable, so an actor near its limit dies when its checkpoint is
+written; on disk the same pages were reclaimable page cache (which is also
+why disk checkpoints showed writeback stalls inside the limit). Upstream
+#1917 (chw120, open) writes pages.img outside the actor cgroup and would
+remove this; the alternative is headroom in the actor limit. The memory
+accounting question is the real cost of E1, not the RAM itself (59 GB of
+tmpfs for 100 actors with retained copies).
+
+
+### B9c. tmpfs, gVisor, suspend, think-scale 15 (14:22-14:30 UTC), compare B4b
+
+| series | n | B4b p50 / p90 / p99 | B9c p50 / p90 / p99 / max | fail |
+|---|---|---|---|---|
+| WakeFirstTouch (ms) | 813 | 190 / 250 / 340 | 180 / 210 / 240 / 840 | 0 |
+| SuspendActor (ms) | 924 | 1800 / 4700 / 60000 | 1600 / 2600 / 3500 / 4100 | 12 |
+
+atelet checkpoint p50 1.72 s = persist (zstd + GCS PUT) 1.54 + ateom
+0.16 + dirs_reset 0.02; restore p50 0.177 s, all retained. The suspend tail
+is now the upload alone (p99 3.5 s against 60 s on disk, though B4b also
+had the GCS stall minute); the wake tail tightens further because nothing
+on the node queues. The 12 suspend failures are again memcg OOM kills of
+sentries writing their checkpoint into tmpfs inside the 1 GiB actor limit
+(node total 30 kills across B9b and B9c), plus their follow-ons.
+
+
+Leak that E1 turns from disk into RAM: after all actors of B9a to B9c were
+suspended and deleted, 318 actor directories (90 GB) remained on the tmpfs,
+each holding about 630 MB of `restore-state` and `checkpoint-state`. A
+delete of a SUSPENDED actor has no worker and never reaches atelet, so
+nothing removes the directory (upstream #1688; draft #1706 is the sweep).
+On disk this is a slow leak; on a tmpfs it is memory the node never gets
+back, so E1 needs that sweep (or a terminate-on-delete signal) before it
+can be a default.
+
+Layering upstream #1917 (checkpoint I/O in a sibling cgroup) onto this
+branch to close that was blocked by the sandbox as untrusted code
+integration, so the clean-room check is B9d below: the same run with a
+2 GiB actor limit, i.e. headroom instead of isolation.
+
+
+### B9d. tmpfs, gVisor, pause, think-scale 15, 2 GiB actor limit (14:32-14:40 UTC)
+
+Same as B9b with the glutton template at 2Gi so the checkpoint's shmem fits
+beside the guest inside the actor cgroup.
+
+| series | n | p50 | p90 | p95 | p99 | max | fail |
+|---|---|---|---|---|---|---|---|
+| WakeFirstTouch (ms) | 875 | 180 | 200 | 210 | 230 | 250 | 0 |
+| PauseActor (ms) | 973 | 150 | 210 | 220 | 240 | 260 | 0 |
+
+ateapi resume total p50 0.179 / p99 0.225 s; ateom checkpoint p50 0.166 /
+p99 0.210 (runsc 0.119). No OOM kills (node counter unchanged at 30), no
+failures of any kind. This is the flattest run of the study: pause and wake
+p99 within 50 ms of their p50, and the pause itself 40% faster than on disk
+at the same duty cycle (B4a p50 250 / p90 890 / p99 3600).
+
+Reading of E1 so far: memory-backed per-actor state removes the disk as a
+factor entirely, for pause and for the node-side part of suspend. Its two
+costs are accounting, not speed: the checkpoint's pages must not be charged
+to the actor's limit (#1917, or headroom), and deleted actors' directories
+must be reclaimed (#1688).
+
 ## Changes
 
 Each change: what, why, measured effect, verdict (keep / drop), submit?
