@@ -1255,11 +1255,13 @@ type recordingObjectStorage struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	putErr  error
+	gets    int
 }
 
 func (r *recordingObjectStorage) GetObject(_ context.Context, bucket, object string) (io.ReadCloser, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.gets++
 	b, ok := r.objects[bucket+"/"+object]
 	if !ok {
 		return nil, fmt.Errorf("%w: Bucket:%q, Object:%q", objectstorage.ErrObjectNotFound, bucket, object)
@@ -1282,6 +1284,13 @@ func (r *recordingObjectStorage) PutObject(_ context.Context, bucket, object str
 	}
 	r.objects[bucket+"/"+object] = b
 	return nil
+}
+
+// getCount is how many objects were asked for, found or not.
+func (r *recordingObjectStorage) getCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.gets
 }
 
 func (r *recordingObjectStorage) keys() []string {

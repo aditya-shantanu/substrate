@@ -274,6 +274,18 @@ func TestSnapshotOpAttrsNormalizesSandboxClass(t *testing.T) {
 	}
 }
 
+// The restore source is a log-only field: it is not in the metric registry,
+// so it must never become a datapoint dimension.
+func TestSnapshotOpAttrsOmitRestoreSource(t *testing.T) {
+	t.Parallel()
+	attrs := snapshotOp{scope: ateattr.SnapshotScopeFull, restoreSource: restoreSourceRetained}.attrs()
+	for _, kv := range attrs {
+		if string(kv.Key) == restoreSourceLogKey || kv.Value.AsString() == restoreSourceRetained {
+			t.Errorf("attrs() carries the restore source: %v", attrs)
+		}
+	}
+}
+
 // TestIsCollateral guards the durations: a leg cancelled by the other leg's
 // failure recorded a partial duration, which would land in the healthy-path
 // percentiles as a fast success and drag them down on every failed restore.

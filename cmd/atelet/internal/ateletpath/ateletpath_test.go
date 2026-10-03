@@ -46,3 +46,31 @@ func TestActorDirs(t *testing.T) {
 		seen[dir] = field
 	}
 }
+
+// The retained snapshot and the sandbox record sit directly under the actor
+// root, outside every directory handed to ateom: those are wiped between
+// activations, and both files must outlive that.
+func TestRetainedSnapshotDirOutsideActorDirs(t *testing.T) {
+	const actorUID = "actor-uid-1"
+	actorDirs := ActorDirs(actorUID)
+	for name, file := range map[string]string{
+		"retained snapshot": RetainedSnapshotDir(actorUID),
+		"sandbox record":    ActorSandboxAssetsFile(actorUID),
+	} {
+		if got := filepath.Dir(file); got != actorDirs.GetRootDir() {
+			t.Errorf("%s %q is in %q, want directly under root_dir %q", name, file, got, actorDirs.GetRootDir())
+		}
+		for _, dir := range []string{
+			actorDirs.GetOciBundleDir(),
+			actorDirs.GetCheckpointDir(),
+			actorDirs.GetRestoreDir(),
+			actorDirs.GetDurableDirVolumeMountsDir(),
+			actorDirs.GetSystemInfoVolumeRootsDir(),
+			actorDirs.GetVolumesDir(),
+		} {
+			if file == dir || strings.HasPrefix(file, dir+string(filepath.Separator)) {
+				t.Errorf("%s %q is under ateom directory %q", name, file, dir)
+			}
+		}
+	}
+}

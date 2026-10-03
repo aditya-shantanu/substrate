@@ -23,6 +23,11 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// restoreSourceLogKey marks a "Restore timing breakdown" record with where the
+// checkpoint files came from, so the retained-snapshot hit rate can be read
+// from logs. Log-only: it is not a registry attribute and never a metric label.
+const restoreSourceLogKey = "ate.actor.restore.source"
+
 // snapshotLogAttrs renders what recordPhases measures as a per-actor record. The
 // histograms cannot be one: actor identity is barred from metric labels
 // (docs/metrics/substrate.yaml, cardinality_rules.no-actor-identity), so the
@@ -54,6 +59,9 @@ func snapshotLogAttrs(a resources.ActorAttribution, op snapshotOp, durationKey s
 			continue
 		}
 		attrs = append(attrs, slog.String(string(kv.Key), kv.Value.String()))
+	}
+	if op.restoreSource != "" {
+		attrs = append(attrs, slog.String(restoreSourceLogKey, op.restoreSource))
 	}
 
 	if err != nil {

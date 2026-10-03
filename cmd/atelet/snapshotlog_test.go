@@ -177,7 +177,21 @@ func TestSnapshotLogAttrs(t *testing.T) {
 			// The phase key names the one step a datapoint timed; this record has
 			// them all, so borrowing it here would give one key two meanings.
 			// Absent error.type is success, as on the instruments.
-			wantAbsent: []string{"ate.snapshot.phase", "actor", "total", "download", "error.type"},
+			wantAbsent: []string{"ate.snapshot.phase", "actor", "total", "download", "error.type", restoreSourceLogKey},
+		},
+		{
+			name: "a restore names where it staged the files from, in the log only",
+			op: func() snapshotOp {
+				op := fullOp
+				op.restoreSource = restoreSourceRetained
+				return op
+			}(),
+			phases: []phase{
+				{ateattr.SnapshotPhaseDownload, 3 * time.Millisecond},
+			},
+			wantStrings: map[string]string{
+				restoreSourceLogKey: restoreSourceRetained,
+			},
 		},
 		{
 			name: "a failed restore keeps the phases it completed and is marked with the gRPC code",

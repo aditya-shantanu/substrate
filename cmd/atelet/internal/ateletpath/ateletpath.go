@@ -64,6 +64,20 @@ func ActorSandboxAssetsFile(actorUID string) string {
 	)
 }
 
+// RetainedSnapshotDir is the node-local copy of the actor's most recently
+// uploaded snapshot: the snapshot files, their manifest, and a "uri" file
+// naming the snapshot URI they were uploaded under. A Restore of that same URI
+// on this node stages the files from here instead of downloading them. It
+// lives directly under ActorPath, NOT under a subdir wiped by atelet's
+// resetActorDirs, so it survives from the suspend to the next resume; Terminate
+// removes it with the rest of the actor directory.
+func RetainedSnapshotDir(actorUID string) string {
+	return filepath.Join(
+		ActorPath(actorUID),
+		"retained-snapshot",
+	)
+}
+
 func OCIBundleDir(actorUID string) string {
 	return filepath.Join(
 		ActorPath(actorUID),

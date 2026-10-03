@@ -79,11 +79,16 @@ type snapshotOp struct {
 	kind              string
 	scope             string
 	sandboxClass      string
+	// restoreSource is where a restore staged its checkpoint files from (a
+	// restoreSource* value); empty on a checkpoint. It reaches the log record
+	// only: attrs leaves it out, so it is not a dimension of any instrument.
+	restoreSource string
 }
 
 // attrs omits kind and sandbox class while they are unknown (a restore that
 // failed before reading the snapshot manifest) rather than emitting an
-// empty-string series.
+// empty-string series. restoreSource is deliberately absent: it is not in
+// the metric registry.
 func (o snapshotOp) attrs() []attribute.KeyValue {
 	attrs := make([]attribute.KeyValue, 0, 5)
 	attrs = append(attrs,
