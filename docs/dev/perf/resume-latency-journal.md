@@ -536,6 +536,74 @@ costs are accounting, not speed: the checkpoint's pages must not be charged
 to the actor's limit (#1917, or headroom), and deleted actors' directories
 must be reclaimed (#1688).
 
+
+### B10a. tmpfs, micro-VM on metal, pause, think-scale 15 (14:43-14:51 UTC), compare B8a
+
+800G tmpfs on the metal node's `/var/lib/ate/actors`, atelet and the
+WorkerPool restarted onto it; glutton at 1Gi (no headroom change).
+
+| series | n | B8a p50 / p90 / p99 | B10a p50 / p90 / p99 / max | fail |
+|---|---|---|---|---|
+| WakeFirstTouch (ms) | 848 | 460 / 2400 / 4500 | 310 / 450 / 580 / 700 | 0 |
+| PauseActor (ms) | 946 | 560 / 9000 / 15000 | 320 / 480 / 650 / 700 | 0 |
+
+Server side p50 / p90 / p99 (s): atelet restore 0.297 / 0.440 / 0.564;
+atelet checkpoint 0.312 / 0.468 / 0.637 (local_prune 0.020);
+ateom-microvm restore 0.429 (vm_restore 0.298, lowers 0.033, upper_join
+0.033, wakeup_probe 0.033, vmm_launch 0.013, prep 0.011); ateom-microvm
+checkpoint 0.346 (CH snapshot 0.202, teardown 0.135, rootfs_upper 0.033).
+I/O pressure under 1%, no OOM kills, 44 GB of tmpfs in use.
+
+The rootfs upper tar fell from 0.825 s to 0.033 s and the CH snapshot from
+0.549 to 0.202 s once neither waited on the disk; the whole micro-VM pause
+tail collapsed (p99 15 s to 0.65 s). What remains on the micro-VM restore
+path is 0.30 s in cloud-hypervisor and about 0.13 s of Substrate (overlay
+lowers and virtiofsd start, the upper untar wait, VMM launch, prep), and on
+the checkpoint path the 0.135 s teardown that runs before the pause RPC
+returns.
+
+
+### B10b. tmpfs, micro-VM on metal, suspend, think-scale 15 (14:53-15:01 UTC), compare B8b
+
+| series | n | B8b p50 / p90 / p99 | B10b p50 / p90 / p99 / max | fail |
+|---|---|---|---|---|
+| WakeFirstTouch (ms) | 804 | 470 / 3000 / 5500 | 300 / 430 / 620 / 2000 | 0 |
+| SuspendActor (ms) | 903 | 2400 / 11000 / 16000 | 1900 / 3000 / 5000 / 9800 | 0 |
+
+All 712 restores from the retained copy; atelet restore p50 0.296 /
+p99 0.601 s; checkpoint p50 1.945 = persist 1.604 (about 470 MB zstd + PUT)
++ ateom 0.317 + dirs_reset 0.004. No OOM kills, 90 GB of tmpfs. Suspend is
+now upload-bound only; the micro-VM suspend/resume wake equals its pause
+wake, as on gVisor.
+
+### E1 conclusion
+
+Memory-backed per-actor state is the single largest improvement found for
+pause latency and for every tail in this study, on both sandbox classes,
+and it costs no change to the resume path. Wake p50 / p99 (ms), 100 actors,
+think-scale 15, with C1 to C4 in both columns:
+
+| path | disk | tmpfs |
+|---|---|---|
+| gVisor pause | 190 / 310 | 180 / 230 (2Gi limit) |
+| gVisor pause, think-scale 5 stress | 220 / 10000, 34 failures | 200 / 330, 0 failures |
+| gVisor suspend | 190 / 340 | 180 / 240 |
+| micro-VM pause | 460 / 4500 | 310 / 580 |
+| micro-VM suspend | 470 / 5500 | 300 / 620 |
+
+Pause p50 / p99: gVisor 250 / 3600 to 150 / 240; micro-VM 560 / 15000 to
+320 / 650.
+
+To make it a Substrate feature rather than a node mount: an atelet flag
+that mounts a size-capped tmpfs under its actors directory (or asks for a
+memory-backed emptyDir in the atelet DaemonSet), plus the two accounting
+fixes it exposes, checkpoint pages charged outside the actor cgroup (#1917)
+and reclamation of deleted actors' directories (#1688, draft #1706). The
+RAM budget is modest (about 0.5 to 0.9 GB per resident or recently
+suspended actor here) and is the resident rung of lifecycle v2 in its
+simplest form. Node sizing should then count RAM for sandboxes plus
+checkpoints rather than disk bandwidth.
+
 ## Changes
 
 Each change: what, why, measured effect, verdict (keep / drop), submit?
@@ -677,7 +745,11 @@ commit on `perf/resume-latency`.
 4. **C1 manifest/dial reordering** (590efbb5, atelet part): correct and
    harmless but not a measured win on these runs; submit only if the cold
    asset/OCI case is shown to benefit, or fold into #1551's restructuring.
-5. **Benchmark tooling**: `--worker-node-selector` / `--worker-toleration`
+5. **E1 as an atelet option**: memory-backed per-actor state directory
+   with a size cap; depends on #1917 (checkpoint pages outside the actor
+   cgroup) and an actor-directory sweep (#1688/#1706) before it can default
+   on. Largest pause and tail win measured; no resume-path code change.
+6. **Benchmark tooling**: `--worker-node-selector` / `--worker-toleration`
    on `benchmarking/workloads/deploy.sh`; a `boomer:stop` hook so an
    interactive stop runs the agent-session shutdown fan-out.
 
@@ -686,9 +758,9 @@ Not changed, reported for the backlog:
 - Pause and suspend throughput per node are bound by the worker boot disk's
   write bandwidth (175 MB per gVisor checkpoint, about 470 MB per micro-VM
   checkpoint). At the intended duty cycle 100 actors on one node already
-  saturate a hyperdisk at 890 MiB/s. Options: memory-backed per-actor state
-  (E1, needs your call), provisioned throughput, local SSD shapes. This is
-  the first thing that will cap oversubscription per node.
+  saturate a hyperdisk at 890 MiB/s. E1 (memory-backed per-actor state,
+  run as a node mount) removes it; the productized form is an atelet flag
+  plus #1917 and #1688. Candidate 6 below.
 - A suspend canceled by its caller's deadline leaves the actor CRASHED
   (seen under a GCS stall; #1665 family).
 - A PAUSED actor cannot be deleted; the harness's shutdown has to suspend
@@ -716,6 +788,9 @@ actors, think-scale 15, p50 / p99 in ms:
 | gVisor pause, 3 nodes | n/a | 180 / 240 | |
 | micro-VM pause, 1 metal node | 460 / 4500 | same build | disk-bound |
 | micro-VM suspend, 1 metal node | 1400 / 10000+ (110 failures) | 470 / 5500 | C3 + C4 |
+| gVisor pause, 1 node, tmpfs (E1) | 190 / 310 | 180 / 230 | E1 |
+| micro-VM pause, 1 metal node, tmpfs (E1) | 460 / 4500 | 310 / 580 | E1 |
+| micro-VM suspend, 1 metal node, tmpfs (E1) | 470 / 5500 | 300 / 620 | E1 + C3 + C4 |
 
 What a gVisor wake is made of now: about 165 ms of `runsc` (create and
 restore of the pause and app containers) and about 25 ms of Substrate
