@@ -271,6 +271,50 @@ SUSPENDED (upstream #1665 family).
 C1 could not be measured here: with retained hits there is no manifest GET
 left to overlap. It will show on the multi-node runs, where misses download.
 
+
+### B6a. Three worker nodes, suspend lifecycle, C1+C2+C3, no node preference (05:42-05:52 UTC)
+
+Worker pool grown to 3x c3-highmem-88, WorkerPool replicas 3 (one 600Gi
+worker per node), 100 users, suspend, think-scale 15. Build 0ccab235.
+
+| series | n | p50 | p90 | p95 | p99 | max | fail |
+|---|---|---|---|---|---|---|---|
+| WakeFirstTouch (ms) | 943 | 730 | 1400 | 1500 | 2100 | 3100 | 0 |
+| SuspendActor (ms) | 1031 | 1600 | 2200 | 2500 | 3900 | 6600 | 0 |
+
+`ate.actor.restore.source`: 265 retained (29%), 655 download. Retained
+restores total 0.165 s p50; downloads 0.964 s p50 (manifest 0.055 +
+download 0.726 + ateom 0.164). As predicted, the scheduler's load-only
+choice (#1915) finds the copy about one time in N. Suspend is healthier than
+on one node (uploads spread over three disks and three NICs): no 60 s
+stalls this time.
+
+C1 note: on a download restore the fetch leg (manifest + download) is the
+longer leg, so overlapping the manifest GET with the prep leg saves nothing
+here; it only helps when assets/OCI prep is cold. Kept as harmless; not a
+measured win.
+
+
+### B7a. Three worker nodes, suspend lifecycle, C1 to C4 (05:54-06:04 UTC)
+
+Build 2f4d9d46 (ateapi redeployed with C4). Same configuration as B6a.
+
+| series | n | p50 | p90 | p95 | p99 | max | fail |
+|---|---|---|---|---|---|---|---|
+| WakeFirstTouch (ms) | 1082 | 180 | 200 | 210 | 240 | 300 | 0 |
+| SuspendActor (ms) | 1180 | 1600 | 2300 | 2700 | 4000 | 9500 | 0 |
+
+`ate.scheduler.node_preference`: 551 hit, 0 miss, 60 none (first
+activations have no producing node). `ate.actor.restore.source`: 1093
+retained, 101 download (the 100 first activations plus one). atelet restore
+p50 0.165 s; ateapi total p50 0.180 s.
+
+Against B6a (same nodes, no preference): wake p50 0.73 s to 0.18 s, p99
+2.1 s to 0.24 s. Against the single-node B4b: slightly better at every
+percentile because three nodes share the checkpoint and upload load. The
+suspend/resume wake on three nodes is now indistinguishable from the pause
+wake on one.
+
 ## Changes
 
 Each change: what, why, measured effect, verdict (keep / drop), submit?
@@ -354,6 +398,36 @@ node, which it does not try to do today (#1761/#589). Disk: one extra
 snapshot per suspended actor on its last node, no cap; an upstream version
 needs an age or budget GC. Measured (B4b vs B3): wake p50 1.2 s to 0.19 s, p99 3.4 s to 0.34 s,
 98.4% retained hits, zero wake failures. Kept.
+
+### E1 (not run): memory-backed per-actor state on the worker node
+
+B1 showed pause is bound by the boot disk's write throughput (175 MB per
+checkpoint, 890 MiB/s provisioned) and B3/B4b showed the uploaded files'
+deletion costing seconds under contention. The obvious experiment is to put
+`/var/lib/ate/actors` on a tmpfs (the node has 704 GiB; 100 actors hold
+about 50 GB of checkpoints and retained copies) and rerun B1 and B4b. This
+needs a mount in the node's root namespace; I did not do that on my own
+authority. If you want it, the one-off is
+`mount -t tmpfs -o size=400G tmpfs /var/lib/ate/actors` on the worker node
+followed by restarting the atelet and worker pods; the Substrate-side
+version would be an atelet flag that mounts a size-capped tmpfs under its
+base path, which is lifecycle v2's resident rung for pause checkpoints in
+its cheapest form. Alternatives that stay on disk: provision the hyperdisk
+for 2400 MiB/s, or use a local-SSD machine shape for worker nodes.
+
+### C4. ateapi: prefer the node that produced the snapshot (2f4d9d46)
+
+The suspend workflow records the uploading node on the committed
+`ExternalSnapshot` (`produced_on_node`, a hint). A SUSPENDED actor's resume
+narrows the scheduler's candidates to workers on that node when any applies
+and has room, keeps power-of-two-choices within that set, and falls back to
+the whole fleet otherwise; paused actors keep their hard pin. Logged as
+`ate.scheduler.node_preference=hit|miss|none`. This is the "affinity with
+failover" of #1761/#589 in its smallest form. Expected: retained hit rate on
+3 nodes from 29% to near 100%, wake p50 from 0.73 s to about 0.19 s.
+Measured (B7a vs B6a): hit rate 29% to 91.5% (the rest are first
+activations), wake p50 0.73 s to 0.18 s, p99 2.1 s to 0.24 s, 0 misses on
+the preference itself. Kept.
 
 ## Candidates to submit
 
