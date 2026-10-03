@@ -407,6 +407,25 @@ tar and untar are avoidable: the upper dir could stay in place. That needs
 ateom-microvm to know a checkpoint is local and to defer the tar to the
 later upload if the actor is suspended from PAUSED; not done here.
 
+
+### B8c. Control: micro-VM suspend with `--retain-uploaded-snapshots=false` (06:45-06:52 UTC)
+
+Same as B8b with retention switched off on atelet (the flag was added to
+the DaemonSet args for this run and removed afterwards).
+
+| series | n | p50 | p90 | p95 | p99 | max | fail |
+|---|---|---|---|---|---|---|---|
+| WakeFirstTouch (ms) | 777 | 1400 | 10000 | 10000 | 10000 | 10000 | 110 |
+| SuspendActor (ms) | 933 | 2300 | 11000 | 23000 | 37000 | 38000 | 110 |
+
+`ate.actor.restore.source`: 891 download, 0 retained. atelet restore p50
+1.394 s, p90 11.9 s; download p50 1.03 s, p90 11.3 s (about 470 MB per
+restore competing with the uploads on one NIC and one disk). The 10 s
+ceiling on the wake is the router's park budget running out; those are the
+110 failures. Against B8b (retention on): wake p50 1.4 s to 0.47 s, p99
+over 10 s to 5.5 s, failures 110 to 0. C3 matters more on micro-VM than on
+gVisor because the snapshot is 2.7x larger.
+
 ## Changes
 
 Each change: what, why, measured effect, verdict (keep / drop), submit?
@@ -586,7 +605,7 @@ actors, think-scale 15, p50 / p99 in ms:
 | gVisor suspend, 3 nodes | 730 / 2100 | 180 / 240 | C3 + C4 |
 | gVisor pause, 3 nodes | n/a | 180 / 240 | |
 | micro-VM pause, 1 metal node | 460 / 4500 | same build | disk-bound |
-| micro-VM suspend, 1 metal node | see B8c | 470 / 5500 | C3 + C4 |
+| micro-VM suspend, 1 metal node | 1400 / 10000+ (110 failures) | 470 / 5500 | C3 + C4 |
 
 What a gVisor wake is made of now: about 165 ms of `runsc` (create and
 restore of the pause and app containers) and about 25 ms of Substrate
