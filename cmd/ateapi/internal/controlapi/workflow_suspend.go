@@ -363,6 +363,10 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 		return nil, err
 	}
 
+	// Read before the worker is freed, which clears the assignment that
+	// names the node. A re-entry after that point records no node.
+	producedOnNode := snapshotProducerNode(latestActor)
+
 	// 1. Free the worker (if it hasn't been freed yet)
 	if latestActor.GetStatus().GetWorkerAssignment() != nil {
 		t = time.Now()
@@ -391,6 +395,7 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 			SnapshotUri:      inProgressSnapshotURI,
 			ContentScope:     commitSnapshotScope(actorRef.Atespace, actorTemplate),
 			ActorTemplateUid: actorTemplate.GetMetadata().GetUid(),
+			ProducedOnNode:   producedOnNode,
 		}
 	}
 
@@ -433,6 +438,20 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 			slog.String("err", releaseErr.Error()))
 	}
 	return storedActor, nil
+}
+
+// snapshotProducerNode is the node whose atelet uploaded the in-progress
+// snapshot: the assigned worker's node for a running-origin suspend, or the
+// node UploadPausedCheckpoint was sent to for a paused-origin one. Empty when
+// neither is recorded.
+func snapshotProducerNode(actor *ateapipb.Actor) string {
+	if node := actor.GetStatus().GetWorkerAssignment().GetNodeName(); node != "" {
+		return node
+	}
+	if nodes := actor.GetStatus().GetLocalSnapshot().GetNodeVmsWithLocalSnapshots(); len(nodes) > 0 {
+		return nodes[0]
+	}
+	return ""
 }
 
 // releaseReplacedSnapshot releases the external snapshot the actor held before

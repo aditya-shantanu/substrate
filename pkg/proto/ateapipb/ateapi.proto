@@ -192,6 +192,15 @@ message ExternalSnapshot {
   // +k8s:optional
   // +k8s:format=k8s-uuid
   string actor_template_uid = 3;
+
+  // produced_on_node is the Kubernetes node whose atelet uploaded this
+  // snapshot. A scheduling hint only: a resume prefers a worker on this node,
+  // which may still hold a local copy of the snapshot, and falls back to any
+  // eligible worker. May be stale (node drained or gone) or empty.
+  //
+  // +k8s:optional
+  // +k8s:format=k8s-long-name
+  string produced_on_node = 4;
 }
 
 // LocalSnapshot records information about a node-local snapshot.

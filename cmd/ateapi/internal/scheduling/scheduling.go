@@ -42,6 +42,12 @@ type Constraints struct {
 	// to specific node VMs.
 	RequiredNodes []string
 
+	// PreferredNodes, when non-empty, narrows the choice to workers on one of
+	// these nodes if any applies and has room; otherwise it has no effect.
+	// Used when the actor's latest external snapshot was uploaded from a node
+	// that may still hold a local copy of it.
+	PreferredNodes []string
+
 	// Limits are the actor's declared resource limits, named as a Worker names
 	// the capacity it reports, so the two subtract.
 	Limits *ateapipb.Resources
@@ -96,10 +102,11 @@ func New(source WorkerSource, opts ...Option) Scheduler {
 	return s
 }
 
-// Schedule filters the fleet for eligible candidates with room, samples two at
-// random (power of two choices), and returns the less-loaded one, where load is
-// the higher of actor-slot and compute-resource utilization. Spreading across
-// the warm pool avoids hotspots until autoscaling reclaims idle workers.
+// Schedule filters the fleet for eligible candidates with room, narrows to
+// those on a preferred node when any qualify, samples two at random (power of
+// two choices), and returns the less-loaded one, where load is the higher of
+// actor-slot and compute-resource utilization. Spreading across the warm pool
+// avoids hotspots until autoscaling reclaims idle workers.
 func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ateapipb.Worker, error) {
 	workers, err := s.source.Workers()
 	if err != nil {
@@ -123,6 +130,14 @@ func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ate
 
 	if len(candidates) == 0 {
 		return nil, ErrNoCapacity
+	}
+	if len(constraints.PreferredNodes) > 0 {
+		preferred := slices.DeleteFunc(slices.Clone(candidates), func(c candidate) bool {
+			return !slices.Contains(constraints.PreferredNodes, c.worker.GetNodeName())
+		})
+		if len(preferred) > 0 {
+			candidates = preferred
+		}
 	}
 	if len(candidates) == 1 {
 		return candidates[0].worker, nil

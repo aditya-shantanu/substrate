@@ -441,8 +441,16 @@ type ExternalSnapshot struct {
 	// +k8s:optional
 	// +k8s:format=k8s-uuid
 	ActorTemplateUid string `protobuf:"bytes,3,opt,name=actor_template_uid,json=actorTemplateUid,proto3" json:"actor_template_uid,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// produced_on_node is the Kubernetes node whose atelet uploaded this
+	// snapshot. A scheduling hint only: a resume prefers a worker on this node,
+	// which may still hold a local copy of the snapshot, and falls back to any
+	// eligible worker. May be stale (node drained or gone) or empty.
+	//
+	// +k8s:optional
+	// +k8s:format=k8s-long-name
+	ProducedOnNode string `protobuf:"bytes,4,opt,name=produced_on_node,json=producedOnNode,proto3" json:"produced_on_node,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ExternalSnapshot) Reset() {
@@ -492,6 +500,13 @@ func (x *ExternalSnapshot) GetContentScope() SnapshotContentScope {
 func (x *ExternalSnapshot) GetActorTemplateUid() string {
 	if x != nil {
 		return x.ActorTemplateUid
+	}
+	return ""
+}
+
+func (x *ExternalSnapshot) GetProducedOnNode() string {
+	if x != nil {
+		return x.ProducedOnNode
 	}
 	return ""
 }
@@ -7984,11 +7999,12 @@ var File_ateapi_proto protoreflect.FileDescriptor
 
 const file_ateapi_proto_rawDesc = "" +
 	"\n" +
-	"\fateapi.proto\x12\x06ateapi\x1a\x1fgoogle/protobuf/timestamp.proto\"\xa6\x01\n" +
+	"\fateapi.proto\x12\x06ateapi\x1a\x1fgoogle/protobuf/timestamp.proto\"\xd0\x01\n" +
 	"\x10ExternalSnapshot\x12!\n" +
 	"\fsnapshot_uri\x18\x01 \x01(\tR\vsnapshotUri\x12A\n" +
 	"\rcontent_scope\x18\x02 \x01(\x0e2\x1c.ateapi.SnapshotContentScopeR\fcontentScope\x12,\n" +
-	"\x12actor_template_uid\x18\x03 \x01(\tR\x10actorTemplateUid\"\xb9\x01\n" +
+	"\x12actor_template_uid\x18\x03 \x01(\tR\x10actorTemplateUid\x12(\n" +
+	"\x10produced_on_node\x18\x04 \x01(\tR\x0eproducedOnNode\"\xb9\x01\n" +
 	"\rLocalSnapshot\x12#\n" +
 	"\rsnapshot_name\x18\x01 \x01(\tR\fsnapshotName\x12@\n" +
 	"\x1dnode_vms_with_local_snapshots\x18\x02 \x03(\tR\x19nodeVmsWithLocalSnapshots\x12A\n" +

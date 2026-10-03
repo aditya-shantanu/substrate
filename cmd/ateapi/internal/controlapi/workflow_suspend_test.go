@@ -327,6 +327,63 @@ func TestEnsureSuspendedFinalized_NoAssignment(t *testing.T) {
 	if stored.GetStatus().GetLocalSnapshot() != nil {
 		t.Errorf("LocalSnapshot = %v, want cleared", stored.GetStatus().GetLocalSnapshot())
 	}
+	// A paused-origin suspend uploaded from the node holding the local
+	// snapshot, so that is where a resume should prefer to land.
+	if got := stored.GetStatus().GetExternalSnapshot().GetProducedOnNode(); got != "node1" {
+		t.Errorf("ExternalSnapshot.ProducedOnNode = %q, want %q", got, "node1")
+	}
+}
+
+// TestEnsureSuspendedFinalized_RecordsProducerNode verifies the committed
+// external snapshot names the assigned worker's node, read before the
+// assignment that carries it is cleared.
+func TestEnsureSuspendedFinalized_RecordsProducerNode(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+
+	created := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "actor-1"},
+		Status: &ateapipb.ActorStatus{
+			State: ateapipb.ActorState_ACTOR_STATE_SUSPENDING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{
+				Worker:          &ateapipb.ObjectRef{Name: testWorkerUID("pod-1")},
+				WorkerNamespace: "worker-ns",
+				WorkerPool:      "pool",
+				WorkerPod:       "pod-1",
+				WorkerPodUid:    testWorkerUID("pod-1"),
+				NodeName:        "node-7",
+			},
+			InProgressSnapshotUri: someActorSnapshotURI(t, testStorageLocation, "team-a", "snapshot-1"),
+		},
+	})
+	if _, err := persistence.CreateWorker(ctx, &ateapipb.Worker{
+		Metadata:        &ateapipb.ResourceMetadata{Name: testWorkerUID("pod-1")},
+		WorkerNamespace: "worker-ns",
+		WorkerPool:      "pool",
+		WorkerPod:       "pod-1",
+		WorkerPodUid:    testWorkerUID("pod-1"),
+		NodeName:        "node-7",
+		Status:          &ateapipb.WorkerStatus{},
+	}); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+	seedAssignment(t, persistence, testWorkerUID("pod-1"), &ateapipb.ActorAssignment{
+		Actor:    &ateapipb.ObjectRef{Atespace: "team-a", Name: "actor-1"},
+		ActorUid: created.GetMetadata().GetUid(),
+	})
+
+	w := &ActorWorkflow{store: persistence}
+	tmpl := &ateapipb.ActorTemplate{SnapshotConfig: &ateapipb.SnapshotConfig{StorageLocation: testStorageLocation}}
+	stored, err := w.ensureSuspendedFinalized(ctx, resources.ActorRef{Atespace: "team-a", Name: "actor-1"}, tmpl)
+	if err != nil {
+		t.Fatalf("ensureSuspendedFinalized: %v", err)
+	}
+	if stored.GetStatus().GetWorkerAssignment() != nil {
+		t.Errorf("WorkerAssignment = %v, want cleared", stored.GetStatus().GetWorkerAssignment())
+	}
+	if got := stored.GetStatus().GetExternalSnapshot().GetProducedOnNode(); got != "node-7" {
+		t.Errorf("ExternalSnapshot.ProducedOnNode = %q, want %q", got, "node-7")
+	}
 }
 
 // TestEnsureSuspendedFinalized_ReleasesReplacedSnapshot verifies which external

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -217,6 +218,135 @@ func TestAssignWorkerAttempt_StampsSubstrateTemplateRef(t *testing.T) {
 	}
 	if assignment.GetActorTemplateRef().GetAtespace() != "team-a" || assignment.GetActorTemplateRef().GetName() != "sub-tmpl" {
 		t.Errorf("assignment ActorTemplateRef = %v, want team-a/sub-tmpl", assignment.GetActorTemplateRef())
+	}
+}
+
+// TestAssignWorkerAttempt_PrefersSnapshotProducerNode verifies a SUSPENDED
+// actor lands on the node its external snapshot was uploaded from when a
+// worker there has room, and that the pick is logged as a hit.
+func TestAssignWorkerAttempt_PrefersSnapshotProducerNode(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	records := logRecords(t, "Picked worker")
+
+	for _, w := range []struct{ pod, node string }{{"pod-a", "node-a"}, {"pod-b", "node-b"}} {
+		if _, err := persistence.CreateWorker(ctx, &ateapipb.Worker{
+			Metadata:        &ateapipb.ResourceMetadata{Name: testWorkerUID(w.pod)},
+			WorkerNamespace: "worker-ns",
+			WorkerPool:      "pool",
+			WorkerPod:       w.pod,
+			WorkerPodUid:    testWorkerUID(w.pod),
+			NodeName:        w.node,
+			SandboxClass:    "gvisor",
+			Status:          &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_ACTIVE, Capacity: &ateapipb.WorkerResources{Actors: 4}},
+		}); err != nil {
+			t.Fatalf("CreateWorker(%s): %v", w.pod, err)
+		}
+	}
+
+	actor := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
+		Metadata:      &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "id1"},
+		ActorTemplate: &ateapipb.ObjectRef{Atespace: "team-a", Name: "tmpl"},
+		Status: &ateapipb.ActorStatus{
+			State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+			ExternalSnapshot: &ateapipb.ExternalSnapshot{
+				SnapshotUri:    someActorSnapshotURI(t, testStorageLocation, "team-a", "snap-1"),
+				ProducedOnNode: "node-b",
+			},
+		},
+	})
+
+	cacheCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	wc := workercache.New(persistence, time.Minute)
+	if err := wc.Start(cacheCtx); err != nil {
+		t.Fatalf("workercache.Start: %v", err)
+	}
+
+	// intn always samples the first candidate pair, which would pick pod-a
+	// (listed first, equally loaded) without the preference.
+	w := &ActorWorkflow{store: persistence, workerCache: wc, scheduler: scheduling.New(wc, scheduling.WithIntn(func(int) int { return 0 }))}
+	tmpl := &ateapipb.ActorTemplate{
+		Metadata:      &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "tmpl"},
+		SandboxConfig: &ateapipb.SandboxConfig{SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR},
+	}
+	var tm resumeTiming
+	stored, assigned, err := w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, tmpl, &tm)
+	if err != nil {
+		t.Fatalf("assignWorkerAttempt: %v", err)
+	}
+	if got := assigned.GetNodeName(); got != "node-b" {
+		t.Errorf("assigned worker node = %q, want node-b", got)
+	}
+	if got := stored.GetStatus().GetWorkerAssignment().GetNodeName(); got != "node-b" {
+		t.Errorf("persisted assignment node = %q, want node-b", got)
+	}
+	if tm.nodePreference != nodePreferenceHit {
+		t.Errorf("tm.nodePreference = %q, want %q", tm.nodePreference, nodePreferenceHit)
+	}
+	if len(*records) != 1 {
+		t.Fatalf("got %d \"Picked worker\" records, want 1", len(*records))
+	}
+	if got := (*records)[0].attrs[nodePreferenceKey]; got != nodePreferenceHit {
+		t.Errorf("%s = %q, want %q", nodePreferenceKey, got, nodePreferenceHit)
+	}
+}
+
+func TestNodePreferenceOutcome(t *testing.T) {
+	worker := &ateapipb.Worker{NodeName: "node-a"}
+	tests := []struct {
+		name      string
+		preferred []string
+		want      string
+	}{
+		{"no preference", nil, nodePreferenceNone},
+		{"on preferred node", []string{"node-a"}, nodePreferenceHit},
+		{"elsewhere", []string{"node-b"}, nodePreferenceMiss},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := nodePreferenceOutcome(worker, scheduling.Constraints{PreferredNodes: tt.preferred}); got != tt.want {
+				t.Errorf("nodePreferenceOutcome() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSchedulingConstraints_PreferredNodes(t *testing.T) {
+	tmpl := &ateapipb.ActorTemplate{}
+	snap := &ateapipb.ExternalSnapshot{SnapshotUri: "gs://b/p", ProducedOnNode: "node-a"}
+	tests := []struct {
+		name   string
+		status *ateapipb.ActorStatus
+		want   []string
+	}{
+		{
+			name:   "suspended with producer node",
+			status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, ExternalSnapshot: snap},
+			want:   []string{"node-a"},
+		},
+		{
+			name:   "suspended without producer node",
+			status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, ExternalSnapshot: &ateapipb.ExternalSnapshot{SnapshotUri: "gs://b/p"}},
+		},
+		{
+			// A paused actor is pinned by RequiredNodes; the stale external
+			// snapshot's node must not leak into the preference.
+			name: "paused ignores producer node",
+			status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_PAUSED, ExternalSnapshot: snap,
+				LocalSnapshot: &ateapipb.LocalSnapshot{NodeVmsWithLocalSnapshots: []string{"node-b"}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := schedulingConstraints(&ateapipb.Actor{Status: tt.status}, tmpl)
+			if err != nil {
+				t.Fatalf("schedulingConstraints: %v", err)
+			}
+			if !slices.Equal(c.PreferredNodes, tt.want) {
+				t.Errorf("PreferredNodes = %v, want %v", c.PreferredNodes, tt.want)
+			}
+		})
 	}
 }
 
@@ -776,7 +906,7 @@ func TestResumeActor_TimingBreakdown(t *testing.T) {
 		got := (*records)[0].attrs
 		want := []string{
 			"ate.atespace", "ate.actor.name", "ate.actor.uid",
-			"ate.actor.resume.assign_attempts",
+			"ate.actor.resume.assign_attempts", nodePreferenceKey,
 		}
 		for _, phase := range []string{
 			"get_actor", "lease_acquire", "load", "volumes_create", "assign", "schedule", "bind",
@@ -792,6 +922,10 @@ func TestResumeActor_TimingBreakdown(t *testing.T) {
 		}
 		if got["ate.actor.resume.assign_attempts"] != "1" {
 			t.Errorf("assign_attempts = %q, want 1", got["ate.actor.resume.assign_attempts"])
+		}
+		// The seeded actor's snapshot names no producing node.
+		if got[nodePreferenceKey] != nodePreferenceNone {
+			t.Errorf("%s = %q, want %q", nodePreferenceKey, got[nodePreferenceKey], nodePreferenceNone)
 		}
 		if _, ok := got["error.type"]; ok {
 			t.Errorf("successful resume carries error.type: %v", got)

@@ -84,6 +84,54 @@ func TestSchedule(t *testing.T) {
 			wantPod:     "w-b",
 		},
 		{
+			// w-a is sampled first and is less loaded, so only the preference
+			// can land on w-b.
+			name: "preferred node wins over a less-loaded worker elsewhere",
+			fleet: fleet{
+				worker("w-a", "gvisor", "node-a", tierTwo, withMaxActors(4)),
+				worker("w-b", "gvisor", "node-b", tierTwo, withMaxActors(4), assigned("demo", "a")),
+			},
+			constraints: Constraints{SandboxClass: "gvisor", PreferredNodes: []string{"node-b"}},
+			wantPod:     "w-b",
+		},
+		{
+			name: "preferred node full falls back to the fleet",
+			fleet: fleet{
+				worker("w-a", "gvisor", "node-a", tierTwo),
+				worker("w-b", "gvisor", "node-b", tierTwo, assigned("demo", "a")),
+			},
+			constraints: Constraints{SandboxClass: "gvisor", PreferredNodes: []string{"node-b"}},
+			wantPod:     "w-a",
+		},
+		{
+			name: "preferred node absent falls back to the fleet",
+			fleet: fleet{
+				worker("w-a", "gvisor", "node-a", tierTwo),
+			},
+			constraints: Constraints{SandboxClass: "gvisor", PreferredNodes: []string{"node-gone"}},
+			wantPod:     "w-a",
+		},
+		{
+			name: "preferred node does not relax selectors",
+			fleet: fleet{
+				worker("w-a", "gvisor", "node-a", tierOne),
+				worker("w-b", "gvisor", "node-b", tierTwo),
+			},
+			constraints: Constraints{SandboxClass: "gvisor",
+				TemplateSelector: labels.SelectorFromSet(labels.Set{"tier": "1"}),
+				PreferredNodes:   []string{"node-b"}},
+			wantPod: "w-a",
+		},
+		{
+			name: "required nodes apply before preferred nodes",
+			fleet: fleet{
+				worker("w-a", "gvisor", "node-a", tierTwo),
+				worker("w-b", "gvisor", "node-b", tierTwo),
+			},
+			constraints: Constraints{SandboxClass: "gvisor", RequiredNodes: []string{"node-a"}, PreferredNodes: []string{"node-b"}},
+			wantPod:     "w-a",
+		},
+		{
 			name: "nil selectors match everything",
 			fleet: fleet{
 				worker("w-1", "gvisor", "node-a", nil),
@@ -593,5 +641,30 @@ func TestScheduleMalformedLimitsIsNotNoCapacity(t *testing.T) {
 	}
 	if errors.Is(err, ErrNoCapacity) {
 		t.Fatalf("Schedule() error = %v, want an error other than ErrNoCapacity", err)
+	}
+}
+
+func TestSchedulePreferredNodesSampleAmongPreferred(t *testing.T) {
+	// Two workers on the preferred node and a lighter one elsewhere: the pair
+	// is sampled from the preferred two only, and the less loaded of them wins.
+	f := fleet{
+		worker("w-0", "gvisor", "node-x", nil, withMaxActors(4)),
+		worker("w-1", "gvisor", "node-p", nil, withMaxActors(4), assigned("demo", "a"), assigned("demo", "b")),
+		worker("w-2", "gvisor", "node-p", nil, withMaxActors(4), assigned("demo", "c")),
+	}
+	calls := 0
+	s := New(f, WithIntn(func(n int) int {
+		calls++
+		if calls == 1 && n != 2 {
+			t.Fatalf("first sample over %d candidates, want the 2 preferred", n)
+		}
+		return 0
+	}))
+	got, err := s.Schedule(context.Background(), Constraints{SandboxClass: "gvisor", PreferredNodes: []string{"node-p"}})
+	if err != nil {
+		t.Fatalf("Schedule() error = %v", err)
+	}
+	if got.GetWorkerPod() != "w-2" {
+		t.Fatalf("Schedule() = %q, want %q", got.GetWorkerPod(), "w-2")
 	}
 }

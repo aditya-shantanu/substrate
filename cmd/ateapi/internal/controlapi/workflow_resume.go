@@ -69,12 +69,36 @@ type resumeTiming struct {
 	// already RESUMING with a valid worker.
 	assignAttempts            int
 	ateletDial, ateletRestore time.Duration
+	// nodePreference is the successful attempt's same-node preference outcome
+	// (see nodePreferenceOutcome); empty when no worker was scheduled.
+	nodePreference string
 }
 
 const (
 	resumeDurationKeyPrefix = "ate.actor.resume.duration."
 	resumeAssignAttemptsKey = "ate.actor.resume.assign_attempts"
+	// nodePreferenceKey labels whether a resume landed on the node its external
+	// snapshot was uploaded from (hit), elsewhere (miss), or had no preference
+	// to honor (none).
+	nodePreferenceKey = "ate.scheduler.node_preference"
+
+	nodePreferenceHit  = "hit"
+	nodePreferenceMiss = "miss"
+	nodePreferenceNone = "none"
 )
+
+// nodePreferenceOutcome classifies the worker Schedule picked against the
+// constraints' preferred nodes.
+func nodePreferenceOutcome(worker *ateapipb.Worker, constraints scheduling.Constraints) string {
+	switch {
+	case len(constraints.PreferredNodes) == 0:
+		return nodePreferenceNone
+	case slices.Contains(constraints.PreferredNodes, worker.GetNodeName()):
+		return nodePreferenceHit
+	default:
+		return nodePreferenceMiss
+	}
+}
 
 // logAttrs renders the record: the actor identity, one float-seconds attr per
 // step that ran, the attempt count, and on failure the gRPC code as error.type.
@@ -110,6 +134,9 @@ func (tm *resumeTiming) logAttrs(actorRef resources.ActorRef, actor *ateapipb.Ac
 		attrs = append(attrs, slog.Float64(resumeDurationKeyPrefix+p.name, p.d.Seconds()))
 	}
 	attrs = append(attrs, slog.Int(resumeAssignAttemptsKey, tm.assignAttempts))
+	if tm.nodePreference != "" {
+		attrs = append(attrs, slog.String(nodePreferenceKey, tm.nodePreference))
+	}
 	if err != nil {
 		attrs = append(attrs, slog.String(string(ateattr.ErrorTypeKey), status.Code(err).String()))
 	}
@@ -503,6 +530,7 @@ func schedulerRecordable(err error) bool {
 func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate, tm *resumeTiming) (_ *ateapipb.Actor, _ *ateapipb.Worker, err error) {
 	start := time.Now()
 	var dSchedule, dBind, dUpdate time.Duration
+	var nodePreference string
 	outcome := ateattr.SchedulerOutcomeError
 	poolNamespace := ""
 	pool := ""
@@ -538,7 +566,10 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 		}
 
 		assignedWorker = pickedWorker
-		slog.InfoContext(ctx, "Picked worker", slog.Any("worker", pickedWorker.String()))
+		nodePreference = nodePreferenceOutcome(pickedWorker, constraints)
+		slog.InfoContext(ctx, "Picked worker",
+			slog.Any("worker", pickedWorker.String()),
+			slog.String(nodePreferenceKey, nodePreference))
 	}
 
 	assignment := &ateapipb.ActorAssignment{
@@ -606,6 +637,7 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 	pool = assignedWorker.GetWorkerPool()
 	outcome = ateattr.SchedulerOutcomeAssigned
 	tm.schedule, tm.bind, tm.assignUpdate = dSchedule, dBind, dUpdate
+	tm.nodePreference = nodePreference
 	logActorStateChanged(ctx, storedActor, ateattr.OperationResume)
 	return storedActor, assignedWorker, nil
 }
@@ -662,6 +694,14 @@ func schedulingConstraints(actor *ateapipb.Actor, tmpl *ateapipb.ActorTemplate) 
 	}
 	if sel := tmpl.GetWorkerSelector(); sel != nil {
 		c.TemplateSelector = labels.SelectorFromSet(labels.Set(sel.GetMatchLabels()))
+	}
+	// A SUSPENDED actor restores from its external snapshot; the node that
+	// uploaded it may still hold a local copy (atelet retains one), so prefer
+	// it. A PAUSED actor is pinned by RequiredNodes instead.
+	if actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		if node := actor.GetStatus().GetExternalSnapshot().GetProducedOnNode(); node != "" {
+			c.PreferredNodes = []string{node}
+		}
 	}
 	return c, nil
 }

@@ -3621,6 +3621,8 @@ func TestSuspendActor(t *testing.T) {
 				SnapshotUri:      snapshotURI,
 				ContentScope:     sourceActor.GetStatus().GetExternalSnapshot().GetContentScope(),
 				ActorTemplateUid: tmpl.GetMetadata().GetUid(),
+				// The node of the worker the suspend ran on.
+				ProducedOnNode: "node1",
 			},
 		},
 	}
