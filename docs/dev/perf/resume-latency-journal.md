@@ -75,6 +75,143 @@ outside spans; the cert-mint chain was untimed.
 Each run: id, date, build, config, results table, notes. Appended as they
 happen.
 
+### B1. Baseline, gVisor, pause lifecycle, think-scale 5 (2026-10-03 04:17-04:24 UTC)
+
+Build 20d10da3 (main bec46812 + instrumentation). 100 users, spawn 5/s,
+`resume_mode=implicit lifecycle_mode=pause agentsession_think_scale=5`,
+1 worker pod (600Gi) on the c3-highmem-88, glutton 1Gi. Ran 7 minutes.
+
+Client side (ms, boomer stats):
+
+| series | n | p50 | p90 | p99 | max | fail |
+|---|---|---|---|---|---|---|
+| WakeFirstTouch | 1482 | 220 | 690 | 10000 | 10000 | 34 |
+| PauseActor | 1609 | 3900 | 21000 | 44000 | 53000 | 34 |
+
+WakeFirstTouch at the 60 s mark, before pause backed up: p50 200, p95 320,
+p99 460. The p99 of 10 s and the 34 failures at the end are the router's park
+budget expiring behind queued pauses.
+
+Server side, local (pause) restores only, p50 / p90 / p99 seconds:
+
+| layer | total | biggest phases |
+|---|---|---|
+| router flight (`elapsed_seconds`, outcome triggered) | 0.218 / 0.322 / 0.830 | |
+| ateapi `Resume timing breakdown` | 0.211 / 0.319 / 0.506 | atelet_restore 0.200; assign 0.004 (bind 0.002, assign_update 0.002); finalize 0.002; lease_acquire 0.002; lease_release 0.002 |
+| atelet `Restore timing breakdown` | 0.187 / 0.291 / 0.457 | ateom_restore 0.184; everything else < 1 ms at p50 |
+| ateom-gvisor `Restore timing breakdown` | 0.204 / 0.329 / 0.640 | app_restore 0.095; pause_create 0.041; app_create 0.021; pause_restore 0.018; net_setup 0.005; egress_prepare 0.004; prep 0.003; wakeup_probe 0.003 |
+| ateom-gvisor `Checkpoint timing breakdown` | 4.39 / 9.20 / 10.73 | checkpoint (runsc) 4.29 / 9.10 / 10.64; teardown 0.09 |
+
+First activation from the golden (100 samples): atelet total 0.249 p50, of
+which ateom_restore 0.157, download 0.049, manifest_fetch 0.029 (serial GCS
+GET before the download starts).
+
+Findings:
+
+1. On the pause/resume path about 90% of a 200 ms wake is `runsc`
+   (create + restore of the pause and app containers, 175 ms of 204 ms in
+   ateom). Substrate's own share is about 25 ms: ateapi 12 ms of store work,
+   router about 7 ms, atelet about 3 ms, ateom outside runsc about 15 ms.
+   The hypothesis that the sandbox layer would not matter does not hold for
+   gVisor pause/resume at this scale.
+2. Pause is disk-bound. Each local checkpoint is about 167 MB on disk; at
+   3.8 pauses/s the worker's boot disk (hyperdisk-balanced, 890 MiB/s
+   provisioned) sat at about 905 MB/s written with I/O pressure `full`
+   avg60 at 50%. Checkpoints queued behind each other (p50 4.4 s, p99 11 s
+   in ateom; 44 s at the client once the queue built up) and the backlog
+   eventually starved resumes.
+3. The ateapi path is already cheap: 13 statements cost about 12 ms total.
+   Collapsing them is worth a few milliseconds, not tens.
+4. atelet's restore phases now partition the total (`total` minus
+   `ateom_restore` is about 3 ms, all accounted).
+5. Side findings. A PAUSED actor is not deletable (`FailedPrecondition: not
+   in a deletable state`); the load generator's shutdown could not clean up
+   after the overload, leaving 100 paused actors to suspend by hand. The
+   runsc on the node (release-20260824.0-120) checkpoints with
+   `-compression none` by default (pages.img is the resident set, 175 MB
+   here) and offers `-direct` (O_DIRECT), `-exclude-committed-zero-pages`,
+   and on restore `-background` (return before all pages are loaded,
+   uncompressed images only). None are passed today. These are flags on how
+   Substrate drives the sandbox, not changes to gVisor; listed here for the
+   user to rule in or out.
+
+
+### B2. Baseline, gVisor, pause lifecycle, think-scale 15 (04:29-04:41 UTC)
+
+Same build and cluster as B1; only `agentsession_think_scale=15` (about 4%
+duty cycle, the intended coding-agent profile). 12 minutes, no failures.
+This is the reference configuration for the pause path from here on.
+
+| series | n | p50 | p90 | p95 | p99 | max |
+|---|---|---|---|---|---|---|
+| WakeFirstTouch (ms) | 1298 | 190 | 240 | 250 | 290 | 400 |
+| PauseActor (ms) | 1392 | 230 | 620 | 1000 | 2500 | 5100 |
+
+Server side p50 / p90 / p99 (s):
+
+| layer | total | phases |
+|---|---|---|
+| router flight | 0.196 / 0.239 / 0.278 | |
+| ateapi resume | 0.196 / 0.239 / 0.283 | atelet_restore 0.185; assign 0.004; finalize 0.002; bind 0.002; lease_acquire 0.002 |
+| atelet restore (local) | 0.177 / 0.220 / 0.269 | ateom_restore 0.176 |
+| ateom-gvisor restore | 0.175 / 0.196 / 0.223 | app_restore 0.084; pause_create 0.035; app_create 0.018; pause_restore 0.016; net_setup 0.004; wakeup_probe 0.004 |
+| ateom-gvisor checkpoint | 0.172 / 0.262 / 0.393 | checkpoint (runsc) 0.127; teardown 0.045 |
+
+Pause at 2.4/s writes about 420 MB/s, under the disk's 890 MiB/s, so the
+uncontended checkpoint shows: 127 ms of runsc for a 175 MB image plus 45 ms
+of teardown. The 2.5 s p99 is still disk queueing when pauses coincide.
+
+Harness note: the agent-session shutdown fan-out runs only when the boomer
+process quits (`cmd/benchmarking/boomer-worker/main.go` calls it after
+SIGTERM or a master quit), not on a web-UI stop, so every interactive run
+leaves its actors PAUSED and a web-UI restart creates 100 more. Cleanup here
+is a suspend+delete loop. A `boomer:stop` subscription that runs the same
+fan-out would fix it; harness-only, listed under candidates.
+
+
+### B3. Baseline, gVisor, suspend lifecycle, think-scale 15 (04:44-04:55 UTC)
+
+Same build and cluster; `lifecycle_mode=suspend` (durable snapshot to GCS
+on every idle gap, download on every wake). 11 minutes.
+
+| series | n | p50 | p90 | p95 | p99 | max | fail |
+|---|---|---|---|---|---|---|---|
+| WakeFirstTouch (ms) | 1084 | 1200 | 2000 | 2300 | 3400 | 10000 | 2 |
+| SuspendActor (ms) | 1184 | 2000 | 11000 | 12000 | 18000 | 23000 | 2 |
+
+At the 4-minute mark, before the backlog built: WakeFirstTouch p50 770,
+p95 1200, p99 2100; SuspendActor p50 1200.
+
+Server side p50 / p90 / p99 (s), whole run:
+
+| layer | total | phases |
+|---|---|---|
+| router flight | 1.112 / 1.887 / 3.329 | |
+| ateapi resume | 1.356 / 2.116 / 3.811 | atelet_restore 1.346 |
+| atelet restore (latest) | 1.179 / 1.931 / 3.347 | download 0.927 / 1.633 / 3.057; ateom_restore 0.187; manifest_fetch 0.058 |
+| atelet checkpoint (external) | 1.947 / 10.681 / 17.474 | persist (zstd + GCS PUT) 1.585 / 8.869 / 11.477; ateom_checkpoint 0.211 / 1.859 / 8.458; dirs_reset 0.065 / 0.549 / 5.588 |
+
+First 4 minutes only, atelet restore: total 0.782, download 0.551,
+ateom_restore 0.166, manifest_fetch 0.060.
+
+Findings:
+
+1. A suspend/resume wake is 4 to 6 times a pause/resume wake, and the whole
+   difference is Substrate-side: the GCS download of the actor's own 175 MB
+   checkpoint (0.55 s uncontended, 0.93 s p50 over the run) plus the serial
+   manifest GET (0.06 s). The sandbox restore is the same 0.17 to 0.19 s.
+2. The node already had those bytes: suspend streams them from
+   `checkpoint-state/` to GCS and then deletes them. Keeping that copy on the
+   node and restoring from it when the same node is picked turns this path
+   into the pause path (change C3 below).
+3. Suspend is upload-bound and disk-bound: `persist` 1.6 s p50 and
+   `dirs_reset` (deleting the uploaded files) p99 5.6 s under contention.
+   Renaming the files into a retained copy instead of deleting them removes
+   the delete from the suspend path too.
+4. Download speed itself is 190 to 320 MB/s per stream (one GET, one zstd
+   decoder). That matters once actors move between nodes; upstream #1955
+   (client pool spread) is the in-flight work there.
+
 ## Changes
 
 Each change: what, why, measured effect, verdict (keep / drop), submit?
@@ -114,6 +251,26 @@ Added before the baseline so the baseline itself shows where time goes.
 - **benchmark tooling.** `benchmarking/workloads/deploy.sh` gained
   `--worker-node-selector` and `--worker-toleration` so the WorkerPool can be
   pinned to a dedicated node pool. Submit: yes (small, independent).
+
+### C1. atelet: manifest fetch and ateom dial off the serial path (590efbb5)
+
+The snapshot manifest GET ran before the asset/OCI preparation leg although
+that leg needs only the request; it now heads the download leg so both legs
+start together. The ateom dial and workload spec build moved ahead of the
+fan-out. Error attribution unchanged (first error wins; collateral phases
+zeroed). Expected: about the manifest GET (29 ms p50 on golden restores in
+B1) off EXTERNAL restores when the prep leg is the longer one; nothing on
+pause restores. Measured: pending (B4).
+
+### C2. ateom-gvisor: egress certificate mint concurrent with sandbox setup (590efbb5)
+
+`PrepareEgress` (ateom to atelet to ateapi to PostgreSQL) ran first and
+serially; its result is only consumed by `tunnel.Activate` at the end. It now
+runs in a goroutine started where it used to block and is joined just before
+activation; a new `egress_join` phase reports what is left on the critical
+path. Failure paths wait for the goroutine before cleanup. Same change in
+`RunWorkload`. Expected: about 4 ms p50, 13 ms p99 off every gVisor restore.
+Measured: pending (B4).
 
 ## Candidates to submit
 
