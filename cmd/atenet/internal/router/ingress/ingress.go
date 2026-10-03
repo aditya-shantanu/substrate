@@ -29,17 +29,21 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
+	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/atenet"
 	"github.com/agent-substrate/substrate/internal/atunnel"
+	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
@@ -77,6 +81,7 @@ func (h *Handler) Direction() extproc.Direction { return extproc.DirectionIngres
 func (h *Handler) ParkingStatus() ParkingStatus { return h.parking.status() }
 
 func (h *Handler) HandleRequestHeaders(ctx context.Context, md *extproc.RequestMetadata) (extproc.Result, error) {
+	arrived := time.Now()
 	slog.InfoContext(ctx, "Request", slog.String("host", md.Host))
 
 	// The dataplane doesn't propagate trace context into the ext_proc gRPC
@@ -107,18 +112,7 @@ func (h *Handler) HandleRequestHeaders(ctx context.Context, md *extproc.RequestM
 	}
 
 	slog.InfoContext(ctx, "ResumeActor", slog.Any("actor", actorRef))
-	actor, resumeOutcome, err := h.resumer.ResumeActor(ctx, actorRef)
-	if err != nil {
-		return extproc.Result{Resume: string(resumeOutcome)}, mapResumeError(actorRef, err)
-	}
-
-	// ActorTemplate reference, used as low-cardinality route-latency metric
-	// attributes.
-	res := extproc.Result{
-		TemplateAtespace: actor.GetActorTemplate().GetAtespace(),
-		TemplateName:     actor.GetActorTemplate().GetName(),
-		Resume:           string(resumeOutcome),
-	}
+	actor, rs, err := h.resumer.ResumeActor(ctx, actorRef)
 
 	// The first IP is in the cluster's primary IP family.
 	// TODO: choose the IP family that matches the dataplane's own address.
@@ -126,10 +120,18 @@ func (h *Handler) HandleRequestHeaders(ctx context.Context, md *extproc.RequestM
 	if ips := actor.GetStatus().GetWorkerAssignment().GetWorkerPodIps(); len(ips) > 0 {
 		workerIP = ips[0]
 	}
-	slog.InfoContext(ctx, "ResumeActor result",
-		slog.Any("actor", actorRef),
-		slog.String("state", actor.GetStatus().GetState().String()),
-		slog.String("workerIP", workerIP))
+	logResumeResult(ctx, actorRef, actor, workerIP, rs, err, arrived)
+	if err != nil {
+		return extproc.Result{Resume: string(rs.Outcome)}, mapResumeError(actorRef, err)
+	}
+
+	// ActorTemplate reference, used as low-cardinality route-latency metric
+	// attributes.
+	res := extproc.Result{
+		TemplateAtespace: actor.GetActorTemplate().GetAtespace(),
+		TemplateName:     actor.GetActorTemplate().GetName(),
+		Resume:           string(rs.Outcome),
+	}
 
 	if ip := net.ParseIP(workerIP); ip == nil {
 		return res, extproc.NewReqError(envoy_type.StatusCode_InternalServerError,
@@ -174,6 +176,32 @@ func (h *Handler) HandleRequestHeaders(ctx context.Context, md *extproc.RequestM
 	}
 	res.DynamicMetadata = dynamicMetadata
 	return res, nil
+}
+
+// logResumeResult records how one request's resume went: the time from the
+// request headers' arrival to the answer, the shared flight's RPC history,
+// the singleflight outcome, and on failure the gRPC code. actor is nil on
+// failure.
+func logResumeResult(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, workerIP string, rs ResumeStatus, err error, arrived time.Time) {
+	attrs := []slog.Attr{
+		slog.Any("actor", actorRef),
+		slog.String("outcome", string(rs.Outcome)),
+		slog.Int("rpc_attempts", rs.Attempts),
+		slog.Float64("elapsed_seconds", time.Since(arrived).Seconds()),
+	}
+	if !rs.FirstAttemptAt.IsZero() {
+		attrs = append(attrs,
+			slog.Time("first_rpc_at", rs.FirstAttemptAt),
+			slog.Float64("first_rpc_delay_seconds", rs.FirstAttemptAt.Sub(arrived).Seconds()))
+	}
+	if err != nil {
+		attrs = append(attrs, slog.String(string(ateattr.ErrorTypeKey), status.Code(err).String()))
+	} else {
+		attrs = append(attrs,
+			slog.String("state", actor.GetStatus().GetState().String()),
+			slog.String("workerIP", workerIP))
+	}
+	slog.LogAttrs(ctx, slog.LevelInfo, "ResumeActor result", attrs...)
 }
 
 func routingValue(md *extproc.RequestMetadata, header, attribute string) string {

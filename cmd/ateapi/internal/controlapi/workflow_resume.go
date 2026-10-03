@@ -58,6 +58,64 @@ type restoreTelemetry struct {
 	WireSnapshotScope string
 }
 
+// resumeTiming is the wall clock of one ResumeActor call, step by step. It is
+// logged as "Resume timing breakdown" so resume latency can be attributed from
+// logs: the step spans carry the same split per trace but do not aggregate.
+type resumeTiming struct {
+	getActor, leaseAcquire, load, volumesCreate, assign, volumesAttach, finalize, leaseRelease time.Duration
+	// The successful assignment attempt's calls; a retried attempt's are dropped.
+	schedule, bind, assignUpdate time.Duration
+	// assignAttempts counts assignWorkerAttempt calls; zero when the actor was
+	// already RESUMING with a valid worker.
+	assignAttempts            int
+	ateletDial, ateletRestore time.Duration
+}
+
+const (
+	resumeDurationKeyPrefix = "ate.actor.resume.duration."
+	resumeAssignAttemptsKey = "ate.actor.resume.assign_attempts"
+)
+
+// logAttrs renders the record: the actor identity, one float-seconds attr per
+// step that ran, the attempt count, and on failure the gRPC code as error.type.
+// actor may be nil when the first read failed.
+func (tm *resumeTiming) logAttrs(actorRef resources.ActorRef, actor *ateapipb.Actor, total time.Duration, err error) []slog.Attr {
+	attrs := ateattr.ActorRefLogAttrs(actorRef)
+	if actor != nil {
+		attrs = ateattr.ActorLogAttrs(resources.ActorAttributionFromActor(actor))
+	}
+	phases := []struct {
+		name string
+		d    time.Duration
+	}{
+		{"get_actor", tm.getActor},
+		{"lease_acquire", tm.leaseAcquire},
+		{"load", tm.load},
+		{"volumes_create", tm.volumesCreate},
+		{"assign", tm.assign},
+		{"schedule", tm.schedule},
+		{"bind", tm.bind},
+		{"assign_update", tm.assignUpdate},
+		{"volumes_attach", tm.volumesAttach},
+		{"atelet_dial", tm.ateletDial},
+		{"atelet_restore", tm.ateletRestore},
+		{"finalize", tm.finalize},
+		{"lease_release", tm.leaseRelease},
+		{"total", total},
+	}
+	for _, p := range phases {
+		if p.d == 0 {
+			continue
+		}
+		attrs = append(attrs, slog.Float64(resumeDurationKeyPrefix+p.name, p.d.Seconds()))
+	}
+	attrs = append(attrs, slog.Int(resumeAssignAttemptsKey, tm.assignAttempts))
+	if err != nil {
+		attrs = append(attrs, slog.String(string(ateattr.ErrorTypeKey), status.Code(err).String()))
+	}
+	return attrs
+}
+
 // ResumeActor executes the workflow to resume a suspended actor. Idempotent:
 // a re-entered workflow fast-forwards past the steps a previous attempt
 // completed, deriving progress from the persisted actor alone.
@@ -67,24 +125,29 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	var actorTemplate *ateapipb.ActorTemplate
 	var tele restoreTelemetry
 	var wasRunning bool
+	var tm resumeTiming
 
 	// Recorded before the lease so lease contention still counts as an attempt.
 	// Clean already-running no-ops are skipped: the router resumes per routed
 	// request, and recording those would sample at router QPS and bury
-	// cold-resume latency.
+	// cold-resume latency. The timing record follows the same rule.
 	defer func() {
 		if err == nil && wasRunning {
 			return
 		}
 		w.instruments.recordLifecycleOp(ctx, ateattr.OperationResume, start, err,
 			lifecycleOpAttrs(actor, actorTemplate, tele.SnapshotKind, tele.WireSnapshotScope)...)
+		slog.LogAttrs(ctx, slog.LevelInfo, "Resume timing breakdown",
+			tm.logAttrs(actorRef, actor, time.Since(start), err)...)
 	}()
 
 	// Routed requests call ResumeActor even when the actor is already running.
 	// Read before taking the distributed lease so that hot-path checks do not
 	// upsert and delete a PostgreSQL lease row. Any state that needs work is read
 	// again under the lease below.
+	t := time.Now()
 	actor, err = w.store.GetActor(ctx, actorRef)
+	tm.getActor = time.Since(t)
 	if err != nil {
 		return nil, false, err
 	}
@@ -92,14 +155,22 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 		return actor, false, nil
 	}
 
+	t = time.Now()
 	leaseCtx, lease, err := w.acquireActorLease(ctx, actorRef)
+	tm.leaseAcquire = time.Since(t)
 	if err != nil {
 		return nil, false, err
 	}
-	defer lease.Close()
+	defer func() {
+		t := time.Now()
+		lease.Close()
+		tm.leaseRelease = time.Since(t)
+	}()
 
 	var src resumeSnapshotSource
+	t = time.Now()
 	actor, actorTemplate, src, err = w.loadActorForResume(leaseCtx, actorRef)
+	tm.load = time.Since(t)
 	if err != nil {
 		return nil, false, err
 	}
@@ -107,24 +178,36 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 		return actor, false, nil
 	}
 	var created *ateapipb.Actor
-	if created, err = w.ensureVolumesCreated(leaseCtx, actorRef, actor, actorTemplate); err != nil {
+	t = time.Now()
+	created, err = w.ensureVolumesCreated(leaseCtx, actorRef, actor, actorTemplate)
+	tm.volumesCreate = time.Since(t)
+	if err != nil {
 		return nil, false, err
 	}
 	actor = created
 	var worker *ateapipb.Worker
 	var assigned *ateapipb.Actor
-	if assigned, worker, err = w.ensureWorkerAssigned(leaseCtx, actorRef, actor, actorTemplate); err != nil {
+	t = time.Now()
+	assigned, worker, err = w.ensureWorkerAssigned(leaseCtx, actorRef, actor, actorTemplate, &tm)
+	tm.assign = time.Since(t)
+	if err != nil {
 		return nil, false, err
 	}
 	actor = assigned
-	if err = w.ensureVolumesAttached(leaseCtx, actor, worker, actorTemplate); err != nil {
+	t = time.Now()
+	err = w.ensureVolumesAttached(leaseCtx, actor, worker, actorTemplate)
+	tm.volumesAttach = time.Since(t)
+	if err != nil {
 		return nil, false, err
 	}
-	if tele, err = w.ensureAteletRestored(leaseCtx, actorRef, actor, actorTemplate, src); err != nil {
+	if tele, err = w.ensureAteletRestored(leaseCtx, actorRef, actor, actorTemplate, src, &tm); err != nil {
 		return nil, false, err
 	}
 	var running *ateapipb.Actor
-	if running, err = w.finalizeRunning(leaseCtx, actorRef); err != nil {
+	t = time.Now()
+	running, err = w.finalizeRunning(leaseCtx, actorRef)
+	tm.finalize = time.Since(t)
+	if err != nil {
 		return nil, false, err
 	}
 	actor = running
@@ -242,7 +325,7 @@ func (w *ActorWorkflow) ensureVolumesCreated(ctx context.Context, actorRef resou
 // assignment. A version conflict there is retried under a bounded backoff
 // only after re-reading the actor and revalidating it can still be resumed —
 // the conflicting writer may have crashed, drained, or deleted it.
-func (w *ActorWorkflow) ensureWorkerAssigned(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate) (_ *ateapipb.Actor, _ *ateapipb.Worker, err error) {
+func (w *ActorWorkflow) ensureWorkerAssigned(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate, tm *resumeTiming) (_ *ateapipb.Actor, _ *ateapipb.Worker, err error) {
 	ctx, done := stepSpan(ctx, "AssignWorker")
 	defer func() { err = done(err) }()
 
@@ -273,7 +356,8 @@ func (w *ActorWorkflow) ensureWorkerAssigned(ctx context.Context, actorRef resou
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		attemptActor, attemptWorker, attemptErr := w.assignWorkerAttempt(ctx, actorRef, actor, actorTemplate)
+		tm.assignAttempts++
+		attemptActor, attemptWorker, attemptErr := w.assignWorkerAttempt(ctx, actorRef, actor, actorTemplate, tm)
 		if attemptErr == nil {
 			assignedActor, assignedWorker = attemptActor, attemptWorker
 			return true, nil
@@ -414,9 +498,11 @@ func schedulerRecordable(err error) bool {
 // and persisting RESUMING with the assignment. On a version conflict it
 // re-reads the actor: if the fresh copy can still be resumed the refreshed
 // actor is returned along with the conflict so the caller retries with clean
-// inputs; any other status aborts the resume.
-func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate) (_ *ateapipb.Actor, _ *ateapipb.Worker, err error) {
+// inputs; any other status aborts the resume. tm receives the attempt's call
+// durations only when it succeeds.
+func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate, tm *resumeTiming) (_ *ateapipb.Actor, _ *ateapipb.Worker, err error) {
 	start := time.Now()
+	var dSchedule, dBind, dUpdate time.Duration
 	outcome := ateattr.SchedulerOutcomeError
 	poolNamespace := ""
 	pool := ""
@@ -440,7 +526,9 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 		return nil, nil, err
 	}
 	if assignedWorker == nil {
+		t := time.Now()
 		pickedWorker, err := w.scheduler.Schedule(ctx, constraints)
+		dSchedule = time.Since(t)
 		if err != nil {
 			if errors.Is(err, scheduling.ErrNoCapacity) {
 				outcome = ateattr.SchedulerOutcomeNoFreeWorker
@@ -474,7 +562,10 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 		}
 		return nil
 	}
-	if err := w.store.BindActorToWorker(ctx, assignedWorker.GetMetadata().GetName(), assignment, admit); err != nil {
+	t := time.Now()
+	err = w.store.BindActorToWorker(ctx, assignedWorker.GetMetadata().GetName(), assignment, admit)
+	dBind = time.Since(t)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			w.workerCache.Forget(assignedWorker.GetMetadata().GetName())
 			return nil, nil, fmt.Errorf("selected worker disappeared before claim: %w", store.ErrVersionConflict)
@@ -486,11 +577,13 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 	// The cached Worker may predate a raised epoch; the bind read it under the
 	// Worker's row lock.
 	newAssignment.WorkerEpoch = assignment.GetWorkerEpoch()
+	t = time.Now()
 	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapipb.Actor) error {
 		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_RESUMING
 		toUpdate.Status.WorkerAssignment = newAssignment
 		return nil
 	})
+	dUpdate = time.Since(t)
 	if err != nil {
 		if !errors.Is(err, store.ErrVersionConflict) {
 			return nil, nil, err
@@ -512,6 +605,7 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 	poolNamespace = assignedWorker.GetWorkerNamespace()
 	pool = assignedWorker.GetWorkerPool()
 	outcome = ateattr.SchedulerOutcomeAssigned
+	tm.schedule, tm.bind, tm.assignUpdate = dSchedule, dBind, dUpdate
 	logActorStateChanged(ctx, storedActor, ateattr.OperationResume)
 	return storedActor, assignedWorker, nil
 }
@@ -606,12 +700,14 @@ func (w *ActorWorkflow) ensureVolumesAttached(ctx context.Context, actor *ateapi
 // the worker pod UID, so a re-entered workflow re-sends the same semantic
 // request; once atelet's Restore/Run are idempotent on those keys this step
 // becomes fully reentrant with no changes here.
-func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate, src resumeSnapshotSource) (tele restoreTelemetry, err error) {
+func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate, src resumeSnapshotSource, tm *resumeTiming) (tele restoreTelemetry, err error) {
 	ctx, done := stepSpan(ctx, "CallAteletRestore")
 	defer func() { err = done(err) }()
 
 	assignment := actor.GetStatus().GetWorkerAssignment()
+	t := time.Now()
 	ateletConn, err := w.dialer.DialForAteletOnNode(assignment.GetNodeName())
+	tm.ateletDial = time.Since(t)
 	if err != nil {
 		return tele, err
 	}
@@ -661,7 +757,10 @@ func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resou
 		req.Scope = actorSnapshotContentScopeToAtelet(actorTemplate.GetSnapshotConfig().GetOnPause())
 		tele.WireSnapshotScope = ateattr.SnapshotScopeValue(req.Scope)
 
-		if _, err = client.Restore(ctx, req); err != nil {
+		t = time.Now()
+		_, err = client.Restore(ctx, req)
+		tm.ateletRestore = time.Since(t)
+		if err != nil {
 			return tele, handleAteletError(ctx, w.store, actorRef, ateattr.OperationResume, "Restore", false, err)
 		}
 		return tele, nil
@@ -693,7 +792,10 @@ func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resou
 			CpuMilli:      cpuMilli,
 			MemoryBytes:   memBytes,
 		}
-		if _, err = client.Restore(ctx, req); err != nil {
+		t = time.Now()
+		_, err = client.Restore(ctx, req)
+		tm.ateletRestore = time.Since(t)
+		if err != nil {
 			return tele, handleAteletError(ctx, w.store, actorRef, ateattr.OperationResume, "Restore", false, err)
 		}
 		return tele, nil
@@ -714,7 +816,12 @@ func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resou
 			CpuMilli:              cpuMilli,
 			MemoryBytes:           memBytes,
 		}
-		if _, err = client.Run(ctx, req); err != nil {
+		// Run is the cold-boot counterpart of Restore; it is timed under the
+		// same key.
+		t = time.Now()
+		_, err = client.Run(ctx, req)
+		tm.ateletRestore = time.Since(t)
+		if err != nil {
 			return tele, handleAteletError(ctx, w.store, actorRef, ateattr.OperationResume, "Run", false, err)
 		}
 		return tele, nil

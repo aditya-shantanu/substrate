@@ -143,14 +143,19 @@ func isCollateral(groupErr, legErr error) bool {
 	return legErr != nil && groupErr != legErr
 }
 
-// assetsAfterCollateral keeps the sandbox-asset duration when the prep leg was
-// cancelled during the later OCI unpack: only the phase a leg stopped in is
-// truncated, and dropping a completed one reports a step that ran as never run.
-func assetsAfterCollateral(prepFailedPhase string, assets time.Duration) time.Duration {
-	if prepFailedPhase == ateattr.SnapshotPhaseSandboxAssets {
-		return 0
+// prepAfterCollateral truncates the step the prep leg was cancelled in and
+// keeps the ones before it: only the phase a leg stopped in is cut short, and
+// dropping a completed one reports a step that ran as never run. The leg runs
+// the asset fetch, then the system-info register, then the OCI unpack; an
+// unattributed failure keeps both rather than guessing.
+func prepAfterCollateral(prepFailedPhase string, assets, sysinfo time.Duration) (time.Duration, time.Duration) {
+	switch prepFailedPhase {
+	case ateattr.SnapshotPhaseSandboxAssets:
+		return 0, 0
+	case ateattr.SnapshotPhaseSysinfoRegister:
+		return assets, 0
 	}
-	return assets
+	return assets, sysinfo
 }
 
 // restoreSnapshotKind classifies which snapshot a restore reads. A local

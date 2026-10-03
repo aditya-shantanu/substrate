@@ -69,6 +69,14 @@ groups:
           docs/metrics/substrate.yaml. It separates two actors that held the
           same name at different times.
         examples: [8f2a1c4e6b0d47f1]
+      - id: ate.actor.container.count
+        stability: development
+        type: int
+        brief: The number of application containers in the actor's workload spec.
+        note: >
+          Logs only. Carried on the ateom restore timing record so a reader can
+          divide the summed per-container phases by it.
+        examples: [1]
       - id: ate.actor.epoch
         stability: development
         type: int
@@ -328,6 +336,10 @@ groups:
           start is absent. It is not zero.
         type:
           members:
+            - id: dirs_reset
+              stability: development
+              value: dirs_reset
+              brief: atelet empties the directories of the actor on the node. This occurs before the mount on a restore and after the persist on a checkpoint.
             - id: volume_mount
               stability: development
               value: volume_mount
@@ -344,18 +356,34 @@ groups:
               stability: development
               value: download
               brief: Restore. atelet downloads the snapshot from object storage.
+            - id: sysinfo_register
+              stability: development
+              value: sysinfo_register
+              brief: Restore. atelet writes the system-info volumes of the actor. This occurs at the same time as the download.
             - id: oci_unpack
               stability: development
               value: oci_unpack
               brief: Restore. atelet unpacks the layers of the OCI image.
+            - id: ateom_dial
+              stability: development
+              value: ateom_dial
+              brief: atelet opens or reuses the gRPC connection to the target ateom. This occurs on a restore and on a checkpoint.
             - id: ateom_restore
               stability: development
               value: ateom_restore
               brief: Restore. This is the ateom restore call.
+            - id: sandbox_record
+              stability: development
+              value: sandbox_record
+              brief: Restore. atelet writes the sandbox record of the actor to the node.
             - id: ateom_checkpoint
               stability: development
               value: ateom_checkpoint
               brief: Checkpoint. This is the ateom checkpoint call.
+            - id: local_prune
+              stability: development
+              value: local_prune
+              brief: Checkpoint. atelet deletes the superseded local snapshots of the actor.
             - id: persist
               stability: development
               value: persist
@@ -363,6 +391,10 @@ groups:
                 Checkpoint. atelet writes the snapshot to its destination. It
                 uploads an external snapshot. It renames a local snapshot. The
                 ate.snapshot.kind key tells you which.
+            - id: volume_unmount
+              stability: development
+              value: volume_unmount
+              brief: Checkpoint. atelet unmounts the volumes of the actor.
             - id: total
               stability: development
               value: total

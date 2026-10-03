@@ -75,8 +75,8 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 		if !slices.Equal(actor.GetStatus().GetWorkerAssignment().GetWorkerPodIps(), []string{expectedIP}) {
 			t.Errorf("expected IP %q, got %q", expectedIP, actor.GetStatus().GetWorkerAssignment().GetWorkerPodIps())
 		}
-		if outcome != ResumeOutcomeTriggered {
-			t.Errorf("expected outcome %q, got %q", ResumeOutcomeTriggered, outcome)
+		if outcome.Outcome != ResumeOutcomeTriggered {
+			t.Errorf("expected outcome %q, got %q", ResumeOutcomeTriggered, outcome.Outcome)
 		}
 		if resumeCalled != 1 {
 			t.Errorf("expected ResumeActor called 1 time, got %d", resumeCalled)
@@ -101,8 +101,8 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if outcome != ResumeOutcomeNone {
-			t.Errorf("expected outcome %q for warm routing, got %q", ResumeOutcomeNone, outcome)
+		if outcome.Outcome != ResumeOutcomeNone {
+			t.Errorf("expected outcome %q for warm routing, got %q", ResumeOutcomeNone, outcome.Outcome)
 		}
 	})
 
@@ -131,11 +131,18 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 		if !slices.Equal(actor.GetStatus().GetWorkerAssignment().GetWorkerPodIps(), []string{expectedIP}) {
 			t.Errorf("expected IP %q, got %q", expectedIP, actor.GetStatus().GetWorkerAssignment().GetWorkerPodIps())
 		}
-		if outcome != ResumeOutcomeTriggered {
-			t.Errorf("expected outcome %q, got %q", ResumeOutcomeTriggered, outcome)
+		if outcome.Outcome != ResumeOutcomeTriggered {
+			t.Errorf("expected outcome %q, got %q", ResumeOutcomeTriggered, outcome.Outcome)
 		}
 		if resumeCalled != 3 {
 			t.Errorf("expected ResumeActor called 3 times, got %d", resumeCalled)
+		}
+		// The status reports the flight's RPC history for the ingress log.
+		if outcome.Attempts != 3 {
+			t.Errorf("Attempts = %d, want 3", outcome.Attempts)
+		}
+		if outcome.FirstAttemptAt.IsZero() {
+			t.Error("FirstAttemptAt is zero, want the first RPC's start time")
 		}
 	})
 
@@ -151,8 +158,8 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 		if got := status.Code(err); got != codes.NotFound {
 			t.Errorf("expected gRPC code NotFound, got %v (err=%v)", got, err)
 		}
-		if outcome != ResumeOutcomeUnknown {
-			t.Errorf("expected outcome %q on a failed resume, got %q", ResumeOutcomeUnknown, outcome)
+		if outcome.Outcome != ResumeOutcomeUnknown {
+			t.Errorf("expected outcome %q on a failed resume, got %q", ResumeOutcomeUnknown, outcome.Outcome)
 		}
 	})
 
@@ -179,8 +186,8 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Errorf("expected context.Canceled, got %v", err)
 		}
-		if outcome != ResumeOutcomeUnknown {
-			t.Errorf("expected outcome %q on a canceled caller, got %q", ResumeOutcomeUnknown, outcome)
+		if outcome.Outcome != ResumeOutcomeUnknown {
+			t.Errorf("expected outcome %q on a canceled caller, got %q", ResumeOutcomeUnknown, outcome.Outcome)
 		}
 	})
 
@@ -203,7 +210,7 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 			resumer := NewActorResumer(mock)
 
 			var wg sync.WaitGroup
-			outcomes := make([]ResumeOutcome, concurrentRequests)
+			outcomes := make([]ResumeStatus, concurrentRequests)
 			errs := make([]error, concurrentRequests)
 
 			wg.Add(concurrentRequests)
@@ -225,8 +232,8 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 				if got := status.Code(errs[i]); got != codes.ResourceExhausted {
 					t.Fatalf("request %d expected ResourceExhausted, got %v", i, errs[i])
 				}
-				if outcomes[i] != ResumeOutcomeUnknown {
-					t.Errorf("request %d: expected outcome %q on a failed flight, got %q", i, ResumeOutcomeUnknown, outcomes[i])
+				if outcomes[i].Outcome != ResumeOutcomeUnknown {
+					t.Errorf("request %d: expected outcome %q on a failed flight, got %q", i, ResumeOutcomeUnknown, outcomes[i].Outcome)
 				}
 			}
 
@@ -260,7 +267,7 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 		var wg sync.WaitGroup
 		const concurrentRequests = 10
 		results := make([]*ateapipb.Actor, concurrentRequests)
-		outcomes := make([]ResumeOutcome, concurrentRequests)
+		outcomes := make([]ResumeStatus, concurrentRequests)
 		errs := make([]error, concurrentRequests)
 
 		wg.Add(concurrentRequests)
@@ -280,13 +287,13 @@ func TestActorResumer_ResumeActor(t *testing.T) {
 			if !slices.Equal(results[i].GetStatus().GetWorkerAssignment().GetWorkerPodIps(), []string{expectedIP}) {
 				t.Errorf("request %d expected IP %q, got %q", i, expectedIP, results[i].GetStatus().GetWorkerAssignment().GetWorkerPodIps())
 			}
-			switch outcomes[i] {
+			switch outcomes[i].Outcome {
 			case ResumeOutcomeTriggered:
 				triggeredCount++
 			case ResumeOutcomeJoined:
 				joinedCount++
 			default:
-				t.Errorf("unexpected outcome for request %d: %q", i, outcomes[i])
+				t.Errorf("unexpected outcome for request %d: %q", i, outcomes[i].Outcome)
 			}
 		}
 
@@ -795,8 +802,8 @@ func TestActorResumer_LotAdmission(t *testing.T) {
 			if !errors.As(err, &reqErr) || reqErr.StatusCode != int(envoy_type.StatusCode_ServiceUnavailable) {
 				t.Fatalf("expected a 503 router-at-capacity denial, got %v", err)
 			}
-			if outcome != ResumeOutcomeUnknown {
-				t.Errorf("shed caller outcome = %q, want %q", outcome, ResumeOutcomeUnknown)
+			if outcome.Outcome != ResumeOutcomeUnknown {
+				t.Errorf("shed caller outcome = %q, want %q", outcome.Outcome, ResumeOutcomeUnknown)
 			}
 			// The caller was turned away at the transition: exactly one attempt
 			// had run.
@@ -841,7 +848,7 @@ func TestActorResumer_LotAdmission(t *testing.T) {
 			// The leader parks and takes the lot's only slot.
 			type result struct {
 				actor   *ateapipb.Actor
-				outcome ResumeOutcome
+				outcome ResumeStatus
 				err     error
 			}
 			leaderCh := make(chan result, 1)
@@ -860,8 +867,8 @@ func TestActorResumer_LotAdmission(t *testing.T) {
 			if !errors.As(err, &reqErr) || reqErr.StatusCode != int(envoy_type.StatusCode_ServiceUnavailable) {
 				t.Fatalf("joiner: expected a 503 router-at-capacity denial, got %v", err)
 			}
-			if outcome != ResumeOutcomeUnknown {
-				t.Errorf("joiner outcome = %q, want %q", outcome, ResumeOutcomeUnknown)
+			if outcome.Outcome != ResumeOutcomeUnknown {
+				t.Errorf("joiner outcome = %q, want %q", outcome.Outcome, ResumeOutcomeUnknown)
 			}
 
 			close(proceed)
@@ -869,8 +876,8 @@ func TestActorResumer_LotAdmission(t *testing.T) {
 			if res.err != nil {
 				t.Fatalf("leader: unexpected error: %v", res.err)
 			}
-			if res.outcome != ResumeOutcomeTriggered {
-				t.Errorf("leader outcome = %q, want %q", res.outcome, ResumeOutcomeTriggered)
+			if res.outcome.Outcome != ResumeOutcomeTriggered {
+				t.Errorf("leader outcome = %q, want %q", res.outcome.Outcome, ResumeOutcomeTriggered)
 			}
 			if !slices.Equal(res.actor.GetStatus().GetWorkerAssignment().GetWorkerPodIps(), []string{expectedIP}) {
 				t.Errorf("leader IP = %q, want %q", res.actor.GetStatus().GetWorkerAssignment().GetWorkerPodIps(), expectedIP)
@@ -984,8 +991,8 @@ func TestActorResumer_LotAdmission(t *testing.T) {
 			if err != nil {
 				t.Fatalf("call %d: unexpected error: %v", i, err)
 			}
-			if outcome != ResumeOutcomeTriggered {
-				t.Errorf("call %d: outcome = %q, want %q (each sequential call starts a fresh flight)", i, outcome, ResumeOutcomeTriggered)
+			if outcome.Outcome != ResumeOutcomeTriggered {
+				t.Errorf("call %d: outcome = %q, want %q (each sequential call starts a fresh flight)", i, outcome.Outcome, ResumeOutcomeTriggered)
 			}
 		}
 		mu.Lock()

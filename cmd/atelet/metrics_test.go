@@ -168,6 +168,64 @@ func TestCheckpointDurationShape(t *testing.T) {
 	}
 }
 
+// TestEveryPhaseIsRecorded feeds each handler's full phase list through its
+// histogram, so a phase added to a handler but dropped by recordPhases, or one
+// whose name collides with another's, shows up here rather than on a dashboard.
+func TestEveryPhaseIsRecorded(t *testing.T) {
+	restorePhases := []string{
+		ateattr.SnapshotPhaseDirsReset,
+		ateattr.SnapshotPhaseVolumeMount,
+		ateattr.SnapshotPhaseManifestFetch,
+		ateattr.SnapshotPhaseSandboxAssets,
+		ateattr.SnapshotPhaseDownload,
+		ateattr.SnapshotPhaseSysinfoRegister,
+		ateattr.SnapshotPhaseOCIUnpack,
+		ateattr.SnapshotPhaseAteomDial,
+		ateattr.SnapshotPhaseAteomRestore,
+		ateattr.SnapshotPhaseSandboxRecord,
+		ateattr.SnapshotPhaseTotal,
+	}
+	checkpointPhases := []string{
+		ateattr.SnapshotPhaseSandboxAssets,
+		ateattr.SnapshotPhaseAteomDial,
+		ateattr.SnapshotPhaseAteomCheckpoint,
+		ateattr.SnapshotPhaseLocalPrune,
+		ateattr.SnapshotPhasePersist,
+		ateattr.SnapshotPhaseVolumeUnmount,
+		ateattr.SnapshotPhaseDirsReset,
+		ateattr.SnapshotPhaseTotal,
+	}
+	tests := []struct {
+		name   string
+		metric string
+		names  []string
+		record func(*Instruments, context.Context, snapshotOp, ...phase)
+	}{
+		{"restore", restoreDurationMetric, restorePhases, (*Instruments).recordRestore},
+		{"checkpoint", checkpointDurationMetric, checkpointPhases, (*Instruments).recordCheckpoint},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inst, reader := newTestInstruments(t)
+			phases := make([]phase, 0, len(tt.names))
+			for i, name := range tt.names {
+				phases = append(phases, phase{name, time.Duration(i+1) * time.Millisecond})
+			}
+			tt.record(inst, context.Background(), snapshotOp{scope: ateattr.SnapshotScopeFull}, phases...)
+
+			byPhase := phaseValues(t, collectHistogram(t, reader, tt.metric))
+			if len(byPhase) != len(tt.names) {
+				t.Errorf("recorded %d phases, want %d", len(byPhase), len(tt.names))
+			}
+			for _, name := range tt.names {
+				if _, ok := byPhase[name]; !ok {
+					t.Errorf("phase %q not recorded", name)
+				}
+			}
+		})
+	}
+}
+
 // TestRecordPhasesSkipsZeroPhases pins the absence rule: a phase that never
 // started stays absent instead of landing in the percentiles as instantaneous.
 func TestRecordPhasesSkipsZeroPhases(t *testing.T) {
@@ -242,38 +300,49 @@ func TestIsCollateral(t *testing.T) {
 	}
 }
 
-// TestAssetsAfterCollateral covers the other half of the collateral rule: a leg
-// cancelled during the unpack had already finished fetching its assets, and
-// since absence means "never ran", zeroing that reports a step that completed
-// as one that never started.
-func TestAssetsAfterCollateral(t *testing.T) {
-	const assets = 1200 * time.Millisecond
+// TestPrepAfterCollateral covers the other half of the collateral rule: a leg
+// cancelled during the unpack had already finished the asset fetch and the
+// system-info register, and since absence means "never ran", zeroing those
+// reports steps that completed as ones that never started.
+func TestPrepAfterCollateral(t *testing.T) {
+	const (
+		assets  = 1200 * time.Millisecond
+		sysinfo = 3 * time.Millisecond
+	)
 
 	tests := []struct {
 		name            string
 		prepFailedPhase string
-		want            time.Duration
+		wantAssets      time.Duration
+		wantSysinfo     time.Duration
 	}{
 		{
 			name:            "cancelled during the asset fetch truncates it",
 			prepFailedPhase: ateattr.SnapshotPhaseSandboxAssets,
-			want:            0,
 		},
 		{
-			name:            "cancelled during the unpack keeps the completed asset fetch",
+			name:            "cancelled during the register keeps the completed asset fetch",
+			prepFailedPhase: ateattr.SnapshotPhaseSysinfoRegister,
+			wantAssets:      assets,
+		},
+		{
+			name:            "cancelled during the unpack keeps both completed steps",
 			prepFailedPhase: ateattr.SnapshotPhaseOCIUnpack,
-			want:            assets,
+			wantAssets:      assets,
+			wantSysinfo:     sysinfo,
 		},
 		{
-			name:            "an unattributed prep failure keeps it rather than guessing",
+			name:            "an unattributed prep failure keeps both rather than guessing",
 			prepFailedPhase: "",
-			want:            assets,
+			wantAssets:      assets,
+			wantSysinfo:     sysinfo,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := assetsAfterCollateral(tt.prepFailedPhase, assets); got != tt.want {
-				t.Errorf("assetsAfterCollateral() = %v, want %v", got, tt.want)
+			gotAssets, gotSysinfo := prepAfterCollateral(tt.prepFailedPhase, assets, sysinfo)
+			if gotAssets != tt.wantAssets || gotSysinfo != tt.wantSysinfo {
+				t.Errorf("prepAfterCollateral() = (%v, %v), want (%v, %v)", gotAssets, gotSysinfo, tt.wantAssets, tt.wantSysinfo)
 			}
 		})
 	}

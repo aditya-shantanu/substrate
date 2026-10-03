@@ -31,6 +31,7 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
+	"github.com/agent-substrate/substrate/internal/ateomphaselog"
 	"github.com/agent-substrate/substrate/internal/ateomstats"
 	"github.com/agent-substrate/substrate/internal/imagecache"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
@@ -83,15 +84,15 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	attribution := ateomstats.ActorAttributionFromRequest(req)
 	scope := req.GetScope()
 	defer func() {
-		logSnapshotPhases(ctx, "Checkpoint timing breakdown", attribution, scope,
-			checkpointDurationKey, err, []phase{
-				{phasePrep, dPrep},
-				{phasePause, dPause},
-				{phaseSnapshot, dSnapshot},
-				{phaseDurableDir, dDurable},
-				{phaseRootfsUpper, dUpper},
-				{phaseTeardown, dTeardown},
-				{phaseTotal, time.Since(tStart)},
+		ateomphaselog.LogSnapshotPhases(ctx, "Checkpoint timing breakdown", attribution, scope,
+			ateomphaselog.CheckpointDurationKey, err, []ateomphaselog.Phase{
+				{Name: phasePrep, D: dPrep},
+				{Name: phasePause, D: dPause},
+				{Name: phaseSnapshot, D: dSnapshot},
+				{Name: phaseDurableDir, D: dDurable},
+				{Name: phaseRootfsUpper, D: dUpper},
+				{Name: phaseTeardown, D: dTeardown},
+				{Name: phaseTotal, D: time.Since(tStart)},
 			})
 	}()
 

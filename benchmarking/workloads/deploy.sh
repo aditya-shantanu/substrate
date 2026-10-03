@@ -53,6 +53,8 @@ ACTOR_MEMORY="256Mi"
 # and limit. Empty leaves the pod unsized. The limit is also the memory the
 # worker reports as its actor capacity.
 WORKER_MEMORY=""
+WORKER_NODE_SELECTOR=()
+WORKER_TOLERATIONS=()
 # The address to which an instrumented actor container sends its telemetry.
 # --otlp-endpoint sets it. Without the flag, resolve_otlp_endpoint reads the
 # address that the control plane uses.
@@ -74,6 +76,9 @@ usage() {
   echo "                              the smallest size microvm admits)"
   echo "  --worker-memory SIZE        Memory request and limit for each WorkerPool pod"
   echo "                              (default: unset, the pod is unsized)"
+  echo "  --worker-node-selector K=V  Node label the worker pods require; repeatable"
+  echo "  --worker-toleration K=V:E   Taint the worker pods tolerate, as key=value:Effect"
+  echo "                              (Effect NoSchedule|NoExecute|PreferNoSchedule); repeatable"
   echo "  --otlp-endpoint URL         The address to which an instrumented actor container"
   echo "                              sends telemetry (default: the endpoint in the"
   echo "                              ate-otel-config ConfigMap)"
@@ -132,9 +137,32 @@ substitute() {
     gvisor)  sandbox_config_name="gvisor-default" sandbox_class_enum="SANDBOX_CLASS_GVISOR" ;;
     microvm) sandbox_config_name="microvm"        sandbox_class_enum="SANDBOX_CLASS_MICROVM" ;;
   esac
-  # One flow-style line, so an unset WORKER_MEMORY leaves only a blank line.
+  # One flow-style line, so an empty template leaves only a blank line.
+  local -a fields=()
   if [[ -n "${WORKER_MEMORY}" ]]; then
-    worker_template="template: {resources: {requests: {memory: \"${WORKER_MEMORY}\"}, limits: {memory: \"${WORKER_MEMORY}\"}}}"
+    fields+=("resources: {requests: {memory: \"${WORKER_MEMORY}\"}, limits: {memory: \"${WORKER_MEMORY}\"}}")
+  fi
+  if ((${#WORKER_NODE_SELECTOR[@]} > 0)); then
+    local kv sel=""
+    for kv in "${WORKER_NODE_SELECTOR[@]}"; do
+      sel+="${sel:+, }\"${kv%%=*}\": \"${kv#*=}\""
+    done
+    fields+=("nodeSelector: {${sel}}")
+  fi
+  if ((${#WORKER_TOLERATIONS[@]} > 0)); then
+    local spec rest tol=""
+    for spec in "${WORKER_TOLERATIONS[@]}"; do
+      rest="${spec#*=}"
+      tol+="${tol:+, }{key: \"${spec%%=*}\", operator: Equal, value: \"${rest%:*}\", effect: \"${rest##*:}\"}"
+    done
+    fields+=("tolerations: [${tol}]")
+  fi
+  if ((${#fields[@]} > 0)); then
+    local f joined=""
+    for f in "${fields[@]}"; do
+      joined+="${joined:+, }${f}"
+    done
+    worker_template="template: {${joined}}"
   fi
   sed -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
       -e "s|\${WORKER_COUNT}|${WORKER_COUNT}|g" \
@@ -288,6 +316,20 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --worker-memory=*)
       WORKER_MEMORY="${1#*=}"
+      ;;
+    --worker-node-selector)
+      shift
+      WORKER_NODE_SELECTOR+=("$1")
+      ;;
+    --worker-node-selector=*)
+      WORKER_NODE_SELECTOR+=("${1#*=}")
+      ;;
+    --worker-toleration)
+      shift
+      WORKER_TOLERATIONS+=("$1")
+      ;;
+    --worker-toleration=*)
+      WORKER_TOLERATIONS+=("${1#*=}")
       ;;
     --wait-timeout)
       shift

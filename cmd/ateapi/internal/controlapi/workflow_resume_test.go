@@ -141,7 +141,7 @@ func TestAssignWorkerAttempt_MissingSelectedWorkerIsRetried(t *testing.T) {
 	w := &ActorWorkflow{store: st, workerCache: wc, scheduler: scheduling.New(wc)}
 	tmpl := &ateapipb.ActorTemplate{SandboxConfig: &ateapipb.SandboxConfig{SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR}}
 
-	_, _, err := w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, tmpl)
+	_, _, err := w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, tmpl, &resumeTiming{})
 	if !errors.Is(err, store.ErrVersionConflict) {
 		t.Fatalf("assignWorkerAttempt error = %v, want ErrVersionConflict", err)
 	}
@@ -162,7 +162,7 @@ func TestEnsureWorkerAssigned_ConflictExhaustionIsRetryable(t *testing.T) {
 	w := &ActorWorkflow{store: st, workerCache: wc, scheduler: scheduling.New(wc)}
 	tmpl := &ateapipb.ActorTemplate{SandboxConfig: &ateapipb.SandboxConfig{SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR}}
 
-	_, _, err := w.ensureWorkerAssigned(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, tmpl)
+	_, _, err := w.ensureWorkerAssigned(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, tmpl, &resumeTiming{})
 	if !errors.Is(err, store.ErrVersionConflict) {
 		t.Fatalf("ensureWorkerAssigned error = %v, want ErrVersionConflict", err)
 	}
@@ -206,7 +206,7 @@ func TestAssignWorkerAttempt_StampsSubstrateTemplateRef(t *testing.T) {
 		Metadata:      &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "sub-tmpl"},
 		SandboxConfig: &ateapipb.SandboxConfig{SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR},
 	}
-	_, assigned, err := w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, tmpl)
+	_, assigned, err := w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, tmpl, &resumeTiming{})
 	if err != nil {
 		t.Fatalf("assignWorkerAttempt: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestAssignWorkerAttempt_SkipsWorkerAssignedInOtherAtespace(t *testing.T) {
 	tmpl := &ateapipb.ActorTemplate{
 		SandboxConfig: &ateapipb.SandboxConfig{SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR},
 	}
-	_, _, err := w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "shared"}, actor, tmpl)
+	_, _, err := w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "shared"}, actor, tmpl, &resumeTiming{})
 	if status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("assignWorkerAttempt() error = %v, want ResourceExhausted (no free workers)", err)
 	}
@@ -325,7 +325,7 @@ func TestAssignWorkerAttempt_ReleasesIneligibleStaleWorker(t *testing.T) {
 	tmpl := &ateapipb.ActorTemplate{
 		SandboxConfig: &ateapipb.SandboxConfig{SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR},
 	}
-	_, worker, err := w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, tmpl)
+	_, worker, err := w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, tmpl, &resumeTiming{})
 	if err != nil {
 		t.Fatalf("assignWorkerAttempt() error = %v, want nil (release must not fail the resume)", err)
 	}
@@ -397,7 +397,7 @@ func TestAssignWorkerAttempt_RetryAfterConflictPicksFreshWorker(t *testing.T) {
 	tmpl := &ateapipb.ActorTemplate{
 		SandboxConfig: &ateapipb.SandboxConfig{SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR},
 	}
-	_, worker, err := w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, tmpl)
+	_, worker, err := w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, tmpl, &resumeTiming{})
 	if err != nil {
 		t.Fatalf("assignWorkerAttempt() on retry = %v, want nil (must re-pick a free worker)", err)
 	}
@@ -535,7 +535,7 @@ func TestAssignWorkerAttempt_ConflictRefreshesActor(t *testing.T) {
 			tmpl := &ateapipb.ActorTemplate{
 				SandboxConfig: &ateapipb.SandboxConfig{SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR},
 			}
-			refreshed, _, err := w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, tmpl)
+			refreshed, _, err := w.assignWorkerAttempt(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, actor, tmpl, &resumeTiming{})
 
 			if tc.wantRetry {
 				if !errors.Is(err, store.ErrVersionConflict) {
@@ -660,7 +660,7 @@ func TestEnsureWorkerAssigned_RejectsNonResumableStates(t *testing.T) {
 			continue
 		}
 		actor := &ateapipb.Actor{Status: &ateapipb.ActorStatus{State: st}, Metadata: &ateapipb.ResourceMetadata{Name: "id1", Uid: "actor-uid-1"}}
-		_, _, err := w.ensureWorkerAssigned(ctx, resources.ActorRef{Name: "id1"}, actor, &ateapipb.ActorTemplate{})
+		_, _, err := w.ensureWorkerAssigned(ctx, resources.ActorRef{Name: "id1"}, actor, &ateapipb.ActorTemplate{}, &resumeTiming{})
 		assertPrerequisiteResult(t, st, err, false)
 	}
 }
@@ -710,6 +710,137 @@ func TestResumeActor_MetricSkipsAlreadyRunningNoop(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResumeActor_TimingBreakdown pins the "Resume timing breakdown" record:
+// a cold resume that runs every step logs one record carrying every phase
+// under ate.actor.resume.duration.* plus the attempt count, a failed resume
+// carries the gRPC code, and an already-running no-op logs nothing, as with
+// the lifecycle metric.
+func TestResumeActor_TimingBreakdown(t *testing.T) {
+	const msg = "Resume timing breakdown"
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
+
+	t.Run("cold resume logs every phase", func(t *testing.T) {
+		ctx := context.Background()
+		persistence := newTestPersistence(t)
+		w, _ := newWireCaptureWorkflow(t, persistence)
+		records := logRecords(t, msg)
+
+		storetest.MustCreateAtespace(t, ctx, persistence, "ns")
+		if _, err := persistence.CreateActorTemplate(ctx, &ateapipb.ActorTemplate{
+			Metadata:       &ateapipb.ResourceMetadata{Atespace: "ns", Name: "tmpl1"},
+			SnapshotConfig: &ateapipb.SnapshotConfig{StorageLocation: testStorageLocation},
+			SandboxConfig: &ateapipb.SandboxConfig{
+				SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR,
+				ConfigName:   "gvisor",
+			},
+		}); err != nil {
+			t.Fatalf("create template: %v", err)
+		}
+		// The worker sits on the node the fake atelet serves.
+		if _, err := persistence.CreateWorker(ctx, &ateapipb.Worker{
+			Metadata:        &ateapipb.ResourceMetadata{Name: testWorkerUID("pod-1")},
+			WorkerNamespace: "worker-ns",
+			WorkerPool:      "pool",
+			WorkerPod:       "pod-1",
+			WorkerPodUid:    testWorkerUID("pod-1"),
+			NodeName:        "node-1",
+			Ips:             []string{"10.0.0.2"},
+			SandboxClass:    "gvisor",
+			Status:          &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_ACTIVE, Capacity: &ateapipb.WorkerResources{Actors: 1}},
+		}); err != nil {
+			t.Fatalf("CreateWorker: %v", err)
+		}
+		seedWorkflowActor(t, ctx, persistence, actorRef, "ns", "tmpl1", ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+
+		cacheCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		wc := workercache.New(persistence, time.Minute)
+		if err := wc.Start(cacheCtx); err != nil {
+			t.Fatalf("workercache.Start: %v", err)
+		}
+		w.workerCache, w.scheduler = wc, scheduling.New(wc)
+
+		_, resumed, err := w.ResumeActor(ctx, actorRef)
+		if err != nil {
+			t.Fatalf("ResumeActor: %v", err)
+		}
+		if !resumed {
+			t.Fatal("ResumeActor resumed = false, want a cold activation")
+		}
+
+		if len(*records) != 1 {
+			t.Fatalf("got %d %q records, want 1", len(*records), msg)
+		}
+		got := (*records)[0].attrs
+		want := []string{
+			"ate.atespace", "ate.actor.name", "ate.actor.uid",
+			"ate.actor.resume.assign_attempts",
+		}
+		for _, phase := range []string{
+			"get_actor", "lease_acquire", "load", "volumes_create", "assign", "schedule", "bind",
+			"assign_update", "volumes_attach", "atelet_dial", "atelet_restore", "finalize",
+			"lease_release", "total",
+		} {
+			want = append(want, "ate.actor.resume.duration."+phase)
+		}
+		for _, key := range want {
+			if _, ok := got[key]; !ok {
+				t.Errorf("record lacks %q; attrs: %v", key, got)
+			}
+		}
+		if got["ate.actor.resume.assign_attempts"] != "1" {
+			t.Errorf("assign_attempts = %q, want 1", got["ate.actor.resume.assign_attempts"])
+		}
+		if _, ok := got["error.type"]; ok {
+			t.Errorf("successful resume carries error.type: %v", got)
+		}
+	})
+
+	t.Run("failed resume carries the gRPC code", func(t *testing.T) {
+		ctx := context.Background()
+		st, cleanup := storetest.SetupTestStore(t)
+		defer cleanup()
+		w := newTestActorWorkflow(t, st, "ns", "tmpl1")
+		records := logRecords(t, msg)
+		seedWorkflowActor(t, ctx, st, actorRef, "ns", "tmpl1", ateapipb.ActorState_ACTOR_STATE_CRASHED)
+
+		if _, _, err := w.ResumeActor(ctx, actorRef); status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("ResumeActor error = %v, want FailedPrecondition", err)
+		}
+		if len(*records) != 1 {
+			t.Fatalf("got %d %q records, want 1", len(*records), msg)
+		}
+		got := (*records)[0].attrs
+		if got["error.type"] != codes.FailedPrecondition.String() {
+			t.Errorf("error.type = %q, want %q", got["error.type"], codes.FailedPrecondition)
+		}
+		for _, key := range []string{"ate.actor.resume.duration.assign", "ate.actor.resume.duration.total"} {
+			if _, ok := got[key]; !ok {
+				t.Errorf("record lacks %q; attrs: %v", key, got)
+			}
+		}
+		if _, ok := got["ate.actor.resume.duration.finalize"]; ok {
+			t.Errorf("record carries a phase that never ran: %v", got)
+		}
+	})
+
+	t.Run("already running no-op logs nothing", func(t *testing.T) {
+		ctx := context.Background()
+		st, cleanup := storetest.SetupTestStore(t)
+		defer cleanup()
+		w := newTestActorWorkflow(t, st, "ns", "tmpl1")
+		records := logRecords(t, msg)
+		seedWorkflowActor(t, ctx, st, actorRef, "ns", "tmpl1", ateapipb.ActorState_ACTOR_STATE_RUNNING)
+
+		if _, _, err := w.ResumeActor(ctx, actorRef); err != nil {
+			t.Fatalf("ResumeActor: %v", err)
+		}
+		if len(*records) != 0 {
+			t.Errorf("got %d %q records for a no-op, want 0", len(*records), msg)
+		}
+	})
 }
 
 // TestResumeActor_CrashesOnMissingWorkerAssignment verifies that a RESUMING
@@ -1511,7 +1642,7 @@ func TestResumeActor_AteletWireRequest(t *testing.T) {
 
 			actor, loadedTmpl, src, err := w.loadActorForResume(ctx, actorRef)
 			if err == nil {
-				_, err = w.ensureAteletRestored(ctx, actorRef, actor, loadedTmpl, src)
+				_, err = w.ensureAteletRestored(ctx, actorRef, actor, loadedTmpl, src, &resumeTiming{})
 			}
 			if got := status.Code(err); got != tt.want.code {
 				t.Fatalf("status.Code(err) = %v, want %v (err: %v)", got, tt.want.code, err)

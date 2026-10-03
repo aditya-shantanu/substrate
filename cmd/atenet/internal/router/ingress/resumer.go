@@ -76,6 +76,18 @@ const (
 	ResumeOutcomeUnknown   ResumeOutcome = ateattr.RouterResumeUnknown
 )
 
+// ResumeStatus is what one caller learns about its resume beyond the actor:
+// the singleflight outcome and the shared flight's RPC history, which the
+// ingress result log reports.
+type ResumeStatus struct {
+	Outcome ResumeOutcome
+	// Attempts is how many ResumeActor RPCs the flight had started when the
+	// caller got its answer.
+	Attempts int
+	// FirstAttemptAt is when the flight's first RPC started; zero if none had.
+	FirstAttemptAt time.Time
+}
+
 type resumeCallResult struct {
 	actor *ateapipb.Actor
 	// resumed is true if ResumeActor call executed a cold activation
@@ -181,7 +193,7 @@ func (r *ActorResumer) retryable(err error) bool {
 
 // ResumeActor ensures the actor is running.
 // This method will block until the actor is resumed or error.
-func (r *ActorResumer) ResumeActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, ResumeOutcome, error) {
+func (r *ActorResumer) ResumeActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, ResumeStatus, error) {
 	ctx, span := otel.Tracer(extproc.ServiceName).Start(ctx, "ResumeActor",
 		trace.WithAttributes(ateattr.ActorRefAttributes(actorRef)...))
 	defer span.End()
@@ -226,6 +238,7 @@ func (r *ActorResumer) runFlight(f *resumeActorFlight, key string, actorRef reso
 
 	err := wait.ExponentialBackoffWithContext(bgCtx, backoff, func(context.Context) (bool, error) {
 		var err error
+		f.noteAttempt()
 		resumeResp, err = r.apiClient.ResumeActor(attemptCtx, &ateapipb.ResumeActorRequest{
 			Actor: actorRef.ToObjectRef(),
 		})
@@ -268,13 +281,13 @@ func flightResult(bgCtx context.Context, resumeResp *ateapipb.ResumeActorRespons
 // two-phase: while the flight is resolving the caller holds nothing; once the
 // flight is retrying (or already was), the caller must hold a parking-lot slot
 // to keep waiting and is shed with a 503 when the lot is full.
-func (r *ActorResumer) awaitFlight(ctx context.Context, f *resumeActorFlight, actorRef resources.ActorRef, reqID uint64) (*ateapipb.Actor, ResumeOutcome, error) {
+func (r *ActorResumer) awaitFlight(ctx context.Context, f *resumeActorFlight, actorRef resources.ActorRef, reqID uint64) (*ateapipb.Actor, ResumeStatus, error) {
 	select {
 	case <-ctx.Done():
 		// The caller's request context was canceled before the shared resume
 		// completed. The flight continues and may still activate the actor, so
 		// the outcome is "unknown", not "none".
-		return nil, ResumeOutcomeUnknown, ctx.Err()
+		return nil, f.status(ResumeOutcomeUnknown), ctx.Err()
 	case <-f.done:
 		// Fast path: the flight finished without ever retrying, or before this
 		// caller saw retrying. The lot is never touched.
@@ -294,7 +307,7 @@ func (r *ActorResumer) awaitFlight(ctx context.Context, f *resumeActorFlight, ac
 
 	release, ok := r.enterLot(ctx)
 	if !ok {
-		return nil, ResumeOutcomeUnknown, parkingFullErr(actorRef.String())
+		return nil, f.status(ResumeOutcomeUnknown), parkingFullErr(actorRef.String())
 	}
 	var finalErr error
 	defer func() { release(parkOutcomeFor(finalErr)) }()
@@ -302,11 +315,11 @@ func (r *ActorResumer) awaitFlight(ctx context.Context, f *resumeActorFlight, ac
 	select {
 	case <-ctx.Done():
 		finalErr = ctx.Err()
-		return nil, ResumeOutcomeUnknown, finalErr
+		return nil, f.status(ResumeOutcomeUnknown), finalErr
 	case <-f.done:
-		actor, outcome, err := f.callerResult(reqID)
+		actor, st, err := f.callerResult(reqID)
 		finalErr = err
-		return actor, outcome, err
+		return actor, st, err
 	}
 }
 

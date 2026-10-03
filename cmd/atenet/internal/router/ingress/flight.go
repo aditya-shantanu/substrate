@@ -15,6 +15,9 @@
 package ingress
 
 import (
+	"sync/atomic"
+	"time"
+
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -36,6 +39,12 @@ type resumeActorFlight struct {
 	retryingSignaled bool
 	done             chan struct{}
 	result           *resumeCallResult
+
+	// attempts and firstAttemptUnixNano are the flight's RPC history, read by
+	// callers while the flight is still running (a canceled caller reports what
+	// it waited through), hence atomic.
+	attempts             atomic.Int32
+	firstAttemptUnixNano atomic.Int64
 }
 
 func newResumeActorFlight() *resumeActorFlight {
@@ -51,6 +60,23 @@ func (f *resumeActorFlight) signalRetrying() {
 	close(f.retrying)
 }
 
+// noteAttempt records that the flight is starting another ResumeActor RPC.
+func (f *resumeActorFlight) noteAttempt() {
+	if f.attempts.Add(1) == 1 {
+		f.firstAttemptUnixNano.Store(time.Now().UnixNano())
+	}
+}
+
+// status is one caller's view of f: outcome plus the RPC history so far. Safe
+// to call before f.done closes.
+func (f *resumeActorFlight) status(outcome ResumeOutcome) ResumeStatus {
+	st := ResumeStatus{Outcome: outcome, Attempts: int(f.attempts.Load())}
+	if ns := f.firstAttemptUnixNano.Load(); ns != 0 {
+		st.FirstAttemptAt = time.Unix(0, ns)
+	}
+	return st
+}
+
 // callerResult classifies f's completed outcome for one caller. It must only
 // be called after f.done is closed.
 //
@@ -59,14 +85,14 @@ func (f *resumeActorFlight) signalRetrying() {
 // resume reports "unknown": the gRPC code alone does not carry the fact. A
 // canceled leader's flight outlives its request and keeps restoring the actor,
 // and a DeadlineExceeded can land in the middle of a restore.
-func (f *resumeActorFlight) callerResult(reqID uint64) (*ateapipb.Actor, ResumeOutcome, error) {
+func (f *resumeActorFlight) callerResult(reqID uint64) (*ateapipb.Actor, ResumeStatus, error) {
 	res := f.result
 	if res == nil {
-		return nil, ResumeOutcomeUnknown, status.Error(codes.Internal, "resume call returned nil result")
+		return nil, f.status(ResumeOutcomeUnknown), status.Error(codes.Internal, "resume call returned nil result")
 	}
 
 	if res.err != nil {
-		return nil, ResumeOutcomeUnknown, res.err
+		return nil, f.status(ResumeOutcomeUnknown), res.err
 	}
 
 	// Disambiguate the shared-flight resume outcome:
@@ -82,7 +108,7 @@ func (f *resumeActorFlight) callerResult(reqID uint64) (*ateapipb.Actor, ResumeO
 		}
 	}
 
-	return res.actor, outcome, nil
+	return res.actor, f.status(outcome), nil
 }
 
 // publish completes f. The order matters: result is written before done closes

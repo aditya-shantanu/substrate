@@ -348,17 +348,26 @@ func SnapshotScopeValue(scope ateletpb.SnapshotScope) string {
 // with the asset fetch and OCI unpack), so they are independent observations,
 // not a partition of Total: summing across them is meaningless.
 const (
+	// DirsReset empties the actor's on-node directories: before the mount on a
+	// restore, after the persist on a checkpoint.
+	SnapshotPhaseDirsReset       = "dirs_reset"
 	SnapshotPhaseVolumeMount     = "volume_mount"
 	SnapshotPhaseManifestFetch   = "manifest_fetch"
 	SnapshotPhaseSandboxAssets   = "sandbox_assets"
 	SnapshotPhaseDownload        = "download"
+	SnapshotPhaseSysinfoRegister = "sysinfo_register"
 	SnapshotPhaseOCIUnpack       = "oci_unpack"
+	// AteomDial opens or reuses the gRPC connection to the target ateom.
+	SnapshotPhaseAteomDial       = "ateom_dial"
 	SnapshotPhaseAteomRestore    = "ateom_restore"
+	SnapshotPhaseSandboxRecord   = "sandbox_record"
 	SnapshotPhaseAteomCheckpoint = "ateom_checkpoint"
+	SnapshotPhaseLocalPrune      = "local_prune"
 	// Persist is one step with two destinations (upload for external, rename
 	// for local); SnapshotKindKey already says which.
-	SnapshotPhasePersist = "persist"
-	SnapshotPhaseTotal   = "total"
+	SnapshotPhasePersist       = "persist"
+	SnapshotPhaseVolumeUnmount = "volume_unmount"
+	SnapshotPhaseTotal         = "total"
 )
 
 // SandboxClassUnknown is the NormalizeSandboxClass fallback.

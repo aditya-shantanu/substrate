@@ -142,12 +142,16 @@ func TestSnapshotLogAttrs(t *testing.T) {
 			name: "a successful restore carries identity, the metric dimensions and every phase that ran",
 			op:   fullOp,
 			phases: []phase{
+				{ateattr.SnapshotPhaseDirsReset, 2 * time.Millisecond},
 				{ateattr.SnapshotPhaseVolumeMount, 4 * time.Millisecond},
 				{ateattr.SnapshotPhaseManifestFetch, 21 * time.Millisecond},
 				{ateattr.SnapshotPhaseSandboxAssets, 10 * time.Millisecond},
 				{ateattr.SnapshotPhaseDownload, 310 * time.Millisecond},
+				{ateattr.SnapshotPhaseSysinfoRegister, 1 * time.Millisecond},
 				{ateattr.SnapshotPhaseOCIUnpack, 50 * time.Millisecond},
+				{ateattr.SnapshotPhaseAteomDial, 3 * time.Millisecond},
 				{ateattr.SnapshotPhaseAteomRestore, 60 * time.Millisecond},
+				{ateattr.SnapshotPhaseSandboxRecord, 1 * time.Millisecond},
 				{ateattr.SnapshotPhaseTotal, 420 * time.Millisecond},
 			},
 			wantStrings: map[string]string{
@@ -161,10 +165,14 @@ func TestSnapshotLogAttrs(t *testing.T) {
 				"ate.sandbox.class":     "gvisor",
 			},
 			wantNumbers: map[string]float64{
-				"ate.actor.restore.duration.volume_mount":   0.004,
-				"ate.actor.restore.duration.manifest_fetch": 0.021,
-				"ate.actor.restore.duration.download":       0.310,
-				"ate.actor.restore.duration.total":          0.420,
+				"ate.actor.restore.duration.dirs_reset":       0.002,
+				"ate.actor.restore.duration.volume_mount":     0.004,
+				"ate.actor.restore.duration.manifest_fetch":   0.021,
+				"ate.actor.restore.duration.download":         0.310,
+				"ate.actor.restore.duration.sysinfo_register": 0.001,
+				"ate.actor.restore.duration.ateom_dial":       0.003,
+				"ate.actor.restore.duration.sandbox_record":   0.001,
+				"ate.actor.restore.duration.total":            0.420,
 			},
 			// The phase key names the one step a datapoint timed; this record has
 			// them all, so borrowing it here would give one key two meanings.
