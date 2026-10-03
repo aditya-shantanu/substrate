@@ -315,6 +315,24 @@ percentile because three nodes share the checkpoint and upload load. The
 suspend/resume wake on three nodes is now indistinguishable from the pause
 wake on one.
 
+
+### B7b. Three worker nodes, pause lifecycle, C1 to C4 (06:06-06:15 UTC)
+
+| series | n | p50 | p90 | p95 | p99 | max | fail |
+|---|---|---|---|---|---|---|---|
+| WakeFirstTouch (ms) | 1038 | 180 | 200 | 210 | 240 | 350 | 0 |
+| PauseActor (ms) | 1136 | 210 | 290 | 370 | 1200 | 2700 | 0 |
+
+ateapi resume total p50 0.179 s, p99 0.267 s. Pause p99 drops from 2.5 s
+(one node, B2) to 1.2 s with the checkpoint writes spread over three disks,
+which is the disk ceiling from B1 again, not Substrate.
+
+gVisor summary after C1 to C4, 100 actors, think-scale 15, wake p50 / p99
+in ms: pause 1 node 190 / 290 (B2) to 190 / 310 (B4a); suspend 1 node
+1200 / 3400 (B3) to 190 / 340 (B4b); suspend 3 nodes 730 / 2100 (B6a) to
+180 / 240 (B7a); pause 3 nodes 180 / 240 (B7b). What is left in a wake is
+about 165 ms of runsc create+restore and about 25 ms of Substrate.
+
 ## Changes
 
 Each change: what, why, measured effect, verdict (keep / drop), submit?
