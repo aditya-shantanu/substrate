@@ -333,6 +333,80 @@ in ms: pause 1 node 190 / 290 (B2) to 190 / 310 (B4a); suspend 1 node
 180 / 240 (B7a); pause 3 nodes 180 / 240 (B7b). What is left in a wake is
 about 165 ms of runsc create+restore and about 25 ms of Substrate.
 
+
+## Micro-VM phase (bare metal)
+
+Worker pool `uvm-metal`: 1x c3-highmem-192-metal (192 vCPU, 1.5 TiB),
+UBUNTU_CONTAINERD, hyperdisk-balanced 500 GB (890 MiB/s), tainted
+`ate.dev/sandboxClass=microvm`. Same build (2f4d9d46: C1 to C4), same
+glutton template at 1Gi, class microvm. The gVisor pool stays up but idle.
+
+### B8a. Micro-VM, one metal node, pause lifecycle, think-scale 15 (06:20-06:30 UTC)
+
+| series | n | p50 | p90 | p95 | p99 | max | fail |
+|---|---|---|---|---|---|---|---|
+| WakeFirstTouch (ms) | 917 | 460 | 2400 | 2900 | 4500 | 7200 | 0 |
+| PauseActor (ms) | 1005 | 560 | 9000 | 11000 | 15000 | 18000 | 0 |
+
+First 90 s, before the disk filled up: WakeFirstTouch p50 220, p95 320,
+p99 490; PauseActor p50 240, p95 470.
+
+Server side p50 / p90 / p99 (s):
+
+| layer | total | phases |
+|---|---|---|
+| ateapi resume | 0.610 / 2.282 / 4.946 | atelet_restore 0.600 |
+| atelet restore (local) | 0.450 / 2.390 / 4.411 | ateom_restore 0.426 / 1.784 / 3.495; sandbox_record 0.006 / 0.398 / 1.547; dirs_reset 0.001 / 0.163 / 0.413 |
+| ateom-microvm restore | 0.619 / 1.105 / 1.478 | vm_restore (CH) 0.287; upper_join (wait for rootfs upper untar) 0.083; lowers (virtiofsd) 0.038; wakeup_probe 0.032; prep 0.021; vmm_launch 0.013 |
+| atelet checkpoint | 0.562 / 8.935 / 14.615 | ateom_checkpoint 0.509 / 8.333 / 13.766; local_prune 0.038 / 0.342 / 1.780 |
+| ateom-microvm checkpoint | 1.251 / 3.669 / 4.985 | rootfs_upper (tar) 0.825 / 2.988 / 3.889; snapshot (CH) 0.549; teardown 0.312; pause 0.005 |
+
+Findings:
+
+1. The same disk ceiling, hit harder. A micro-VM pause writes
+   `memory-ranges` (896 MiB apparent, 428 MB allocated) plus a 46 MB
+   `rootfs-upper.tar`, about 2.7x the gVisor checkpoint, so 1.9 pauses/s
+   saturates the 890 MiB/s boot disk at the intended duty cycle; I/O
+   pressure `full` sat at 35 to 70% through the run and every tail above
+   (atelet `sandbox_record` p90 0.4 s is a single small file write) is that
+   queue. Uncontended, micro-VM pause/resume is close to gVisor: 220 ms wake
+   p50 in the first 90 s.
+2. Substrate work on the micro-VM restore path is about 0.3 s of the 0.62 s
+   p50 (prep, bundles, upper_join, lowers, vmm_launch, tap) against 0.29 s
+   in cloud-hypervisor; on the checkpoint path the rootfs upper tar (0.83 s
+   p50) is the critical path, longer than the CH snapshot (0.55 s) it runs
+   concurrently with, and teardown adds 0.31 s before the pause returns.
+   Under gVisor the equivalent Substrate share was 25 ms. This is where the
+   micro-VM path differs and where Substrate-side work would pay.
+3. The 46 MB rootfs upper for a glutton actor is worth a look on its own:
+   it is tarred on every pause and untarred on every resume.
+
+
+### B8b. Micro-VM, one metal node, suspend lifecycle, C1 to C4 (06:33-06:42 UTC)
+
+| series | n | p50 | p90 | p95 | p99 | max | fail |
+|---|---|---|---|---|---|---|---|
+| WakeFirstTouch (ms) | 800 | 470 | 3000 | 3700 | 5500 | 7600 | 0 |
+| SuspendActor (ms) | 897 | 2400 | 11000 | 13000 | 16000 | 20000 | 0 |
+
+`ate.actor.restore.source`: 752 retained, 0 download. atelet restore p50
+0.468 s (ateom_restore 0.450); checkpoint p50 2.486 s = ateom_checkpoint
+0.659 + persist (zstd + PUT of about 470 MB) 1.548.
+
+The retained copy and the node preference carry over to micro-VM unchanged:
+the suspend/resume wake equals the pause/resume wake (B8a: 460 ms p50) and
+no restore touched GCS. Both are held at 0.46 s p50 and 3 s p90 by the
+same saturated boot disk rather than by anything in the resume path.
+
+The rootfs upper tar is the glutton script's own files: `/tmp/glutton/`
+holds deps_cache 32 MB, build_artifacts 8 MB, repo_tarball 4 MB, patch.
+Under gVisor those live in the sandbox's memory and ride in pages.img;
+under micro-VM the rootfs upper is host-backed, so every pause tars them
+and every resume untars them. For a pause (node-local by definition) the
+tar and untar are avoidable: the upper dir could stay in place. That needs
+ateom-microvm to know a checkpoint is local and to defer the tar to the
+later upload if the actor is suspended from PAUSED; not done here.
+
 ## Changes
 
 Each change: what, why, measured effect, verdict (keep / drop), submit?
@@ -449,4 +523,75 @@ the preference itself. Kept.
 
 ## Candidates to submit
 
-(Filled in as changes prove out.)
+In order of value. None has been opened as a PR; each is a self-contained
+commit on `perf/resume-latency`.
+
+1. **C3 + C4 together: node-local retained snapshot and same-node
+   preference** (0ccab235, 2f4d9d46). Turns a suspend/resume wake into a
+   pause/resume wake on the same node (6x p50, 10x p99 on gVisor; same on
+   micro-VM) and removes the GCS GET from the common path. Before
+   upstreaming: a size or age budget for retained copies (today one per
+   suspended actor on its last node, freed only on terminate), a decision on
+   the default (on in this branch), and alignment with #1551's cache
+   directory and `SnapshotSharing` field so PRIVATE snapshots are explicitly
+   this mechanism's job. C4 is the smallest honest answer to #1761/#589 and
+   should be filed against them; it changes `ExternalSnapshot` (new optional
+   field), so it needs the API owners' eyes.
+2. **C0 instrumentation** (20d10da3): ateom-gvisor restore/checkpoint phase
+   records, the atelet phases that close the #1646 gap (`sandbox_record`
+   name shared with #1975), the ateapi `Resume timing breakdown`, and the
+   router flight statistics. Independent of everything else; splits
+   naturally into four PRs. The registry gained six phase values and one
+   log attribute; weaver passes.
+3. **C2 egress mint overlap** (590efbb5, ateom-gvisor part): small, pure
+   overlap, no cost. Could ride with C0's gVisor instrumentation.
+4. **C1 manifest/dial reordering** (590efbb5, atelet part): correct and
+   harmless but not a measured win on these runs; submit only if the cold
+   asset/OCI case is shown to benefit, or fold into #1551's restructuring.
+5. **Benchmark tooling**: `--worker-node-selector` / `--worker-toleration`
+   on `benchmarking/workloads/deploy.sh`; a `boomer:stop` hook so an
+   interactive stop runs the agent-session shutdown fan-out.
+
+Not changed, reported for the backlog:
+
+- Pause and suspend throughput per node are bound by the worker boot disk's
+  write bandwidth (175 MB per gVisor checkpoint, about 470 MB per micro-VM
+  checkpoint). At the intended duty cycle 100 actors on one node already
+  saturate a hyperdisk at 890 MiB/s. Options: memory-backed per-actor state
+  (E1, needs your call), provisioned throughput, local SSD shapes. This is
+  the first thing that will cap oversubscription per node.
+- A suspend canceled by its caller's deadline leaves the actor CRASHED
+  (seen under a GCS stall; #1665 family).
+- A PAUSED actor cannot be deleted; the harness's shutdown has to suspend
+  first.
+- Micro-VM: the rootfs upper tar on the pause path and the 0.3 s teardown
+  before the pause RPC returns are Substrate-side costs worth a design
+  pass (keep the upper in place for local checkpoints; tear down after
+  responding).
+- ateapi's store work per resume is 12 ms in 13 statements; collapsing
+  `finalizeRunning`'s read and merging bind + update would save a few
+  milliseconds. Not worth it for latency; relevant for ateapi throughput.
+- runsc offers `-direct` for checkpoint/restore and `-background` restore;
+  Substrate passes neither. Out of scope by your rule, noted for later.
+
+## Summary
+
+Wake latency (client first byte after an idle gap), 100 agent-session
+actors, think-scale 15, p50 / p99 in ms:
+
+| path | before | after | change |
+|---|---|---|---|
+| gVisor pause, 1 node | 190 / 290 | 190 / 310 | none (runsc-bound) |
+| gVisor suspend, 1 node | 1200 / 3400 | 190 / 340 | C3 |
+| gVisor suspend, 3 nodes | 730 / 2100 | 180 / 240 | C3 + C4 |
+| gVisor pause, 3 nodes | n/a | 180 / 240 | |
+| micro-VM pause, 1 metal node | 460 / 4500 | same build | disk-bound |
+| micro-VM suspend, 1 metal node | see B8c | 470 / 5500 | C3 + C4 |
+
+What a gVisor wake is made of now: about 165 ms of `runsc` (create and
+restore of the pause and app containers) and about 25 ms of Substrate
+(ateapi 12 ms of PostgreSQL, atelet 3 ms, ateom outside runsc 10 ms, router
+under 5 ms). The Substrate share cannot get much lower without changing how
+the sandbox is driven. The large remaining lever on both sandbox classes is
+checkpoint write bandwidth per node, which bounds pause latency and
+therefore how many actors a node can cycle.
