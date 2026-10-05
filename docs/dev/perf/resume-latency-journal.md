@@ -718,6 +718,40 @@ Measured (B7a vs B6a): hit rate 29% to 91.5% (the rest are first
 activations), wake p50 0.73 s to 0.18 s, p99 2.1 s to 0.24 s, 0 misses on
 the preference itself. Kept.
 
+## Actor sizing and snapshot sizes
+
+What the actors were (every run above unless stated): glutton ActorTemplate
+with a single resource limit, memory 1Gi (2Gi only in B9d). No CPU limit, so
+the sandbox is sized to the host: under gVisor `runsc` boots with
+`--cpu-num 88` (or 192 on metal) and no cgroup CPU quota; under micro-VM the
+guest gets kata's default 1 vCPU and 1Gi minus the VMM reserve of guest RAM
+(the memory image is 896 MiB). The coding-session script declares 96 MiB of
+RAM arrays (agent_context 32Mi, compiler_ws 64Mi) and about 90 MiB of files
+(ingest and write_disk), with min_actor_memory 1Gi for guest and allocator
+overhead.
+
+Snapshot sizes, measured on 2026-10-05 with a one-off run (10 actors,
+suspend after every step, think-scale 1 so every step is reached within the
+run) by polling the bucket for the compressed objects and reading atelet's
+upload records for the uncompressed sizes:
+
+| | gVisor | micro-VM |
+|---|---|---|
+| memory image, uncompressed (populated) p50 / p90 / max | pages.img 281 / 325 / 356 MB | memory-ranges 487 / 507 / 521 MB (940 MB apparent, sparse) |
+| memory image, zstd object in GCS p50 / p90 / max | 259 / 305 / 325 MB | 379 / 402 / 412 MB |
+| other files per snapshot | checkpoint.img 1 MB, pages_meta 12 KB | rootfs-upper.tar 84 MB raw, 78 MB zstd (p50), state.json 65 KB |
+| whole snapshot in GCS p50 / p90 | 251 / 305 MB | 456 / 498 MB |
+| one actor across successive suspends (zstd MB) | 147, 305, 277 | 122, 301, 300, 303, 314, 382, 382 ... |
+
+zstd gains little on these images (gVisor 0.92, micro-VM 0.78 of populated
+bytes): glutton's arrays and files are random bytes. Under gVisor the
+script's files live in the sandbox's memory and ride in pages.img; under
+micro-VM they are the rootfs upper and travel as a separate tar. The size
+grows through the first few steps (clone, deps, first build) and plateaus
+at the script's working set; the Friday runs at think-scale 15 sampled
+earlier steps more often and showed a lower median (gVisor pages.img p50
+215 MB, micro-VM memory-ranges populated p50 365 MB).
+
 ## Candidates to submit
 
 In order of value. None has been opened as a PR; each is a self-contained
