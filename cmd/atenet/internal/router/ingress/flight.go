@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -45,10 +46,15 @@ type resumeActorFlight struct {
 	// it waited through), hence atomic.
 	attempts             atomic.Int32
 	firstAttemptUnixNano atomic.Int64
+
+	// spanCtx identifies the flight's own span, the parent of its ResumeActor
+	// RPCs. A joiner links its request span to it, which is how a trace of a
+	// request that only waited finds the trace that did the resume.
+	spanCtx trace.SpanContext
 }
 
-func newResumeActorFlight() *resumeActorFlight {
-	return &resumeActorFlight{retrying: make(chan struct{}), done: make(chan struct{})}
+func newResumeActorFlight(spanCtx trace.SpanContext) *resumeActorFlight {
+	return &resumeActorFlight{retrying: make(chan struct{}), done: make(chan struct{}), spanCtx: spanCtx}
 }
 
 // signalRetrying is idempotent; only the flight goroutine calls it.

@@ -46,6 +46,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/nodepath"
 	"github.com/agent-substrate/substrate/internal/ocispec"
 	"github.com/agent-substrate/substrate/internal/otlprelay"
+	"github.com/agent-substrate/substrate/internal/phasespan"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 	"github.com/agent-substrate/substrate/internal/resources"
@@ -64,6 +65,7 @@ import (
 	"github.com/spf13/pflag"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"golang.org/x/sync/errgroup"
@@ -665,6 +667,11 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	}
 	op.sandboxClass = sandboxRec.SandboxClass
 
+	// One span per phase on the request's trace, beside the log record.
+	seq := phasespan.NewSequence(ctx, tracer, "checkpoint")
+	defer func() { seq.End(err) }()
+
+	seq.Next(ateattr.SnapshotPhaseSandboxAssets)
 	tAssets := time.Now()
 	assetPaths, err := s.ensureSandboxAssets(ctx, sandboxRec)
 	dAssets = time.Since(tAssets)
@@ -674,6 +681,7 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 
 	checkpointDir := ateletpath.CheckpointStateDir(actorUID)
 
+	seq.Next(ateattr.SnapshotPhaseAteomDial)
 	tDial := time.Now()
 	client, err := s.dialAteom(ctx, req.GetTargetAteomUid())
 	dDial = time.Since(tDial)
@@ -690,7 +698,7 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	}
 
 	tAteom := time.Now()
-	resp, err := client.CheckpointWorkload(ctx, &ateompb.CheckpointWorkloadRequest{
+	resp, err := client.CheckpointWorkload(seq.Next(ateattr.SnapshotPhaseAteomCheckpoint), &ateompb.CheckpointWorkloadRequest{
 		Atespace:              actorRef.Atespace,
 		ActorName:             actorRef.Name,
 		ActorTemplateAtespace: req.GetActorTemplateAtespace(),
@@ -735,7 +743,7 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	//
 	// Best-effort: if this fail, the actor's terminate prunes again.
 	tPrune := time.Now()
-	if err := pruneLocalCheckpoints(ctx, actorUID); err != nil {
+	if err := pruneLocalCheckpoints(seq.Next(ateattr.SnapshotPhaseLocalPrune), actorUID); err != nil {
 		slog.WarnContext(ctx, "failed to prune superseded local checkpoints", slog.Any("actor", actorRef), slog.Any("err", err))
 	}
 	dPrune = time.Since(tPrune)
@@ -744,15 +752,16 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	// superseded snapshots on both paths, so timing it as part of an external
 	// upload would mix local disk deletion into the object-storage measurement.
 	tPersist := time.Now()
+	persistCtx := seq.Next(ateattr.SnapshotPhasePersist)
 	switch req.GetType() {
 	case ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL:
 		// TODO(#362): Because we do not cache the external snapshot files when upload fails, we have to mark the Actor as CRASHED.
-		if err := s.uploadExternalCheckpoint(ctx, req, checkpointDir, sandboxRec); err != nil {
+		if err := s.uploadExternalCheckpoint(persistCtx, req, checkpointDir, sandboxRec); err != nil {
 			dPersist = time.Since(tPersist)
 			return nil, fmt.Errorf("while uploading external snapshot: %w", err)
 		}
 	case ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL:
-		if err := s.moveLocalCheckpoint(ctx, req, sandboxRec); err != nil {
+		if err := s.moveLocalCheckpoint(persistCtx, req, sandboxRec); err != nil {
 			dPersist = time.Since(tPersist)
 			return nil, fmt.Errorf("while moving to local snapshot: %w", err)
 		}
@@ -767,23 +776,25 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	// checkpoint-state also takes them out of the RemoveAll in resetActorDirs
 	// below, which is the slow step under disk contention.
 	if op.kind == ateattr.SnapshotKindLatest && req.GetType() == ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL {
-		s.retainSnapshot(ctx, actorUID, checkpointDir, sandboxRec, req.GetExternalConfig().GetSnapshotUri(), true)
+		s.retainSnapshot(seq.Next("retain"), actorUID, checkpointDir, sandboxRec, req.GetExternalConfig().GetSnapshotUri(), true)
 	}
 
 	tUnmount := time.Now()
-	unmountErr := s.unmountExternalVolumes(ctx, actorUID, req.GetSpec().GetVolumes())
+	unmountErr := s.unmountExternalVolumes(seq.Next(ateattr.SnapshotPhaseVolumeUnmount), actorUID, req.GetSpec().GetVolumes())
 	dUnmount = time.Since(tUnmount)
 	if unmountErr != nil {
 		return nil, fmt.Errorf("while unmounting external volumes: %w", unmountErr)
 	}
 
 	// Note: we do not crash the actor if resetting the directory fails.
+	seq.Next(ateattr.SnapshotPhaseDirsReset)
 	tReset := time.Now()
 	resetErr := resetActorDirs(actorUID)
 	dReset = time.Since(tReset)
 	if resetErr != nil {
 		return nil, fmt.Errorf("while resetting actor dirs: %w", resetErr)
 	}
+	seq.End(nil)
 
 	return &ateletpb.CheckpointResponse{}, nil
 }
@@ -975,7 +986,9 @@ func (s *AteomHerder) UploadPausedCheckpoint(ctx context.Context, req *ateletpb.
 	localDir := ateletpath.LocalSnapshotDir(req.GetActorUid(), req.GetLocalSnapshotName())
 
 	tPersist := time.Now()
-	rec, err := s.uploadLocalCheckpointDir(ctx, req, localDir, uri)
+	persistCtx, endPersist := phasespan.Start(ctx, tracer, "checkpoint", ateattr.SnapshotPhasePersist)
+	rec, err := s.uploadLocalCheckpointDir(persistCtx, req, localDir, uri)
+	endPersist(err)
 	dPersist = time.Since(tPersist)
 	if rec != nil {
 		op.sandboxClass = rec.SandboxClass
@@ -1178,8 +1191,14 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 			snapshotLogAttrs(attribution, op, restoreDurationMetric, err, phases)...)
 	}()
 
+	// One span per phase on the request's trace, beside the log record. The
+	// two concurrent legs below open their phases under their own leg spans.
+	seq := phasespan.NewSequence(ctx, tracer, "restore")
+	defer func() { seq.End(err) }()
+
 	// Not crashing the actor, because terminal errors here indicate problems with atelet,
 	// node or the disk itself.
+	seq.Next(ateattr.SnapshotPhaseDirsReset)
 	tReset := time.Now()
 	resetErr := resetActorDirs(actorUID)
 	dReset = time.Since(tReset)
@@ -1188,7 +1207,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	}
 
 	tMount := time.Now()
-	mountErr := s.mountExternalVolumes(ctx, actorUID, req.GetSpec().GetVolumes())
+	mountErr := s.mountExternalVolumes(seq.Next(ateattr.SnapshotPhaseVolumeMount), actorUID, req.GetSpec().GetVolumes())
 	dMount = time.Since(tMount)
 	if mountErr != nil {
 		return nil, mountErr
@@ -1200,11 +1219,12 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	// before the legs below, and an unreachable target fails before any
 	// download starts.
 	tDial := time.Now()
-	client, err := s.dialAteom(ctx, req.GetTargetAteomUid())
+	client, err := s.dialAteom(seq.Next(ateattr.SnapshotPhaseAteomDial), req.GetTargetAteomUid())
 	dDial = time.Since(tDial)
 	if err != nil {
 		return nil, err
 	}
+	seq.End(nil)
 
 	// Undo the Register if the restore fails.
 	defer func() {
@@ -1231,11 +1251,14 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() (err error) {
 		defer func() { fetchErr = err }()
+		leg := phasespan.NewSequence(gctx, tracer, "restore")
+		defer func() { leg.End(err) }()
 		// An external snapshot this node uploaded is still on its disk (see
 		// retainUploadedSnapshot): the manifest is read and the files linked
 		// from there, under the same phase names, and no object is fetched.
 		// Written here, read after g.Wait.
 		var retained bool
+		gctx := leg.Next(ateattr.SnapshotPhaseManifestFetch)
 		tManifest := time.Now()
 		if req.GetType() == ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL {
 			sandboxRec, retained = lookupRetainedSnapshot(gctx, actorUID, req.GetExternalConfig().GetSnapshotUri())
@@ -1255,6 +1278,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 			op.restoreSource = restoreSourceRetained
 		}
 
+		gctx = leg.Next(ateattr.SnapshotPhaseDownload, attribute.String("ate.actor.restore.source", string(op.restoreSource)))
 		tDownload := time.Now()
 		switch {
 		case retained:
@@ -1273,6 +1297,9 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	})
 	g.Go(func() (err error) {
 		defer func() { prepErr = err }()
+		leg := phasespan.NewSequence(gctx, tracer, "restore")
+		defer func() { leg.End(err) }()
+		gctx := leg.Next(ateattr.SnapshotPhaseSandboxAssets)
 		tAssets := time.Now()
 		assetPaths, err = s.ensureSandboxAssets(gctx, runtimeRec)
 		dAssets = time.Since(tAssets)
@@ -1280,6 +1307,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 			prepFailedPhase = ateattr.SnapshotPhaseSandboxAssets
 			return err
 		}
+		leg.Next(ateattr.SnapshotPhaseSysinfoRegister)
 		tSysinfo := time.Now()
 		err = s.systemInfoVolumes.Register(actorUID, actorRef, systemInfoVolumesFor(actorUID, req.GetSpec()))
 		dSysinfo = time.Since(tSysinfo)
@@ -1287,6 +1315,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 			prepFailedPhase = ateattr.SnapshotPhaseSysinfoRegister
 			return err
 		}
+		gctx = leg.Next(ateattr.SnapshotPhaseOCIUnpack)
 		t := time.Now()
 		err = s.prepareOCIBundles(gctx, actorUID, actorRef, req.GetSpec(), runtimeRec.PauseImage, req.GetTargetAteomUid())
 		dBundles = time.Since(t)
@@ -1317,7 +1346,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	// The ateom_restore phase is opaque from here; ateom logs its own breakdown of
 	// this call as "Actor restore phases".
 	tAteom := time.Now()
-	_, err = client.RestoreWorkload(ctx, &ateompb.RestoreWorkloadRequest{
+	_, err = client.RestoreWorkload(seq.Next(ateattr.SnapshotPhaseAteomRestore), &ateompb.RestoreWorkloadRequest{
 		Atespace:              actorRef.Atespace,
 		ActorName:             actorRef.Name,
 		ActorTemplateAtespace: req.GetActorTemplateAtespace(),
@@ -1341,6 +1370,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	// Record the sandbox binaries actually running the guest on-node so a
 	// subsequent Checkpoint of this restored actor can re-pin the same version
 	// (Checkpoint overwrites the identity fields from its own request).
+	seq.Next(ateattr.SnapshotPhaseSandboxRecord)
 	tRecord := time.Now()
 	recordErr := writeSandboxRecord(actorUID, runtimeRec)
 	dRecord = time.Since(tRecord)
@@ -1348,6 +1378,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		// Note: crash the actor right away, if we cannot write the sandbox record now, we will not be able to checkpoint it later.
 		return nil, recordErr
 	}
+	seq.End(nil)
 
 	return &ateletpb.RestoreResponse{}, nil
 }

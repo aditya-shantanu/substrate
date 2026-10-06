@@ -449,8 +449,20 @@ type ExternalSnapshot struct {
 	// +k8s:optional
 	// +k8s:format=k8s-long-name
 	ProducedOnNode string `protobuf:"bytes,4,opt,name=produced_on_node,json=producedOnNode,proto3" json:"produced_on_node,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// produced_by_trace_id and produced_by_span_id identify the span of the
+	// operation that wrote this snapshot (a suspend, or the golden build), as
+	// lowercase hex W3C trace and span ids. A later resume links its own trace
+	// to them, so the trace of a wake leads to the trace that produced what it
+	// restored. Empty when the producer carried no trace context.
+	//
+	// +k8s:optional
+	// +k8s:maxLength=32
+	ProducedByTraceId string `protobuf:"bytes,5,opt,name=produced_by_trace_id,json=producedByTraceId,proto3" json:"produced_by_trace_id,omitempty"`
+	// +k8s:optional
+	// +k8s:maxLength=16
+	ProducedBySpanId string `protobuf:"bytes,6,opt,name=produced_by_span_id,json=producedBySpanId,proto3" json:"produced_by_span_id,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ExternalSnapshot) Reset() {
@@ -507,6 +519,20 @@ func (x *ExternalSnapshot) GetActorTemplateUid() string {
 func (x *ExternalSnapshot) GetProducedOnNode() string {
 	if x != nil {
 		return x.ProducedOnNode
+	}
+	return ""
+}
+
+func (x *ExternalSnapshot) GetProducedByTraceId() string {
+	if x != nil {
+		return x.ProducedByTraceId
+	}
+	return ""
+}
+
+func (x *ExternalSnapshot) GetProducedBySpanId() string {
+	if x != nil {
+		return x.ProducedBySpanId
 	}
 	return ""
 }
@@ -7999,12 +8025,14 @@ var File_ateapi_proto protoreflect.FileDescriptor
 
 const file_ateapi_proto_rawDesc = "" +
 	"\n" +
-	"\fateapi.proto\x12\x06ateapi\x1a\x1fgoogle/protobuf/timestamp.proto\"\xd0\x01\n" +
+	"\fateapi.proto\x12\x06ateapi\x1a\x1fgoogle/protobuf/timestamp.proto\"\xb0\x02\n" +
 	"\x10ExternalSnapshot\x12!\n" +
 	"\fsnapshot_uri\x18\x01 \x01(\tR\vsnapshotUri\x12A\n" +
 	"\rcontent_scope\x18\x02 \x01(\x0e2\x1c.ateapi.SnapshotContentScopeR\fcontentScope\x12,\n" +
 	"\x12actor_template_uid\x18\x03 \x01(\tR\x10actorTemplateUid\x12(\n" +
-	"\x10produced_on_node\x18\x04 \x01(\tR\x0eproducedOnNode\"\xb9\x01\n" +
+	"\x10produced_on_node\x18\x04 \x01(\tR\x0eproducedOnNode\x12/\n" +
+	"\x14produced_by_trace_id\x18\x05 \x01(\tR\x11producedByTraceId\x12-\n" +
+	"\x13produced_by_span_id\x18\x06 \x01(\tR\x10producedBySpanId\"\xb9\x01\n" +
 	"\rLocalSnapshot\x12#\n" +
 	"\rsnapshot_name\x18\x01 \x01(\tR\fsnapshotName\x12@\n" +
 	"\x1dnode_vms_with_local_snapshots\x18\x02 \x03(\tR\x19nodeVmsWithLocalSnapshots\x12A\n" +

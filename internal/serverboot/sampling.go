@@ -19,10 +19,12 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -141,4 +143,44 @@ func resolveTraceSampling(name string, nameSet bool, arg string, argSet bool, de
 		return ParentRatioSampling(ratio), nil
 	}
 	return def, fmt.Errorf("unsupported %s %q", tracesSamplerEnv, name)
+}
+
+// AlwaysSampleSpanNames returns s with its sampler wrapped so that a span
+// whose name is in names is always recorded and sampled, whatever its parent
+// says, and every other span keeps s's decision. It is how a component roots
+// a new, complete trace for a rare and expensive event (an actor wake) while
+// the requests around it stay at the head ratio.
+func AlwaysSampleSpanNames(s TraceSampling, names ...string) TraceSampling {
+	if len(names) == 0 || s.sampler == nil {
+		return s
+	}
+	set := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		set[n] = struct{}{}
+	}
+	return TraceSampling{sampler: namedSampler{inner: s.sampler, names: set}, rootRatio: s.rootRatio}
+}
+
+type namedSampler struct {
+	inner sdktrace.Sampler
+	names map[string]struct{}
+}
+
+func (n namedSampler) ShouldSample(p sdktrace.SamplingParameters) sdktrace.SamplingResult {
+	if _, ok := n.names[p.Name]; ok {
+		return sdktrace.SamplingResult{
+			Decision:   sdktrace.RecordAndSample,
+			Tracestate: oteltrace.SpanContextFromContext(p.ParentContext).TraceState(),
+		}
+	}
+	return n.inner.ShouldSample(p)
+}
+
+func (n namedSampler) Description() string {
+	names := make([]string, 0, len(n.names))
+	for name := range n.names {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return fmt.Sprintf("AlwaysSampleSpanNames{%s}+%s", strings.Join(names, ","), n.inner.Description())
 }

@@ -201,6 +201,20 @@ message ExternalSnapshot {
   // +k8s:optional
   // +k8s:format=k8s-long-name
   string produced_on_node = 4;
+
+  // produced_by_trace_id and produced_by_span_id identify the span of the
+  // operation that wrote this snapshot (a suspend, or the golden build), as
+  // lowercase hex W3C trace and span ids. A later resume links its own trace
+  // to them, so the trace of a wake leads to the trace that produced what it
+  // restored. Empty when the producer carried no trace context.
+  //
+  // +k8s:optional
+  // +k8s:maxLength=32
+  string produced_by_trace_id = 5;
+
+  // +k8s:optional
+  // +k8s:maxLength=16
+  string produced_by_span_id = 6;
 }
 
 // LocalSnapshot records information about a node-local snapshot.

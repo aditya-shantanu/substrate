@@ -34,6 +34,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/ateomphaselog"
 	"github.com/agent-substrate/substrate/internal/ateomstats"
 	"github.com/agent-substrate/substrate/internal/imagecache"
+	"github.com/agent-substrate/substrate/internal/phasespan"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 	"golang.org/x/sync/errgroup"
 )
@@ -83,7 +84,12 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	var dPrep, dPause, dSnapshot, dDurable, dUpper, dTeardown time.Duration
 	attribution := ateomstats.ActorAttributionFromRequest(req)
 	scope := req.GetScope()
+	// One span per phase on the request's trace, beside the log record. The
+	// three concurrent captures open their own spans under checkpoint.capture.
+	seq := phasespan.NewSequence(ctx, tracer, "checkpoint")
+	seq.Next(phasePrep)
 	defer func() {
+		seq.End(err)
 		ateomphaselog.LogSnapshotPhases(ctx, "Checkpoint timing breakdown", attribution, scope,
 			ateomphaselog.CheckpointDurationKey, err, []ateomphaselog.Phase{
 				{Name: phasePrep, D: dPrep},
@@ -140,6 +146,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 
 	tPause := time.Now()
 	dPrep = tPause.Sub(tStart)
+	seq.Next(phasePause)
 	pauseErr := client.Pause(ctx)
 	dPause = time.Since(tPause)
 	if pauseErr != nil {
@@ -170,31 +177,37 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	//   - Rootfs upper tar (Full only): host-backed like the durable volumes —
 	//     the memory snapshot does not carry rootfs writes. Under Data the
 	//     workload cold-starts on restore, discarding rootfs state.
-	g, gctx := errgroup.WithContext(ctx)
+	g, gctx := errgroup.WithContext(seq.Next("capture"))
 	if scope == ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL {
 		g.Go(func() error {
+			ctx, end := phasespan.Start(gctx, tracer, "checkpoint", phaseSnapshot)
 			t := time.Now()
-			d, err := s.snapshotVMState(gctx, client, ra, actorUID, checkpointDir)
+			d, err := s.snapshotVMState(ctx, client, ra, actorUID, checkpointDir)
 			if err != nil {
 				d = time.Since(t)
 			}
 			dSnapshot = d
+			end(err)
 			return err
 		})
 	}
 	if durable {
 		g.Go(func() error {
+			ctx, end := phasespan.Start(gctx, tracer, "checkpoint", phaseDurableDir)
 			t := time.Now()
-			err := tarDurableVolumes(gctx, actorDirs.GetDurableDirVolumeMountsDir(), checkpointDir)
+			err := tarDurableVolumes(ctx, actorDirs.GetDurableDirVolumeMountsDir(), checkpointDir)
 			dDurable = time.Since(t)
+			end(err)
 			return err
 		})
 	}
 	if scope == ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL {
 		g.Go(func() error {
+			ctx, end := phasespan.Start(gctx, tracer, "checkpoint", phaseRootfsUpper)
 			t := time.Now()
-			err := tarRootfsUpper(gctx, rootfsUpperDir(actorDirs), checkpointDir)
+			err := tarRootfsUpper(ctx, rootfsUpperDir(actorDirs), checkpointDir)
 			dUpper = time.Since(t)
+			end(err)
 			return err
 		})
 	}
@@ -213,6 +226,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// Tear down: the actor returns to "available". Best-effort; the snapshot is
 	// already on disk for atelet to ship.
 	tTeardown := time.Now()
+	seq.Next(phaseTeardown)
 	if err := s.terminateWorkload(ctx, attribution, actorDirs); err != nil {
 		slog.WarnContext(ctx, "failed to terminate workload after checkpoint",
 			slog.String("actor", attribution.Ref.String()),
@@ -220,6 +234,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 			slog.Any("err", err))
 	}
 	dTeardown = time.Since(tTeardown)
+	seq.End(nil)
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor checkpointed", attribution)
 	slog.InfoContext(ctx, "Actor checkpointed", slog.String("id", actorUID), slog.Any("snapshot_files", snapshotFiles),
@@ -258,7 +273,10 @@ func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, r
 
 	slog.InfoContext(ctx, "Snapshotting guest", slog.String("id", actorUID), slog.String("dir", checkpointDir))
 	tSnapshot := time.Now()
-	if err := client.Snapshot(ctx, checkpointDir); err != nil {
+	snapCtx, endSnap := phasespan.Start(ctx, tracer, "checkpoint", "vmm_snapshot")
+	err := client.Snapshot(snapCtx, checkpointDir)
+	endSnap(err)
+	if err != nil {
 		return 0, fmt.Errorf("while snapshotting guest: %w", err)
 	}
 	dSnapshot := time.Since(tSnapshot)
@@ -282,7 +300,10 @@ func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, r
 		// Reuse base's on-disk working set (rename + overlay) instead of copying it —
 		// CH is paused and about to be torn down, and base is discarded after. See
 		// MergeDeltaIntoBase. (Falls back to the copying merge across filesystems.)
-		if err := ch.MergeDeltaIntoBase(ctx, base, delta); err != nil {
+		mergeCtx, endMerge := phasespan.Start(ctx, tracer, "checkpoint", "merge_delta")
+		err := ch.MergeDeltaIntoBase(mergeCtx, base, delta)
+		endMerge(err)
+		if err != nil {
 			return 0, fmt.Errorf("while merging OnDemand delta into restore source: %w", err)
 		}
 		slog.InfoContext(ctx, "Merged OnDemand delta into base (complete snapshot)",

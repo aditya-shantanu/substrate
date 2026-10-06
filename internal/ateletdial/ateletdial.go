@@ -24,6 +24,7 @@ import (
 	"net"
 	"os"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
@@ -88,9 +89,12 @@ func TLSConfig(credentialBundlePath, trustBundlePath, ateletSPIFFEID string) (*t
 
 // Dial opens a connection to the atelet socket. The caller closes it; a fresh
 // connection picks up rotated worker credentials and re-verifies atelet.
+// Calls carry the caller's trace context, so a certificate mint made during a
+// restore shows under that restore rather than as a trace of its own.
 func Dial(socketPath string, tlsConfig *tls.Config) (*grpc.ClientConn, error) {
 	return grpc.NewClient("passthrough:///atelet",
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 		}),

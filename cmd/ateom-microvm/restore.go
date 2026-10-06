@@ -32,6 +32,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/ateomstats"
 
 	"github.com/agent-substrate/substrate/internal/ateomnet"
+	"github.com/agent-substrate/substrate/internal/phasespan"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
@@ -212,6 +213,12 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, scope ateompb.SnapshotScope, restoreDir string, tStart time.Time) (retErr error) {
 	actorUID := p.actorUID
 
+	// One span per phase on the request's trace, beside the log record below.
+	// The untar runs concurrently and opens its own span.
+	seq := phasespan.NewSequence(ctx, tracer, "restore")
+	defer func() { seq.End(retErr) }()
+	seq.Next(phasePrep)
+
 	rr := s.resolveRuntime(p.assetPaths)
 	egress, err := s.tunnel.PrepareEgress(ctx, p.attribution(), p.egressGateway)
 	if err != nil {
@@ -249,8 +256,12 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	untarDone := make(chan error, 1)
 	untarJoined := false
 	go func() {
-		untarDone <- untarRootfsUpper(rootfsUpperDir(p.actorDirs), restoreDir)
+		_, end := phasespan.Start(ctx, tracer, "restore", "untar_rootfs_upper")
+		err := untarRootfsUpper(rootfsUpperDir(p.actorDirs), restoreDir)
+		end(err)
+		untarDone <- err
 	}()
+	seq.Next(phaseBundles)
 	defer func() {
 		if !untarJoined {
 			<-untarDone
@@ -279,12 +290,14 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	// The overlay mounts need the upper on disk: join the background untar (still
 	// overlapped with the bundle preparation above), then assemble the merged trees
 	// and serve them.
+	seq.Next(phaseUpperJoin)
 	untarErr := <-untarDone
 	untarJoined = true
 	if untarErr != nil {
 		return untarErr
 	}
 	tUpper := time.Now()
+	seq.Next(phaseLowers)
 	leaf, err := s.actorLeaf(actorUID, p.size)
 	if err != nil {
 		return err
@@ -322,6 +335,7 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 			}
 		}
 	}()
+	seq.Next(phaseTap)
 	netDevs, err := ch.SnapshotNetDevices(restoreDir)
 	if err != nil {
 		return fmt.Errorf("while reading snapshot net devices: %w", err)
@@ -350,6 +364,7 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	// /dev/vda (image) + each /dev/vd{b+i} (actor rootfs) from the snapshot config paths.
 	apiSocket := filepath.Join(kata.VMDir(actorUID), "clh-api-restore.sock")
 	tTap := time.Now()
+	seq.Next(phaseVMMLaunch)
 	chCmd, client, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
 		Binary: rr.chBinary, APISocket: apiSocket, Stdout: slogWriter{ctx}, Stderr: slogWriter{ctx},
 		SysProcAttr: leaf.SysProcAttr(),
@@ -374,6 +389,7 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	//     source afterwards and nothing merges against it, so it is dropped below and
 	//     the next snapshot stands on its own.
 	tLaunch := time.Now()
+	seq.Next(phaseVMRestore)
 	memMode := restoreMemMode(ctx, client.Info())
 	slog.InfoContext(ctx, "restoring guest memory",
 		slog.String("mode", memMode), slog.String("vmm_version", client.Info().Version))
@@ -381,10 +397,12 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 		return fmt.Errorf("while restoring VM with net FDs: %w", err)
 	}
 	tVMRestore := time.Now()
+	seq.Next(phaseResume)
 	if err := client.Resume(ctx); err != nil {
 		return fmt.Errorf("while resuming restored guest: %w", err)
 	}
 	tResume := time.Now()
+	seq.Next(phaseAgentDial)
 
 	// One kata-agent connection serves this whole activation: the CRNG reseed below,
 	// then log forwarding and guest stats. As on cold boot, not reaching the agent
@@ -416,20 +434,29 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	// and notifies the guest before unpausing the vCPUs, so a >=5.18 kernel reseeds its
 	// CRNG on its own with no host round-trip, no per-restore RPC, and no post-Resume
 	// race. At that point this agent-driven reseed can be dropped.
+	tAgentDial := time.Now()
+	seq.Next(phaseCRNGReseed)
 	if err := reseedGuestCRNG(ctx, guestAC); err != nil {
 		return fmt.Errorf("while reseeding guest CRNG: %w", err)
 	}
+	tReseed := time.Now()
 
 	// Block until every wakeup-probe-enabled container reports 200.
+	seq.Next(phaseWakeupProbe)
 	if err := wakeupprobe.WaitAll(ctx, containers, ateomnet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(actorUID))); err != nil {
 		return fmt.Errorf("while waiting for container wakeup probe: %w", err)
 	}
+	seq.End(nil)
 
 	// Where a resume goes. Like the boot phases, this used to be a single total,
 	// which hid that a first (cold) restore and a later (warm) one differ by more
 	// than 5x on the same actor. upper/lowers is the host reassembling the rootfs;
-	// vm_restore is cloud-hypervisor reading guest RAM back.
-	dWakeupProbe := time.Since(tResume)
+	// vm_restore is cloud-hypervisor reading guest RAM back; agent_dial and
+	// crng_reseed are the kata-agent round trips between the guest resuming and
+	// the probe, which used to hide inside wakeup_probe.
+	dAgentDial := tAgentDial.Sub(tResume)
+	dReseed := tReseed.Sub(tAgentDial)
+	dWakeupProbe := time.Since(tReseed)
 	dTotal := time.Since(tStart)
 	slog.InfoContext(ctx, "Actor restore phases", slog.String("id", actorUID),
 		slog.Duration("prep", tPrep.Sub(tStart)),
@@ -441,6 +468,8 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 		slog.Duration("vmm_launch", tLaunch.Sub(tTap)),
 		slog.Duration("vm_restore", tVMRestore.Sub(tLaunch)),
 		slog.Duration("resume", tResume.Sub(tVMRestore)),
+		slog.Duration("agent_dial", dAgentDial),
+		slog.Duration("crng_reseed", dReseed),
 		slog.Duration("wakeup_probe", dWakeupProbe),
 		slog.Duration("total", dTotal))
 	// The joinable per-actor record the benchmarking tooling aggregates. The
@@ -456,6 +485,8 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 			{Name: phaseVMMLaunch, D: tLaunch.Sub(tTap)},
 			{Name: phaseVMRestore, D: tVMRestore.Sub(tLaunch)},
 			{Name: phaseResume, D: tResume.Sub(tVMRestore)},
+			{Name: phaseAgentDial, D: dAgentDial},
+			{Name: phaseCRNGReseed, D: dReseed},
 			{Name: phaseWakeupProbe, D: dWakeupProbe},
 			{Name: phaseTotal, D: dTotal},
 		})

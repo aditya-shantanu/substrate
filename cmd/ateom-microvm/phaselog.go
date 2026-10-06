@@ -16,7 +16,11 @@
 
 package main
 
-import "github.com/agent-substrate/substrate/internal/ateattr"
+import (
+	"go.opentelemetry.io/otel"
+
+	"github.com/agent-substrate/substrate/internal/ateattr"
+)
 
 // The phase names, suffixed onto the ateomphaselog duration keys. Kept out of
 // ateattr on purpose: that package's SnapshotPhase* values are the
@@ -36,6 +40,8 @@ const (
 
 	phasePrep        = "prep"
 	phaseBundles     = "bundles"
+	phaseAgentDial   = "agent_dial"
+	phaseCRNGReseed  = "crng_reseed"
 	phaseUpperJoin   = "upper_join"
 	phaseLowers      = "lowers"
 	phaseTap         = "tap"
@@ -46,3 +52,6 @@ const (
 
 	phaseTotal = ateattr.SnapshotPhaseTotal
 )
+
+// tracer names the phase spans of RestoreWorkload and CheckpointWorkload.
+var tracer = otel.Tracer("ateom-microvm")

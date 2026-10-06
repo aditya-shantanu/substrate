@@ -20,6 +20,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/apierror"
 	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/resources"
+	"go.opentelemetry.io/otel"
 	"google.golang.org/grpc/status"
 )
 
@@ -87,3 +88,6 @@ func snapshotLogAttrs(a resources.ActorAttribution, op snapshotOp, durationKey s
 	}
 	return attrs
 }
+
+// tracer names the restore and checkpoint phase spans.
+var tracer = otel.Tracer("atelet")

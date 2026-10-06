@@ -1159,6 +1159,9 @@ func (x *XdsServer) buildTracing() *hcmv3.HttpConnectionManager_Tracing {
 	})
 	return &hcmv3.HttpConnectionManager_Tracing{
 		RandomSampling: &typev3.Percent{Value: x.traceRootSamplingPercent},
+		// A child span for the upstream request, so the time the actor itself
+		// takes to answer after its wake stands apart from the ext_proc hop.
+		SpawnUpstreamSpan: wrapperspb.Bool(true),
 		Provider: &tracev3.Tracing_Http{
 			Name: "envoy.tracers.opentelemetry",
 			ConfigType: &tracev3.Tracing_Http_TypedConfig{

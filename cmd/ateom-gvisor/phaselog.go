@@ -19,9 +19,14 @@ package main
 import (
 	"time"
 
+	"go.opentelemetry.io/otel"
+
 	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/ateomphaselog"
 )
+
+// tracer names the phase spans of RestoreWorkload and CheckpointWorkload.
+var tracer = otel.Tracer("ateom-gvisor")
 
 // The phase names, suffixed onto the ateomphaselog duration keys. Kept out of
 // ateattr on purpose: that package's SnapshotPhase* values are the

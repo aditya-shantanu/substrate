@@ -36,6 +36,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/actorlock"
 	"github.com/agent-substrate/substrate/internal/actorlog"
 	"github.com/agent-substrate/substrate/internal/apierror"
+	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/ateinterceptors"
 	"github.com/agent-substrate/substrate/internal/ateomcapacity"
 	"github.com/agent-substrate/substrate/internal/ateomcgroup"
@@ -49,6 +50,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/nodepath"
 	"github.com/agent-substrate/substrate/internal/ocispec"
 	"github.com/agent-substrate/substrate/internal/otlprelay"
+	"github.com/agent-substrate/substrate/internal/phasespan"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/internal/serverboot"
@@ -57,6 +59,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/wakeupprobe"
 	"github.com/spf13/pflag"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -661,12 +664,16 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	scope := req.GetScope()
 	var timing checkpointTiming
 	tLast := tStart
+	// One span per phase on the request's trace, beside the log record.
+	seq := phasespan.NewSequence(ctx, tracer, "checkpoint")
 	defer func() {
+		seq.End(err)
 		timing.total = time.Since(tStart)
 		ateomphaselog.LogSnapshotPhases(ctx, "Checkpoint timing breakdown", attribution, scope,
 			ateomphaselog.CheckpointDurationKey, err, timing.phases())
 	}()
 
+	seq.Next(phasePrep)
 	if err := s.tunnel.Deactivate(ctx, attribution); err != nil {
 		return nil, err
 	}
@@ -699,11 +706,13 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		if !hasDurableVolumes(req.GetSpec().GetContainers()) {
 			return nil, fmt.Errorf("no durable-dir volumes found for DATA snapshot")
 		}
+		seq.Next(phasePause)
 		err := rcmd.cmdPause(ctx, ocispec.PauseContainer)
 		timing.pause = lap(&tLast)
 		if err != nil {
 			return nil, fmt.Errorf("while pausing pause container: %w", err)
 		}
+		seq.Next(phaseDurableDir)
 		tarErr := tarDurableVolumes(ctx, req.GetActorDirs().GetDurableDirVolumeMountsDir(), checkpointPath)
 		timing.durableDir = lap(&tLast)
 		// Undoing our own pause must not depend on the caller's context:
@@ -711,6 +720,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		// fail the resume instantly and leave the sandbox paused forever.
 		resumeCtx, cancelResume := context.WithTimeout(context.WithoutCancel(ctx), resumeTimeout)
 		defer cancelResume()
+		seq.Next(phaseResume)
 		err = rcmd.cmdResume(resumeCtx, ocispec.PauseContainer)
 		timing.resume = lap(&tLast)
 		if err != nil {
@@ -722,12 +732,14 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL:
 		// Checkpoint pause container (root of the sandbox)
 		// TODO: Consider pause -> tar -> resume -> checkpoint order for better failure handling.
+		seq.Next(phaseCheckpoint)
 		err := rcmd.cmdCheckpoint(ctx, ocispec.PauseContainer, checkpointPath)
 		timing.checkpoint = lap(&tLast)
 		if err != nil {
 			return nil, fmt.Errorf("while checkpointing pause: %w", err)
 		}
 		if hasDurableVolumes(req.GetSpec().GetContainers()) {
+			seq.Next(phaseDurableDir)
 			err := tarDurableVolumes(ctx, req.GetActorDirs().GetDurableDirVolumeMountsDir(), checkpointPath)
 			timing.durableDir = lap(&tLast)
 			if err != nil {
@@ -741,6 +753,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// Cleanup the containers after checkpointing. This also unhosts the actor,
 	// before the snapshot listing below can fail.
 	// This is best-effort cleanup for actor containers that may have been left behind after checkpointing.
+	seq.Next(phaseTeardown)
 	if err := s.terminateWorkload(ctx, attribution.Ref, attribution.UID, req.GetRunscPath(), req.GetActorDirs(), req.GetSpec().GetContainers()); err != nil {
 		slog.WarnContext(ctx, "failed to terminate workload after checkpoint",
 			slog.String("actor", attribution.Ref.String()),
@@ -748,6 +761,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 			slog.Any("err", err))
 	}
 	timing.teardown = lap(&tLast)
+	seq.End(nil)
 
 	// Report exactly the files runsc wrote so atelet ships precisely this set
 	// (checkpoint.img plus any pages images), rather than a hardcoded list.
@@ -861,7 +875,11 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	containers := req.GetSpec().GetContainers()
 	var timing restoreTiming
 	tLast := tStart
+	// One span per phase on the request's trace, beside the log record. The
+	// egress mint runs concurrently and opens its own span (startEgressPrep).
+	seq := phasespan.NewSequence(ctx, tracer, "restore")
 	defer func() {
+		seq.End(retErr)
 		timing.total = time.Since(tStart)
 		attrs := ateomphaselog.SnapshotPhaseAttrs(attribution, scope, ateomphaselog.RestoreDurationKey, retErr, timing.phases())
 		attrs = append(attrs, slog.Int(containerCountKey, len(containers)))
@@ -877,6 +895,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		return nil, err
 	}
 
+	seq.Next(phasePrep)
 	err = s.tunnel.Deactivate(ctx, attribution)
 	timing.prep = lap(&tLast)
 	if err != nil {
@@ -902,6 +921,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		egressPrep.abandon()
 		timing.egressPrepare = egressPrep.elapsed
 	}()
+	seq.Next(phaseNetSetup)
 	_, err = s.hostActor(ctx, attribution, req.GetActorDirs())
 	timing.netSetup = lap(&tLast)
 	if err != nil {
@@ -938,6 +958,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	checkpointDir := req.GetActorDirs().GetRestoreDir()
 
 	if hasDurableVolumes(containers) {
+		seq.Next(phaseDurableDir)
 		err := untarDurableVolumes(req.GetActorDirs().GetDurableDirVolumeMountsDir(), checkpointDir)
 		timing.durableDir = lap(&tLast)
 		if err != nil {
@@ -947,6 +968,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	// Compose the pause rootfs before create (see RunWorkload). runsc restore
 	// only needs the rootfs to hold the correct content; whether it came from
 	// an untar or an overlay of cached layers is transparent to it.
+	seq.Next(phasePauseRootfs)
 	err = imagecache.SetupBundleRootfs(ociBundlePath(req.GetActorDirs(), ocispec.PauseContainer))
 	timing.pauseRootfs = lap(&tLast)
 	if err != nil {
@@ -957,11 +979,13 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
 		// Create and start pause container (cold boot with durable-dir volumes restored)
 		containersToDelete = append(containersToDelete, ocispec.PauseContainer)
+		seq.Next(phasePauseCreate)
 		err := rcmd.cmdCreate(ctx, os.Stdout, ocispec.PauseContainer, nil)
 		timing.pauseCreate = lap(&tLast)
 		if err != nil {
 			return nil, fmt.Errorf("while creating pause container: %w", err)
 		}
+		seq.Next(phasePauseRestore)
 		err = rcmd.cmdStart(ctx, os.Stdout, ocispec.PauseContainer)
 		timing.pauseRestore = lap(&tLast)
 		if err != nil {
@@ -970,11 +994,13 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL:
 		// Create and restore pause container
 		containersToDelete = append(containersToDelete, ocispec.PauseContainer)
+		seq.Next(phasePauseCreate)
 		err := rcmd.cmdCreate(ctx, os.Stdout, ocispec.PauseContainer, nil)
 		timing.pauseCreate = lap(&tLast)
 		if err != nil {
 			return nil, fmt.Errorf("while creating pause container: %w", err)
 		}
+		seq.Next(phasePauseRestore)
 		err = rcmd.cmdRestore(ctx, os.Stdout, ocispec.PauseContainer, checkpointDir)
 		timing.pauseRestore = lap(&tLast)
 		if err != nil {
@@ -988,18 +1014,22 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	// every line is tagged with the originating container (ate.actor.container.name).
 	// app_create includes starting that pipe.
 	for _, ac := range containers {
+		ctr := attribute.String(string(ateattr.ActorContainerNameKey), ac.GetName())
+		seq.Next(phaseAppCreate, ctr)
 		pw, err := s.actorLogger.StartJSONLogPipe(attribution, ac.GetName())
 		timing.appCreate += lap(&tLast)
 		if err != nil {
 			return nil, fmt.Errorf("while starting json log pipe for %q: %w", ac.GetName(), err)
 		}
 		defer pw.Close()
+		seq.Next(phaseAppRootfs, ctr)
 		err = imagecache.SetupBundleRootfs(ociBundlePath(req.GetActorDirs(), ac.GetName()))
 		timing.appRootfs += lap(&tLast)
 		if err != nil {
 			return nil, fmt.Errorf("while composing %q rootfs: %w", ac.GetName(), err)
 		}
 		containersToDelete = append(containersToDelete, ac.GetName())
+		seq.Next(phaseAppCreate, ctr)
 		err = rcmd.cmdCreate(ctx, pw, ac.GetName(), nil)
 		timing.appCreate += lap(&tLast)
 		if err != nil {
@@ -1007,12 +1037,14 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		}
 		switch scope {
 		case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
+			seq.Next(phaseAppRestore, ctr)
 			err = rcmd.cmdStart(ctx, pw, ac.GetName())
 			timing.appRestore += lap(&tLast)
 			if err != nil {
 				return nil, fmt.Errorf("while starting %q application container: %w", ac.GetName(), err)
 			}
 		case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL:
+			seq.Next(phaseAppRestore, ctr)
 			err = rcmd.cmdRestore(ctx, pw, ac.GetName(), checkpointDir)
 			timing.appRestore += lap(&tLast)
 			if err != nil {
@@ -1024,21 +1056,25 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	}
 
 	// Block until every wakeup-probe-enabled container reports 200.
+	seq.Next(phaseWakeupProbe)
 	err = wakeupprobe.WaitAll(ctx, containers, ateomnet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(req.GetActorUid())))
 	timing.wakeupProbe = lap(&tLast)
 	if err != nil {
 		return nil, fmt.Errorf("while waiting for container wakeup probe: %w", err)
 	}
+	seq.Next(phaseEgressJoin)
 	egress, err := egressPrep.join()
 	timing.egressJoin = lap(&tLast)
 	if err != nil {
 		return nil, err
 	}
+	seq.Next(phaseActivate)
 	err = s.tunnel.Activate(attribution, s.sandboxDialer(req.GetActorUid()), egress)
 	timing.activate = lap(&tLast)
 	if err != nil {
 		return nil, err
 	}
+	seq.End(nil)
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor restored", attribution)
 	s.setSession(req.GetActorUid(), &workloadSession{rcmd: rcmd, containers: containerNames(containers)})

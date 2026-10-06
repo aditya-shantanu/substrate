@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/substrate/internal/ateomtunnel"
+	"github.com/agent-substrate/substrate/internal/phasespan"
 )
 
 // egressPrep is a PrepareEgress running alongside the sandbox setup. The
@@ -39,15 +40,19 @@ type egressPrep struct {
 	elapsed time.Duration
 }
 
-// startEgressPrep runs prepare in a goroutine under a child of ctx.
+// startEgressPrep runs prepare in a goroutine under a child of ctx, as its
+// own restore.egress_prepare span: it overlaps the sequential phases, so it
+// cannot be one of them.
 func startEgressPrep(ctx context.Context, prepare func(context.Context) (*ateomtunnel.ActorEgress, error)) *egressPrep {
 	ctx, cancel := context.WithCancel(ctx)
 	p := &egressPrep{cancel: cancel, done: make(chan struct{})}
 	go func() {
 		defer close(p.done)
+		ctx, end := phasespan.Start(ctx, tracer, "restore", phaseEgressPrepare)
 		start := time.Now()
 		p.egress, p.err = prepare(ctx)
 		p.elapsed = time.Since(start)
+		end(p.err)
 	}()
 	return p
 }

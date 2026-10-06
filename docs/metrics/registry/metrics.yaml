@@ -69,6 +69,19 @@ groups:
           docs/metrics/substrate.yaml. It separates two actors that held the
           same name at different times.
         examples: [8f2a1c4e6b0d47f1]
+      - id: ate.wake.trace_id
+        stability: development
+        type: string
+        brief: >
+          The W3C trace id of the ActorWake trace ateapi roots for a resume
+          that has to restore the actor, in lowercase hex.
+        note: >
+          Logs and spans only. A routed request's own trace is head sampled
+          at the router's ratio; the wake it triggers is always traced under
+          its own root, linked both ways. This attribute on the request's
+          span and on the Resume timing breakdown record is the join key from
+          a request or a log line to the wake's trace.
+        examples: [4bf92f3577b34da6a3ce929d0e0e4736]
       - id: ate.actor.container.count
         stability: development
         type: int

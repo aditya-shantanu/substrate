@@ -82,6 +82,7 @@ var (
 	postgresSchema                    = pflag.String("postgres-schema", "substrate", "PostgreSQL schema for Substrate tables. This overrides a search_path connection parameter.")
 	postgresPoolMaxConns              = pflag.Int32("postgres-pool-max-conns", 0, "Maximum connections in the shared Substrate and OpenFGA read/write PostgreSQL pool. Does not affect the owner or watch pools. The DSN or pgx default is used when unset.")
 	experimentalEnableAuthz           = pflag.Bool("experimental-enable-authz", false, "Enforce OpenFGA authorization checks on all registered RPCs (experimental). AccessPolicy RPCs are always checked.")
+	traceEveryWake                    = pflag.Bool("trace-every-wake", true, "Root a new, always-sampled trace for every resume that has to restore an actor, linked both ways to the request's trace. Routed requests stay at the head sampling ratio; the rare and expensive wakes are complete. Off, the wake stays a child of the request's trace and samples with it.")
 	// TODO: Move the authz settings into the hot-reloadable config proto
 	// (agent-substrate/substrate#2021) once it lands, so bootstrap owner
 	// changes take effect without a restart.
@@ -135,9 +136,14 @@ func main() {
 	shutdownCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGTERM, os.Interrupt)
 	defer stopSignals()
 
+	controlapi.TraceEveryWake = *traceEveryWake
+	sampling := serverboot.ResolveTraceSampling(ctx, serverboot.ParentRatioSampling(serverboot.ControlPlaneTraceRatio))
+	if *traceEveryWake {
+		sampling = serverboot.AlwaysSampleSpanNames(sampling, controlapi.WakeSpanName)
+	}
 	tp, err := serverboot.InitTracing(ctx, serverboot.TracingOptions{
 		ServiceName: "ateapi",
-		Sampling:    serverboot.ResolveTraceSampling(ctx, serverboot.ParentRatioSampling(serverboot.ControlPlaneTraceRatio)),
+		Sampling:    sampling,
 	})
 	if err != nil {
 		serverboot.Fatal(ctx, "Failed to initialize tracing", err)

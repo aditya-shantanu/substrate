@@ -48,6 +48,12 @@ containers:
   # benchmarking/telemetry/README.md.
   - name: OTEL_RESOURCE_ATTRIBUTES
     value: "service.name=glutton-actor"
+  # parentbased_always_off by default: an actor span per request is load the
+  # benchmark does not want. ACTOR_TRACES_SAMPLER=parentbased_always_on makes
+  # the actor's own handler span appear under the routed request's trace,
+  # which is the only way to see the agent's time after a wake.
+  - name: OTEL_TRACES_SAMPLER
+    value: "${ACTOR_TRACES_SAMPLER}"
   # Hold ResumeActor open until port 80 actually answers.
   wakeupProbe:
     httpGet:

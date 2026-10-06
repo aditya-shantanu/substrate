@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 const testDefaultRatio = 0.25
@@ -244,5 +245,30 @@ func TestParentSamplingConstructors(t *testing.T) {
 func TestInitTracingRequiresSampling(t *testing.T) {
 	if _, err := InitTracing(context.Background(), TracingOptions{ServiceName: "x"}); err == nil {
 		t.Error("InitTracing() with zero Sampling: expected error, got nil")
+	}
+}
+
+func TestAlwaysSampleSpanNames(t *testing.T) {
+	unsampledParent := oteltrace.ContextWithSpanContext(context.Background(), oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID: oteltrace.TraceID{1}, SpanID: oteltrace.SpanID{1},
+	}))
+	s := AlwaysSampleSpanNames(ParentNeverSampling(), "ActorWake")
+
+	got := s.Sampler().ShouldSample(sdktrace.SamplingParameters{ParentContext: unsampledParent, Name: "ActorWake"})
+	if got.Decision != sdktrace.RecordAndSample {
+		t.Errorf("ActorWake under an unsampled parent: decision = %v, want RecordAndSample", got.Decision)
+	}
+	got = s.Sampler().ShouldSample(sdktrace.SamplingParameters{ParentContext: unsampledParent, Name: "step.Other"})
+	if got.Decision != sdktrace.Drop {
+		t.Errorf("other span under an unsampled parent: decision = %v, want Drop", got.Decision)
+	}
+	if AlwaysSampleSpanNames(ParentNeverSampling()).Sampler() != ParentNeverSampling().Sampler() {
+		// Same description is the most a sampler exposes; no names means no wrap.
+		if d := AlwaysSampleSpanNames(ParentNeverSampling()).Sampler().Description(); d != ParentNeverSampling().Sampler().Description() {
+			t.Errorf("no names should leave the sampler alone, got %q", d)
+		}
+	}
+	if d := s.Sampler().Description(); d != "AlwaysSampleSpanNames{ActorWake}+ParentBased{root:AlwaysOffSampler,remoteParentSampled:AlwaysOnSampler,remoteParentNotSampled:AlwaysOffSampler,localParentSampled:AlwaysOnSampler,localParentNotSampled:AlwaysOffSampler}" {
+		t.Errorf("description = %q", d)
 	}
 }

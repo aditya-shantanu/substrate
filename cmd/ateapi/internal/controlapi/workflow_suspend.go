@@ -391,11 +391,14 @@ func (w *ActorWorkflow) ensureSuspendedFinalized(ctx context.Context, actorRef r
 	inProgressSnapshotURI := latestActor.GetStatus().GetInProgressSnapshotUri()
 	externalSnapshot := latestActor.GetStatus().GetExternalSnapshot()
 	if inProgressSnapshotURI != "" {
+		traceID, spanID := producerIDs(ctx)
 		externalSnapshot = &ateapipb.ExternalSnapshot{
-			SnapshotUri:      inProgressSnapshotURI,
-			ContentScope:     commitSnapshotScope(actorRef.Atespace, actorTemplate),
-			ActorTemplateUid: actorTemplate.GetMetadata().GetUid(),
-			ProducedOnNode:   producedOnNode,
+			SnapshotUri:       inProgressSnapshotURI,
+			ContentScope:      commitSnapshotScope(actorRef.Atespace, actorTemplate),
+			ActorTemplateUid:  actorTemplate.GetMetadata().GetUid(),
+			ProducedOnNode:    producedOnNode,
+			ProducedByTraceId: traceID,
+			ProducedBySpanId:  spanID,
 		}
 	}
 

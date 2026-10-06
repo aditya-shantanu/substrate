@@ -28,6 +28,10 @@ import (
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -146,6 +150,77 @@ func (tm *resumeTiming) logAttrs(actorRef resources.ActorRef, actor *ateapipb.Ac
 // ResumeActor executes the workflow to resume a suspended actor. Idempotent:
 // a re-entered workflow fast-forwards past the steps a previous attempt
 // completed, deriving progress from the persisted actor alone.
+// WakeSpanName is the span ateapi opens around a resume that has to restore
+// the actor. With TraceEveryWake it roots a trace of its own (see startWake).
+const WakeSpanName = "ActorWake"
+
+// TraceEveryWake makes startWake root a new trace per wake instead of
+// nesting the wake under the request's trace. ateapi's --trace-every-wake
+// flag sets it; the sampler installed with it always samples WakeSpanName.
+var TraceEveryWake = true
+
+const wakeTraceIDKey = "ate.wake.trace_id"
+
+// startWake opens the wake span for a resume that is past the fast path. Under
+// TraceEveryWake it is a new root linked to the request's span, and the
+// request's span is linked back and tagged with the wake's trace id, so a
+// sampled request leads to its wake and a wake leads to the request that
+// caused it even when that request was not sampled. The snapshot the wake
+// restores from links to the trace that produced it, when that was recorded.
+func startWake(ctx context.Context, actor *ateapipb.Actor) (context.Context, trace.Span) {
+	reqSpan := trace.SpanFromContext(ctx)
+	attrs := ateattr.ActorAttributes(actor)
+	attrs = append(attrs, attribute.String("ate.actor.state", actor.GetStatus().GetState().String()))
+	opts := []trace.SpanStartOption{trace.WithAttributes(attrs...)}
+	if snap := actor.GetStatus().GetExternalSnapshot(); actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_SUSPENDED && snap.GetProducedByTraceId() != "" {
+		if link, ok := snapshotProducerLink(snap); ok {
+			opts = append(opts, trace.WithLinks(link))
+		}
+	}
+	if !TraceEveryWake {
+		return otel.Tracer("controlapi").Start(ctx, WakeSpanName, opts...)
+	}
+	opts = append(opts, trace.WithNewRoot(), trace.WithLinks(trace.Link{
+		SpanContext: reqSpan.SpanContext(),
+		Attributes:  []attribute.KeyValue{attribute.String("ate.link.kind", "request")},
+	}))
+	wakeCtx, wakeSpan := otel.Tracer("controlapi").Start(ctx, WakeSpanName, opts...)
+	reqSpan.AddLink(trace.Link{
+		SpanContext: wakeSpan.SpanContext(),
+		Attributes:  []attribute.KeyValue{attribute.String("ate.link.kind", "wake")},
+	})
+	reqSpan.SetAttributes(attribute.String(wakeTraceIDKey, wakeSpan.SpanContext().TraceID().String()))
+	return wakeCtx, wakeSpan
+}
+
+// snapshotProducerLink builds the link from a wake to the trace that produced
+// the snapshot it restores. Malformed ids yield no link rather than an error:
+// the ids are a convenience for a reader, never a condition of the resume.
+func snapshotProducerLink(snap *ateapipb.ExternalSnapshot) (trace.Link, bool) {
+	tid, err := trace.TraceIDFromHex(snap.GetProducedByTraceId())
+	if err != nil {
+		return trace.Link{}, false
+	}
+	sid, err := trace.SpanIDFromHex(snap.GetProducedBySpanId())
+	if err != nil {
+		return trace.Link{}, false
+	}
+	return trace.Link{
+		SpanContext: trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled, Remote: true}),
+		Attributes:  []attribute.KeyValue{attribute.String("ate.link.kind", "snapshot_producer")},
+	}, true
+}
+
+// producerIDs returns the trace and span id of the span in ctx for recording
+// on a snapshot it produced, or empty strings when ctx carries no valid span.
+func producerIDs(ctx context.Context) (traceID, spanID string) {
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		return "", ""
+	}
+	return sc.TraceID().String(), sc.SpanID().String()
+}
+
 func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.ActorRef) (_ *ateapipb.Actor, resumed bool, err error) {
 	start := time.Now()
 	var actor *ateapipb.Actor
@@ -153,6 +228,7 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	var tele restoreTelemetry
 	var wasRunning bool
 	var tm resumeTiming
+	var wakeTraceID string
 
 	// Recorded before the lease so lease contention still counts as an attempt.
 	// Clean already-running no-ops are skipped: the router resumes per routed
@@ -164,8 +240,11 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 		}
 		w.instruments.recordLifecycleOp(ctx, ateattr.OperationResume, start, err,
 			lifecycleOpAttrs(actor, actorTemplate, tele.SnapshotKind, tele.WireSnapshotScope)...)
-		slog.LogAttrs(ctx, slog.LevelInfo, "Resume timing breakdown",
-			tm.logAttrs(actorRef, actor, time.Since(start), err)...)
+		attrs := tm.logAttrs(actorRef, actor, time.Since(start), err)
+		if wakeTraceID != "" {
+			attrs = append(attrs, slog.String(wakeTraceIDKey, wakeTraceID))
+		}
+		slog.LogAttrs(ctx, slog.LevelInfo, "Resume timing breakdown", attrs...)
 	}()
 
 	// Routed requests call ResumeActor even when the actor is already running.
@@ -204,6 +283,18 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	if wasRunning = actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RUNNING; wasRunning {
 		return actor, false, nil
 	}
+	// Past the fast path: this resume restores the actor. Everything from here
+	// runs under the wake span (its own trace under TraceEveryWake).
+	var wakeSpan trace.Span
+	leaseCtx, wakeSpan = startWake(leaseCtx, actor)
+	wakeTraceID = wakeSpan.SpanContext().TraceID().String()
+	defer func() {
+		if err != nil {
+			wakeSpan.RecordError(err)
+			wakeSpan.SetStatus(otelcodes.Error, err.Error())
+		}
+		wakeSpan.End()
+	}()
 	var created *ateapipb.Actor
 	t = time.Now()
 	created, err = w.ensureVolumesCreated(leaseCtx, actorRef, actor, actorTemplate)

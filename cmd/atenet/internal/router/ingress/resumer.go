@@ -16,6 +16,7 @@ package ingress
 
 import (
 	"context"
+	"errors"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -212,22 +214,35 @@ func (r *ActorResumer) ResumeActor(ctx context.Context, actorRef resources.Actor
 	r.mu.Lock()
 	f, ok := r.flights[key]
 	if !ok {
-		f = newResumeActorFlight()
+		// The flight gets a span of its own under the leader's request, so the
+		// RPC attempts, the parked waits between them and the budget verdict
+		// are one subtree a joiner can link to.
+		flightCtx, flightSpan := otel.Tracer(extproc.ServiceName).Start(
+			trace.ContextWithSpanContext(context.Background(), callerSpanCtx), "ResumeFlight",
+			trace.WithAttributes(ateattr.ActorRefAttributes(actorRef)...))
+		f = newResumeActorFlight(flightSpan.SpanContext())
 		r.flights[key] = f
-		go r.runFlight(f, key, actorRef, reqID, callerSpanCtx)
+		go r.runFlight(flightCtx, flightSpan, f, key, actorRef, reqID)
 	}
 	r.mu.Unlock()
+	span.SetAttributes(attribute.Bool("ate.resume.joined", ok))
+	if ok {
+		// A joiner's own trace shows only a wait; the link says what it waited for.
+		span.AddLink(trace.Link{SpanContext: f.spanCtx, Attributes: []attribute.KeyValue{attribute.String("ate.link.kind", "resume_flight")}})
+	}
 
 	return r.awaitFlight(ctx, f, actorRef, reqID)
 }
 
 // runFlight runs one shared resume for actorRef and publishes its outcome to
 // every attached caller. reqID identifies the caller that created the flight.
-func (r *ActorResumer) runFlight(f *resumeActorFlight, key string, actorRef resources.ActorRef, reqID uint64, callerSpanCtx trace.SpanContext) {
+// flightCtx carries the flight's span, which runFlight ends.
+func (r *ActorResumer) runFlight(flightCtx context.Context, flightSpan trace.Span, f *resumeActorFlight, key string, actorRef resources.ActorRef, reqID uint64) {
+	defer flightSpan.End()
 	// The budget is per flight, not per caller: it starts with the first caller
 	// and later joiners share what remains, so no caller's disconnect can abort
 	// the shared resume. Only cancellation is detached; the trace context is kept.
-	bgCtx, bgCancel := context.WithTimeout(trace.ContextWithSpanContext(context.Background(), callerSpanCtx), r.budget)
+	bgCtx, bgCancel := context.WithTimeout(flightCtx, r.budget)
 	defer bgCancel()
 	attemptCtx := context.WithoutCancel(bgCtx)
 
@@ -249,12 +264,26 @@ func (r *ActorResumer) runFlight(f *resumeActorFlight, key string, actorRef reso
 		if r.retryable(err) {
 			f.signalRetrying()
 			lastRetryErr = err // remember it in case the budget elapses
-			return false, nil  // park: retry until the budget elapses
+			// The wait until the next attempt is otherwise a blank in the trace.
+			flightSpan.AddEvent("resume parked", trace.WithAttributes(
+				attribute.Int("ate.resume.attempt", int(f.attempts.Load())),
+				attribute.String(string(ateattr.ErrorTypeKey), status.Code(err).String())))
+			return false, nil // park: retry until the budget elapses
 		}
 		return false, err
 	})
 
-	r.publish(f, key, flightResult(bgCtx, resumeResp, err, lastRetryErr, reqID))
+	result := flightResult(bgCtx, resumeResp, err, lastRetryErr, reqID)
+	flightSpan.SetAttributes(attribute.Int("ate.resume.attempts", int(f.attempts.Load())))
+	if result.err != nil {
+		flightSpan.RecordError(result.err)
+		if errors.As(result.err, new(*budgetExhaustedError)) {
+			flightSpan.AddEvent("resume budget exhausted")
+		}
+	} else {
+		flightSpan.SetAttributes(attribute.Bool("ate.resume.resumed", result.resumed))
+	}
+	r.publish(f, key, result)
 }
 
 // flightResult classifies the retry loop's terminal state into the shared

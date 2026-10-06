@@ -28,6 +28,9 @@ import (
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -1051,5 +1054,83 @@ func TestActorResumer_FlightKeepsCallerTraceContext(t *testing.T) {
 	}
 	if !got.IsSampled() {
 		t.Error("flight RPC lost the caller's sampled flag")
+	}
+}
+
+// A request that joins another request's in-flight resume links its span to
+// the flight's span, and the flight's span records the attempts it made.
+func TestActorResumer_JoinerLinksToTheFlightSpan(t *testing.T) {
+	testActorRef := resources.ActorRef{Atespace: "team-a", Name: "actor-link"}
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr), sdktrace.WithSampler(sdktrace.AlwaysSample()))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	mock := &resumerMockClient{
+		resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+			entered <- struct{}{}
+			<-release
+			return &ateapipb.ResumeActorResponse{
+				Actor:   &ateapipb.Actor{Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING, WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIps: []string{"10.0.0.1"}}}},
+				Resumed: true,
+			}, nil
+		},
+	}
+	resumer := NewActorResumer(mock)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if _, _, err := resumer.ResumeActor(context.Background(), testActorRef); err != nil {
+			t.Errorf("leader ResumeActor: %v", err)
+		}
+	}()
+	<-entered // the leader's flight is in its RPC, so the next caller joins it
+	go func() {
+		defer wg.Done()
+		if _, st, err := resumer.ResumeActor(context.Background(), testActorRef); err != nil || st.Outcome != ResumeOutcomeJoined {
+			t.Errorf("joiner ResumeActor: outcome=%v err=%v", st.Outcome, err)
+		}
+	}()
+	// Let the joiner attach before the flight completes.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	_ = tp.ForceFlush(context.Background())
+
+	var flight sdktrace.ReadOnlySpan
+	var linked []sdktrace.ReadOnlySpan
+	for _, s := range sr.Ended() {
+		switch s.Name() {
+		case "ResumeFlight":
+			flight = s
+		case "ResumeActor":
+			if len(s.Links()) > 0 {
+				linked = append(linked, s)
+			}
+		}
+	}
+	if flight == nil {
+		t.Fatal("no ResumeFlight span recorded")
+	}
+	if len(linked) != 1 {
+		t.Fatalf("got %d ResumeActor spans with links, want 1 (the joiner)", len(linked))
+	}
+	if got := linked[0].Links()[0].SpanContext.SpanID(); got != flight.SpanContext().SpanID() {
+		t.Errorf("joiner link -> %s, want the flight span %s", got, flight.SpanContext().SpanID())
+	}
+	var attempts int64 = -1
+	for _, kv := range flight.Attributes() {
+		if kv.Key == "ate.resume.attempts" {
+			attempts = kv.Value.AsInt64()
+		}
+	}
+	if attempts != 1 {
+		t.Errorf("flight ate.resume.attempts = %d, want 1", attempts)
 	}
 }
