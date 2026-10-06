@@ -833,3 +833,328 @@ under 5 ms). The Substrate share cannot get much lower without changing how
 the sandbox is driven. The large remaining lever on both sandbox classes is
 checkpoint write bandwidth per node, which bounds pause latency and
 therefore how many actors a node can cycle.
+
+## Tracing study (2026-10-06)
+
+Question: can OpenTelemetry show, for one request from a user, where the
+time of the wake it triggers goes, including the out-of-band parts, and
+can that view exist in production without tracing every request?
+
+### What existed before this study
+
+Verified in Cloud Trace against the 2026-10-03 runs (the cluster exports
+through the GKE managed collector). A request that Envoy's 1% root sampling
+picked produced one trace from Envoy's `ingress` span through the router's
+`ExtProc.RequestHeaders` and `ResumeActor`, ateapi's `step.*`, atelet's
+`Restore` with every GCS range GET of the download, down to a single leaf
+`ateom.Ateom/RestoreWorkload`. Gaps: ateom was opaque (90% of a pause
+wake); atelet's phases were log fields, not spans; no database spans in
+ateapi; no Envoy upstream span, so the actor's own time after the wake was
+invisible; the egress certificate mint chain was an orphan trace; a request
+joining another's flight had no link to it; parking left no events; no span
+links anywhere in the tree. The suspend side is caller-rooted and was never
+sampled under the benchmark, because boomer sends an explicitly unsampled
+traceparent when its probability is 0 (parent-based samplers honor it).
+
+Out-of-band work falls in three classes. Work a request waits for that
+another trace drives (WorkerPool scale-up while parked): the wait is a gap
+between retry attempts, and atecontroller has no trace context, so the
+only stitch is actor uid plus time in logs. Work done earlier whose result
+the wake consumes (the suspend that produced the snapshot, the golden
+build): stitchable by recording the producing trace on the artifact and
+linking. Work forked inside the request (untar goroutine, singleflight
+joins): spans and links in place.
+
+### T0a. Baseline traces, micro-VM, pause, think-scale 15 (05:54-06:04 UTC)
+
+Build b98e7189 (C0 to C4), no code change. `trace_probability=1.0` on the
+load generator produced no client traces: the boomer worker container had
+no `OTEL_EXPORTER_OTLP_ENDPOINT` (every export failed with "missing
+address"), and the agent-session HTTP steps open no span anyway, so the
+wake requests carried no traceparent and Envoy rooted at 1%. 11 wake
+traces for about 1,000 wakes.
+
+Client: WakeFirstTouch n=997 p50 590 / p95 4400 / p99 5000 ms, 76 fail;
+PauseActor n=1111 p50 550 / p95 10000 / p99 14000, 52 fail. The
+micro-VM pause path on a disk-backed node at 100 actors is checkpoint-bound
+as in B8a.
+
+Span breakdown of the 11 traces (ms, p50 / p90 / p99):
+
+| segment | p50 | p90 | p99 |
+|---|---|---|---|
+| ingress (Envoy) | 1056 | 2223 | 2260 |
+| ingress minus ResumeActor (router) | 4.8 | 5.2 | 5.2 |
+| ateapi.Control/ResumeActor minus atelet Restore | 7.5 | 8.4 | 8.7 |
+| atelet Restore minus ateom RestoreWorkload | 58 | 914 | 1354 |
+| ateom RestoreWorkload (opaque) | 623 | 1213 | 1326 |
+| fetchFileFromGCSWithZstd (first activations) | 169 | 562 | 797 |
+
+The 58 to 1354 ms between atelet and ateom is the copy of the local
+checkpoint into the restore directory plus the download on first
+activation, which the trace could not separate: exactly the gap the phase
+spans below close.
+
+### T1. Instrumentation (d6c7d832)
+
+One commit, deployed to every component on the cluster (ateapi, atenet
+router, atelet DaemonSet, ateom-microvm worker image; the gVisor worker
+image follows when the WorkerPool switches class):
+
+- `internal/phasespan`: a Sequence opens one child span per sequential
+  phase, Start one per concurrent phase; names are `restore.<phase>` and
+  `checkpoint.<phase>`, the phase names the log records already use.
+- ateom-gvisor: every restore and checkpoint phase is a span; the egress
+  mint is `restore.egress_prepare` beside the sequence. ateom-microvm: the
+  same, plus `restore.untar_rootfs_upper` for the concurrent untar,
+  `checkpoint.capture` with the three concurrent captures under it,
+  `checkpoint.vmm_snapshot` and `checkpoint.merge_delta` inside the
+  snapshot, and `wakeup_probe` split into `agent_dial`, `crng_reseed` and
+  the probe proper (the log record gained the two new keys).
+- atelet: restore and checkpoint phases as spans, the fetch and prep legs
+  of a restore as two sequences, `checkpoint.retain` for the node-local
+  copy, `checkpoint.persist` on the paused-checkpoint upload.
+- `internal/ateletdial`: otelgrpc client handler, so the certificate mint
+  joins the restore's trace.
+- Router: Envoy `spawn_upstream_span`, so the actor's answer after the
+  wake is its own span. The resume flight is a `ResumeFlight` span under
+  the leader's request; attempts are its children, each parked wait an
+  event with the gRPC code, the verdict an attribute; a joiner's
+  `ResumeActor` span links to it (`ate.resume.joined`).
+- ateapi: `ActorWake` span for every resume past the fast path. With
+  `--trace-every-wake` (default on) it is a new root, always sampled by
+  `serverboot.AlwaysSampleSpanNames`, linked to the request span and
+  linked back from it; the request span and the `Resume timing breakdown`
+  record carry `ate.wake.trace_id`. `ExternalSnapshot` gained
+  `produced_by_trace_id` and `produced_by_span_id`, written by the suspend
+  workflow and linked from the wake that restores the snapshot.
+- `benchmarking/workloads/deploy.sh`: `ACTOR_TRACES_SAMPLER` reaches the
+  glutton template, so the actor's own handler span can appear under the
+  routed request.
+
+Not done: the golden build is still untraced (the template reconciler
+runs under the process context; recording its ids on the golden snapshot
+is the same two fields); atecontroller has no trace context at all;
+ateapi's store calls have no spans (upstream 1455); the GCS SDK's own
+spans stay dev-gated. The metric registry check could not run on the
+laptop (weaver's image is pulled from docker.io, which the local Docker
+cannot reach); the one new attribute follows the shape of its neighbors.
+
+Deploy notes: the atenet deploy rebuilds the envoy-dataplane image with
+the in-cluster buildx builder, which must be scaled up first; the
+benchmark worker container had no OTLP endpoint (set by hand on the
+locust Deployment) and the system pool had no CPU headroom left for a
+rolling locust restart (requests lowered to 100m).
+
+### T1a. Instrumented build, micro-VM, pause, 100 actors, think-scale 15 (06:36-06:45 UTC)
+
+Router root sampling at 100% (`OTEL_TRACES_SAMPLER_ARG=1.0`, mirrored into
+Envoy), `--trace-every-wake` on, glutton actor sampler `parentbased_always_on`.
+
+Client: WakeFirstTouch n=758 p50 6200 / p95 10000 ms, 175 fail (504, park
+budget); PauseActor n=1002 p50 1800 / p95 12000, 175 fail (Aborted,
+another operation in progress). Not a tracing effect: the first three and a
+half minutes ran at the T0a rate (atelet restore p50 0.39 to 0.50 s, by
+minute), then at 06:40 every disk-bound phase ballooned at once and stayed
+there: restore 5 to 10 s, checkpoint 4.5 to 9 s p50 per minute. The pause
+path writes about 1 GiB of sparse memory image per checkpoint plus the
+rootfs upper tar; at the 2.5 pauses/s this run reached, that exceeds the
+node's 890 MiB/s hyperdisk, as in B8a. T0a stayed just under the cliff for
+its ten minutes. Later micro-VM runs use 50 actors.
+
+What the traces now show, 873 complete wakes (ms, p50 / p90 / p99):
+
+| span | p50 | p90 | p99 |
+|---|---|---|---|
+| ActorWake (root) | 4497 | 12540 | 17754 |
+| restore.ateom_restore | 4486 | 12486 | 17702 |
+| restore.vm_restore | 1405 | 3107 | 6436 |
+| restore.upper_join (untar of the rootfs upper tar) | 100 | 4500 | 9244 |
+| restore.lowers (overlay mounts + virtiofsd) | 400 | 1028 | 1616 |
+| restore.prep | 314 | 1893 | 3507 |
+| MintActorCertificate (inside prep, serial on micro-VM) | 118 | 782 | 1186 |
+| restore.vmm_launch | 114 | 411 | 695 |
+| restore.wakeup_probe | 106 | 1206 | 3389 |
+| restore.agent_dial | 96 | 302 | 697 |
+| restore.crng_reseed | 86 | 202 | 426 |
+| restore.resume | 81 | 293 | 502 |
+| restore.download (first activation only) | 0.4 | 594 | 759 |
+
+Two things the breakdown exposes that the log record did not: the
+certificate mint is serial on the micro-VM restore path (gVisor got C2's
+overlap; micro-VM did not), 118 ms at p50 and 782 ms at p90 under load; and
+the upper tar untar is the second-largest phase under disk pressure,
+because the glutton writes about 90 MB of files per lap into the rootfs
+upper, which the micro-VM ships as a tar in both directions.
+
+Wake-rooted sampling, first lesson: 551 of 1424 ActorWake roots were
+three-span traces for actors in CRASHED, because the router retries a
+parked resume several times a second and each attempt passed the fast
+path. The root is now opened only for PAUSED and SUSPENDED actors (commit
+after d6c7d832); other states keep the wake nested in the request's trace.
+
+Request side: the Envoy ingress trace now carries the upstream span
+(`router actor_original_dst egress`, the actor's answer after the wake,
+294 ms on the sampled 8.8 s request), the `ResumeFlight` span, and a
+`ateapi.Control/ResumeActor` server span that holds only
+`step.LoadActorForResume` plus the link to the wake trace. The glutton
+actor's own `otelhttp` span did not arrive: the actor's exporter cannot
+reach the collector from inside the sandbox on this cluster (connection
+reset on the egress path), so the actor-side time stays measured from
+Envoy's upstream span, which is enough for the question asked.
+
+### T1b. Instrumented build, micro-VM, pause, 50 actors, think-scale 15 (06:51-07:01 UTC)
+
+Same build and settings as T1a with half the actors, and
+`trace_probability=1.0` on the load generator, whose worker container now
+has an OTLP endpoint: its gRPC spans root the pause traces, so the
+checkpoint side is traced for the first time.
+
+Client: WakeFirstTouch n=503 p50 710 / p95 7400 / p99 10000 ms, 12 fail;
+PauseActor n=562 p50 690 / p95 5200 / p99 9300, 12 fail. The tail is the
+same disk queue as T1a at a lower duty.
+
+400 complete wakes (ms, p50 / p90 / p99): ActorWake 702 / 4311 / 11144;
+vm_restore 398 / 2437 / 4904; lowers 67 / 484 / 796; upper_join 51 / 517 /
+4003; agent_dial 24 / 125 / 322; vmm_launch 13 / 190 / 316; prep 12 / 305 /
+1196 (mint 7 / 191 / 485); crng_reseed 6 / 102 / 1008; wakeup_probe 6 /
+128 / 504. At p50 the micro-VM wake is 57% reading guest memory back
+(vm_restore), the rest spread over ten phases under 70 ms each; at p99
+the untar of the rootfs upper and vm_restore share the blame.
+
+A pause trace, as it now reads (one of 169 boomer-rooted ones): PauseActor
+594 ms = ateapi 7 ms + atelet Checkpoint 586 ms = ateom 474 (prep 1, pause
+6, capture 373 of which vmm_snapshot 373 and rootfs_upper 161 concurrent,
+teardown 93) + local_prune 99 + persist 1 + dirs_reset 11. Every phase
+that the log record names is a span, and the concurrent captures are
+visibly concurrent.
+
+### Side finding: a micro-VM golden does not survive a worker image change
+
+After the worker image rollout, every actor created from the existing
+`openclaw-microvm` template (golden e54f5d51, built by the previous worker
+pod) hung at the wakeup probe: the guest restored, kata-agent answered,
+and the gateway never served `/health` in 300 s (two attempts, oc-m3 and
+oc-m4). A new template with the same spec, whose golden the new worker
+built (`openclaw-microvm-t`), woke in 18.9 s on the first try. The glutton
+template had been recreated by `deploy.sh` and so never showed it. Not
+diagnosed; the wake trace of oc-m3 (10b2e0a0aad4d1260372efacdab91c44)
+shows the restore phases complete in normal time and 300 s in
+`restore.wakeup_probe`, which says the guest is up but the workload inside
+it is not answering. Worth an upstream issue once reproduced on main.
+
+### OpenClaw on micro-VM, traced (oc-m6, 07:11-07:16 UTC)
+
+The personal-agent image (4 GiB, state dir on guest tmpfs, see the
+OpenClaw snapshot notes) driven through the router with the same action
+sequence as before, router at 100%, every trace below pulled from Cloud
+Trace by `ate.actor.name:oc-m6`. Fifteen traces tell the whole run:
+
+| time | trace | duration | what it says |
+|---|---|---|---|
+| 11:20.819 | ingress (504) | 10.0 s | the first request: ResumeFlight 37.2 s, parked past the 10 s budget, request span tagged with the wake's trace id |
+| 11:20.822 | ActorWake (97 spans) | 37.2 s | download 2.6 s, vm_restore 0.84 s, wakeup_probe 33.3 s, everything else under 60 ms |
+| 11:50.911 | ingress (200) | 30.5 s | the second request joined the first flight (`ate.resume.joined=true`, link to the flight span), then the upstream span is 23.4 s: the gateway's first chat turn |
+| 12:31 to 12:54 | 3 ingress | 0.6 to 1.1 s | resident turns, flight 1 ms, upstream is all of it |
+| 13:11 | PauseActor (24 spans) | 1.9 s | checkpoint.capture with vmm_snapshot and rootfs_upper side by side |
+| 13:16 | ingress + ActorWake | 3.3 s | wake 1.5 s (vm_restore most of it) plus 1.8 s of agent time |
+| 14:57 | ingress + ActorWake | 5.6 s | wake 2.3 s plus 3.3 s of agent time after 65 s paused |
+| 15:40 | ingress + ActorWake | 2.2 s | wake from the retained suspend copy 1.8 s plus 0.4 s of agent time |
+
+The 33 s in wakeup_probe on the golden wake is the gateway finishing its
+own startup after the restore: the golden was taken as soon as `/health`
+first answered, so the memory index build and lazy module loads land on
+the first wake of every actor made from it. Earlier in the day, from a
+golden the previous worker built, the same wake took 0.7 s in the probe;
+the difference is where in the gateway's startup the golden caught it.
+Either way the trace makes the split between Substrate (3.9 s) and the
+workload (33 s) plain, which no Substrate log could.
+
+The two SuspendActor calls were issued by kubectl-ate without `--trace`
+and fell under ateapi's 10% root ratio; neither was sampled. The gVisor
+run below forces them.
+
+### Correction: the worker pod ran under a 2-CPU limit from 06:07 UTC
+
+Found while reading T1d (gVisor, pause, 100 actors, 07:21-07:31 UTC: wake
+p50 7.7 s, 295 failures, against 190 ms in B2 on Friday). The traces said
+every ateom phase was 20 to 50x slower at once, including CPU-only ones
+(pause_create 2.1 s p50 against 34 ms, the certificate mint 1.2 s against
+5 ms), which no disk explains. The worker pod's cgroup had `cpu.max
+200000 100000` and 8,073 s of throttled time, and the 278 gVisor sandbox
+cgroups sit under the pod's cgroup, so 100 actors shared two cores.
+`kubectl get workerpool --show-managed-fields` attributes
+`spec.template.resources.limits.cpu: "2"` (and `ate.dev/kvm: 1`) to a
+`kubectl-patch` at 06:06:43 UTC, not to `deploy.sh` and not to this
+session. Every run from T1a on, and the OpenClaw micro-VM run, used a
+worker pod created after that patch; T0a did not. The micro-VM sandboxes
+run outside the pod cgroup, so there the limit hit ateom, virtiofsd and
+the tar and untar of the rootfs upper, which is the T1a collapse at 06:40
+(the backlog of pod-side work, then disk queueing on top), not a disk cliff
+on its own. The T1a and T1b phase tables above remain correct as traces of
+what happened; they are not representative of the build.
+
+Removing the limit from the WorkerPool is a cluster change this session
+could not make (denied by the auto-mode permission classifier). The
+gVisor and micro-VM latency runs need repeating once it is gone:
+
+```
+kubectl --context gke_gke-ai-eco-dev_us-central1-a_resume-lat -n benchmark-workloads \
+  patch workerpool benchmark-ateom --type=json \
+  -p='[{"op":"remove","path":"/spec/template/resources/limits/cpu"},{"op":"remove","path":"/spec/template/resources/requests/cpu"}]'
+```
+
+### T1f. Production sampling check: router at 1%, gVisor, pause, 100 actors (07:39-07:44 UTC)
+
+Router `OTEL_TRACES_SAMPLER_ARG=0.01` (Envoy RandomSampling 1%), load
+generator `trace_probability=0` (explicitly unsampled traceparent, the
+worst case for the control plane), `--trace-every-wake` on. Five minutes,
+still under the 2-CPU limit, so the latencies are not the point.
+
+| | count |
+|---|---|
+| routed requests (router `ResumeActor result`) | 1,260 |
+| request traces in Cloud Trace (`root:ingress`) | 27 (2.1%) |
+| resumes past the fast path (ateapi `Resume timing breakdown`) | 526, every one carrying `ate.wake.trace_id` |
+| wake traces in Cloud Trace (`root:ActorWake`) | 532, all complete (36 spans for a pause wake, 52 with the download) |
+
+Every wake has a complete trace while the request stream is sampled at
+one in fifty, and each wake trace carries the link to the request span
+that caused it (unsampled, so the link points at a span that was never
+exported, which is what makes the `ate.wake.trace_id` on the log record
+the other half of the join). Cost at this rate: about 60 spans per second
+from wakes against 20 from requests.
+
+### OpenClaw on gVisor, traced (oc-g6, 07:47-07:52 UTC)
+
+Same sequence as oc-m6 on the gVisor pool (template `openclaw-gvisor-t`,
+fresh golden), router at 1%, pause and suspend commands issued with
+`kubectl ate --trace`, worker pod still under the 2-CPU limit. Ten traces
+cover the run; the wakes are all `ActorWake` roots even though the
+requests were sampled at 1%:
+
+| time | trace | duration | phases |
+|---|---|---|---|
+| 47:23 | ActorWake (72 spans) | 4.9 s | download 1.66, app_restore 2.27, wakeup_probe 0.63 (request 15.6 s, the rest agent time) |
+| 47:55 | PauseActor | 2.9 s | runsc checkpoint 2.67 |
+| 48:01 | ActorWake | 3.3 s | app_restore 2.79, probe 0.05 |
+| 48:58 | PauseActor | 0.95 s | checkpoint 0.70 |
+| 49:02 | ActorWake | 4.9 s | app_restore 4.6 |
+| 49:40 | PauseActor | 0.91 s | checkpoint 0.63 |
+| 50:44 | ActorWake | 4.0 s | app_restore 3.5, probe 0.24 |
+| 51:01 | SuspendActor (106 spans) | 2.9 s | checkpoint 0.63, teardown 0.13, persist 1.97 (pages.img upload 1.86, two small files 0.13 each, manifest 0.10), retain 0.3 ms, dirs_reset 0.12 |
+| 51:24 | ActorWake | 3.7 s | from the retained copy, no download; app_restore 3.2, probe 0.31 |
+| 51:41 | SuspendActor (116 spans) | 3.7 s | checkpoint 1.36, persist 1.99 |
+
+The suspend trace is the first complete one of the night: the three
+`sendFileToGCSWithZstd` uploads run concurrently under
+`checkpoint.persist` and the 285 MB zstd of pages.img is 95% of it.
+app_restore at 2 to 4.6 s is `runsc restore` of a 1.3 GB image on a
+throttled pod; Friday's untouched number for the same image was 0.17 to
+0.29 s.
+
+Cloud Trace's read API (v1) does not return span links, so the wake to
+request and wake to snapshot-producer links cannot be checked from the
+API; they are written (the OTel SDK test in `wake_span_test.go` covers
+them) and `ate.wake.trace_id` on the request span and the timing record
+is the join that is visible everywhere.
