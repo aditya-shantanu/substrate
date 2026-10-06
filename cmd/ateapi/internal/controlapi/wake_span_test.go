@@ -112,6 +112,21 @@ func TestStartWake_RootsALinkedTraceUnderTraceEveryWake(t *testing.T) {
 	}
 }
 
+func TestStartWake_NestsUnderTheRequestForAnUnwakeableState(t *testing.T) {
+	installRecorder(t)
+	prev := TraceEveryWake
+	TraceEveryWake = true
+	t.Cleanup(func() { TraceEveryWake = prev })
+
+	reqCtx, reqSpan := otel.Tracer("test").Start(context.Background(), "ateapi.Control/ResumeActor")
+	_, wakeSpan := startWake(reqCtx, wakeTestActor(ateapipb.ActorState_ACTOR_STATE_CRASHED, nil))
+	wakeSpan.End()
+	reqSpan.End()
+	if wakeSpan.SpanContext().TraceID() != reqSpan.SpanContext().TraceID() {
+		t.Errorf("crashed actor: wake span trace %s, want the request's %s", wakeSpan.SpanContext().TraceID(), reqSpan.SpanContext().TraceID())
+	}
+}
+
 func TestStartWake_NestsUnderTheRequestWhenOff(t *testing.T) {
 	installRecorder(t)
 	prev := TraceEveryWake

@@ -177,7 +177,11 @@ func startWake(ctx context.Context, actor *ateapipb.Actor) (context.Context, tra
 			opts = append(opts, trace.WithLinks(link))
 		}
 	}
-	if !TraceEveryWake {
+	// A new root only for a state a resume can actually wake from. A CRASHED
+	// or DELETING actor fails at the next step, and the router retries such a
+	// resume several times a second while the request is parked; rooting a
+	// trace per attempt would bury the real wakes under error traces.
+	if !TraceEveryWake || !wakeableState(actor.GetStatus().GetState()) {
 		return otel.Tracer("controlapi").Start(ctx, WakeSpanName, opts...)
 	}
 	opts = append(opts, trace.WithNewRoot(), trace.WithLinks(trace.Link{
@@ -191,6 +195,15 @@ func startWake(ctx context.Context, actor *ateapipb.Actor) (context.Context, tra
 	})
 	reqSpan.SetAttributes(attribute.String(wakeTraceIDKey, wakeSpan.SpanContext().TraceID().String()))
 	return wakeCtx, wakeSpan
+}
+
+// wakeableState reports whether a resume from state restores the actor.
+func wakeableState(state ateapipb.ActorState) bool {
+	switch state {
+	case ateapipb.ActorState_ACTOR_STATE_PAUSED, ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
+		return true
+	}
+	return false
 }
 
 // snapshotProducerLink builds the link from a wake to the trace that produced
