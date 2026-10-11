@@ -54,6 +54,13 @@ const (
 	// ResourceKVM grants /dev/kvm, which the micro-VM runtime needs to create a
 	// VM (cloud-hypervisor fails with EPERM on VmCreate without it).
 	ResourceKVM = "ate.dev/kvm"
+
+	// ResourceFUSE grants /dev/fuse, which nydusd opens to serve a lazily
+	// loaded image rootfs to a gVisor worker. Like /dev/kvm it is denied to a
+	// container by the device controller unless kubelet's device manager
+	// adds it, so it is advertised as an extended resource rather than
+	// mounted or obtained by running the worker privileged.
+	ResourceFUSE = "ate.dev/fuse"
 )
 
 // SandboxDevices are the host devices a sandbox runtime needs a grant for.
@@ -64,6 +71,7 @@ const (
 // default allow-list, so the worker gets it as an ordinary bind mount instead.
 var SandboxDevices = []HostDevice{
 	{ResourceName: ResourceKVM, Path: "/dev/kvm"},
+	{ResourceName: ResourceFUSE, Path: "/dev/fuse"},
 }
 
 // HostDevice is a device node advertised to kubelet under ResourceName.
