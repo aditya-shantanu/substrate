@@ -530,6 +530,9 @@ func (s *Store) cachedImage(digest v1.Hash) (*Image, error) {
 		if s.nydusBackend == "" {
 			return nil, nil // lazy loading disabled since the record was written: re-pull decides
 		}
+		if host, _, _ := strings.Cut(rec.Nydus.Repo, "/"); !strings.Contains(host, ".") {
+			return nil, nil // pre-registry-host record: re-pull rewrites it
+		}
 		if st, err := os.Stat(rec.Nydus.Bootstrap); err != nil || st.Size() == 0 {
 			return nil, nil
 		}
