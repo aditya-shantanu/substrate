@@ -15,6 +15,7 @@
 package controllers
 
 import (
+	"os"
 	"slices"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -236,6 +237,7 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 	applyWorkerPoolPodTemplate(podSpecAC, containerAC, wp.Spec.Template)
 	applySandboxClassToleration(podSpecAC, wp.Spec.DefaultSandboxClass())
 	maybeApplyMicroVMPodShape(podSpecAC, containerAC, wp.Spec.DefaultSandboxClass())
+	maybeApplyLazyImagePodShape(containerAC, wp.Spec.DefaultSandboxClass())
 	podSpecAC.WithContainers(containerAC)
 	podSpecAC.WithTerminationGracePeriodSeconds(workerTerminationGracePeriodSeconds)
 
@@ -413,6 +415,18 @@ func ateomSecurityContext(class atev1alpha1.SandboxClass) *corev1ac.SecurityCont
 			WithAdd(ateomGvisorCapabilities...)).
 		WithSeccompProfile(corev1ac.SeccompProfile().
 			WithType(corev1.SeccompProfileTypeUnconfined))
+}
+
+// maybeApplyLazyImagePodShape requests the /dev/fuse device for gVisor workers
+// when lazy image loading is enabled on the controller (ATE_WORKER_FUSE=true).
+// nydusd serves a Nydus image's rootfs through FUSE inside the worker; the
+// device is granted through atelet's device plugin, the same path /dev/kvm
+// takes for micro-VM workers, so the worker stays unprivileged.
+func maybeApplyLazyImagePodShape(containerAC *corev1ac.ContainerApplyConfiguration, sandboxClass atev1alpha1.SandboxClass) {
+	if sandboxClass == atev1alpha1.SandboxClassMicroVM || os.Getenv("ATE_WORKER_FUSE") != "true" {
+		return
+	}
+	addDeviceResourceLimits(containerAC, deviceplugin.ResourceFUSE)
 }
 
 // maybeApplyMicroVMPodShape adds the /dev/kvm device and node placement a
