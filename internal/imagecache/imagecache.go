@@ -186,6 +186,7 @@ type Store struct {
 	keychain authn.Keychain
 
 	localhostRegistryReplacement string
+	nydusBackend                 string
 
 	// platform overrides the default pull platform (linux/GOARCH), for
 	// callers pulling on a different architecture than the images' target.
@@ -289,16 +290,20 @@ type Image struct {
 	// Config is the OCI image config (entrypoint, env, ...).
 	Config v1.Config
 	// LayerDirs are the absolute cached layer directories, bottom-most layer
-	// first. Each contains the unpacked tree under "fs/".
+	// first. Each contains the unpacked tree under "fs/". Empty for a Nydus
+	// image, whose rootfs is mounted lazily instead (see Nydus).
 	LayerDirs []string
+	// Nydus is set for a lazily-loaded image (see nydus.go).
+	Nydus *NydusSpec
 }
 
 // imageRecord is the persisted form of a cached image, stored under
 // manifests/<algorithm>/<hex>.json.
 type imageRecord struct {
-	Version int       `json:"version"`
-	Config  v1.Config `json:"config"`
-	DiffIDs []string  `json:"diffIDs"`
+	Version int          `json:"version"`
+	Config  v1.Config    `json:"config"`
+	DiffIDs []string     `json:"diffIDs"`
+	Nydus   *nydusRecord `json:"nydus,omitempty"`
 }
 
 // New opens (creating if needed) the layer pool rooted at root and runs
@@ -521,6 +526,16 @@ func (s *Store) cachedImage(digest v1.Hash) (*Image, error) {
 		return nil, fmt.Errorf("while decoding image record for %s: %w", digest, err)
 	}
 
+	if rec.Nydus != nil {
+		if s.nydusBackend == "" {
+			return nil, nil // lazy loading disabled since the record was written: re-pull decides
+		}
+		if st, err := os.Stat(rec.Nydus.Bootstrap); err != nil || st.Size() == 0 {
+			return nil, nil
+		}
+		return &Image{Digest: digest, Config: rec.Config, Nydus: s.nydusSpec(rec.Nydus)}, nil
+	}
+
 	layerDirs := make([]string, len(rec.DiffIDs))
 	for i, d := range rec.DiffIDs {
 		diffID, err := v1.NewHash(d)
@@ -571,6 +586,16 @@ func (s *Store) pullWith(ctx context.Context, parsedRef name.Reference, digest v
 	img, err := remote.Image(digestRef, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("in remote.Image: %w", err)
+	}
+
+	if s.nydusBackend != "" {
+		man, err := img.Manifest()
+		if err != nil {
+			return nil, fmt.Errorf("while reading image manifest: %w", err)
+		}
+		if bi := nydusBootstrapLayer(man); bi >= 0 {
+			return s.pullNydus(ctx, parsedRef.Context().RepositoryStr(), digest, img, bi)
+		}
 	}
 
 	cfgFile, err := img.ConfigFile()

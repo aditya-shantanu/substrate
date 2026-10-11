@@ -55,6 +55,9 @@ type OverlaySpec struct {
 	// fs/), bottom-most layer first — the order the image manifest lists
 	// them. Consumers reverse this into overlayfs's top-first lowerdir.
 	Layers []string `json:"layers"`
+	// Nydus, when set, replaces Layers: the rootfs lower is a lazy nydusd
+	// mount of the image instead of unpacked layer directories.
+	Nydus *NydusSpec `json:"nydus,omitempty"`
 	// ExtraDirs are absolute in-rootfs directories the consumer creates after
 	// mounting (they land in the actor's private upper): bind-mount targets
 	// that must exist for the runtime to attach them, e.g. the actor identity

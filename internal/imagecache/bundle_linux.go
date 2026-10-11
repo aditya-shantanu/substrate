@@ -49,6 +49,9 @@ func SetupBundleRootfs(bundlePath string) error {
 	if spec == nil {
 		return nil
 	}
+	if spec.Nydus != nil {
+		return setupNydusRootfs(bundlePath, spec)
+	}
 
 	for _, layerDir := range spec.Layers {
 		if err := FinalizeLayer(layerDir); err != nil {
@@ -328,6 +331,15 @@ func setOpaque(root *os.Root, rel string) error {
 // single call cleans up all of an actor's bundle mounts. Missing mounts are
 // not an error.
 func UnmountAllUnder(dir string) error {
+	// Lazily-mounted bundles own a nydusd each; stop them before the mounts go.
+	if pids, _ := filepath.Glob(filepath.Join(dir, "*", "bundles", "*", "nydusd.pid")); len(pids) > 0 {
+		for _, p := range pids {
+			killNydusd(filepath.Dir(p))
+		}
+	} else if _, err := os.Stat(filepath.Join(dir, "nydusd.pid")); err == nil {
+		killNydusd(dir)
+	}
+
 	points, err := mountPointsUnder(dir)
 	if err != nil {
 		return err

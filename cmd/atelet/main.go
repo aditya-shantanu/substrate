@@ -102,6 +102,7 @@ var (
 	imageCredentialProviderBinDir = pflag.String("image-credential-provider-bin-dir", "", "Directory holding the credential provider executables named by --image-credential-provider-config. Required when that flag is set.")
 
 	localhostRegistryReplacement = pflag.String("localhost-registry-replacement", "", "The replacement registry endpoint for localhost and/or loopback IP addresses, useful for local development. for example kind-registry:5000")
+	nydusBackendURL              = pflag.String("nydus-backend-url", "", "Base URL of a registry (proxy) that nydusd fetches blobs from, e.g. http://$(HOST_IP):5000. Enables lazy loading of Nydus-converted images; empty disables it.")
 	imageCacheDir                = pflag.String("image-cache-dir", ateletpath.ImageCacheDir, "Directory for the node-local OCI image layer cache. Must be on the volume shared with the ateom pods (the cached layers are their overlay lowerdirs), and on a disk sized for both capacity and IOPS: unpack throughput is gated by the volume's IOPS.")
 
 	showVersion  = pflag.Bool("version", false, "Print version and exit.")
@@ -219,6 +220,7 @@ func main() {
 		imagecache.WithLocalhostRegistryReplacement(*localhostRegistryReplacement),
 		imagecache.WithActorsDir(nodepath.ActorsDir),
 		imagecache.WithMinAge(*imageCacheMinAge),
+		imagecache.WithNydusBackend(os.ExpandEnv(*nydusBackendURL)),
 		imagecache.WithMeter(otel.Meter("atelet")),
 	)
 	if err != nil {

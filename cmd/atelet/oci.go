@@ -132,6 +132,7 @@ func prepareOCIDirectory(ctx context.Context, imageCache *imagecache.Store, acto
 	if err := imagecache.WriteSpec(bundlePath, &imagecache.OverlaySpec{
 		ImageDigest:  img.Digest.String(),
 		Layers:       img.LayerDirs,
+		Nydus:        img.Nydus,
 		ExtraDirs:    extraDirs,
 		ImageVolumes: imageVolumes,
 	}); err != nil {

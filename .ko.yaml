@@ -19,6 +19,8 @@ defaultPlatforms:
   - linux/arm64
 
 baseImageOverrides:
+  # ateom-gvisor mounts Nydus images lazily and needs the nydusd daemon.
+  github.com/agent-substrate/substrate/cmd/ateom-gvisor: us-east4-docker.pkg.dev/gke-ai-eco-dev/rlbench/ateom-base-nydus:v2.4.5@sha256:e5ff770be063f22ed27cbd4e026983c54a0efb21b1133dc42ad74e1be277b023
   github.com/agent-substrate/substrate/demos/sandbox: alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
   # atelet needs glibc to run the node's kubelet credential provider, which
   # some platforms ship dynamically linked (e.g. AKS, GKE Ubuntu).
