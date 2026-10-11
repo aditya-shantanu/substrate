@@ -559,7 +559,9 @@ func TestUnpackLayer_HardlinkEscape(t *testing.T) {
 	}
 }
 
-func TestUnpackLayer_RejectSpecialFiles(t *testing.T) {
+func TestUnpackLayer_SkipsSpecialFiles(t *testing.T) {
+	// Device nodes and FIFOs in a layer (a /dev/null left by a build step) are
+	// skipped, not fatal: atelet has no CAP_MKNOD and the runtime supplies /dev.
 	tests := []struct {
 		name     string
 		typeflag byte
@@ -570,12 +572,18 @@ func TestUnpackLayer_RejectSpecialFiles(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, err := runUnpack(t, []tarEntry{{name: "weird", typeflag: tc.typeflag}})
-			if err == nil {
-				t.Fatalf("unpackLayer succeeded, want unhandled-typeflag error")
+			dir, _, err := runUnpack(t, []tarEntry{
+				{name: "weird", typeflag: tc.typeflag},
+				{name: "ok", typeflag: tar.TypeReg, body: "hello"},
+			})
+			if err != nil {
+				t.Fatalf("unpackLayer failed on a layer with a special file: %v", err)
 			}
-			if !strings.Contains(err.Error(), "unhandled tar entry typeflag") {
-				t.Errorf("error = %q, want it to mention 'unhandled tar entry typeflag'", err.Error())
+			if _, statErr := os.Lstat(filepath.Join(dir, "weird")); !os.IsNotExist(statErr) {
+				t.Errorf("special entry was materialized (stat err=%v), want it skipped", statErr)
+			}
+			if _, statErr := os.Stat(filepath.Join(dir, "ok")); statErr != nil {
+				t.Errorf("regular file after the special entry missing: %v", statErr)
 			}
 		})
 	}

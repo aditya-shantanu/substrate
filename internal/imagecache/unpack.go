@@ -261,6 +261,18 @@ func unpackLayer(ctx context.Context, tarData io.Reader, root *os.Root) (*whiteo
 				return nil, fmt.Errorf("while creating hardlink src=%q target=%q: %w", name, linkname, err)
 			}
 
+		case tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
+			// Device nodes and FIFOs baked into an image layer (a /dev/null left
+			// behind by a build step is the usual case) cannot be created here:
+			// atelet unpacks without CAP_MKNOD. Every rootless unpacker skips
+			// them, and the sandbox runtime provides /dev itself, so skipping
+			// is also the right semantics. Before this, one such entry failed
+			// the whole image pull ("unhandled tar entry typeflag \"3\"") and
+			// every golden snapshot for that image family crashed.
+			slog.WarnContext(ctx, "Skipping device or FIFO tar entry",
+				slog.String("typeflag", string([]byte{hdr.Typeflag})), slog.String("name", name))
+			continue
+
 		default:
 			tfStr := string([]byte{hdr.Typeflag})
 			slog.ErrorContext(ctx, "Unhandled tar entry typeflag", slog.String("typeflag", tfStr), slog.Any("hdr", hdr))
