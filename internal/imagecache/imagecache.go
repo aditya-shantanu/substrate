@@ -594,7 +594,10 @@ func (s *Store) pullWith(ctx context.Context, parsedRef name.Reference, digest v
 			return nil, fmt.Errorf("while reading image manifest: %w", err)
 		}
 		if bi := nydusBootstrapLayer(man); bi >= 0 {
-			return s.pullNydus(ctx, parsedRef.Context().RepositoryStr(), digest, img, bi)
+			// The repo carries its registry host so a single registry proxy can
+			// route blob fetches to the right upstream (nydusd's registry
+			// backend knows only one host).
+			return s.pullNydus(ctx, parsedRef.Context().RegistryStr()+"/"+parsedRef.Context().RepositoryStr(), digest, img, bi)
 		}
 	}
 
