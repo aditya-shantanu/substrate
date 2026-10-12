@@ -1,0 +1,49 @@
+# Per-node pruner for the shared Nydus chunk cache on the Substrate workers (cluster rlbench-sub).
+# atelet's image GC walks layers/ only; nydus-cache grows ~15-30 GB per 200-image wave per node and
+# waves never reuse images, so chunk files idle for > 30 min are safe to drop (nydusd keeps open
+# fds on files it is still using). Apply with:
+#   KUBECONFIG=~/rlbench/kubeconfig-sub kubectl apply -f ~/rlbench/nydus-cache-prune.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nydus-cache-prune
+  namespace: ate-system
+  labels: {app: nydus-cache-prune}
+spec:
+  selector: {matchLabels: {app: nydus-cache-prune}}
+  template:
+    metadata: {labels: {app: nydus-cache-prune}}
+    spec:
+      nodeSelector: {ate.dev/pool: substrate}
+      tolerations: [{operator: Exists}]
+      containers:
+      - name: prune
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          while true; do
+            # Treat each blob's files as one family (data, data.chunk_map, meta) and only drop
+            # families with no file touched in the last 30 min; delete the chunk_map FIRST so a
+            # new nydusd never sees a map claiming chunks that a recreated data file lacks.
+            n=0
+            for d in /cache/*.blob.data; do
+              [ -e "$d" ] || continue
+              id=${d%.blob.data}
+              if [ -z "$(find "$d" "$d.chunk_map" "$id.blob.meta" -mmin -30 2>/dev/null)" ]; then
+                rm -f "$d.chunk_map"; rm -f "$d"; rm -f "$id.blob.meta"; n=$((n+1))
+              fi
+            done
+            # Orphan maps/metas without data are corruption traps: remove them.
+            for m in /cache/*.blob.data.chunk_map; do [ -e "$m" ] && [ ! -e "${m%.chunk_map}" ] && rm -f "$m"; done
+            for m in /cache/*.blob.meta; do [ -e "$m" ] && [ ! -e "${m%.blob.meta}.blob.data" ] && rm -f "$m"; done
+            echo "$(date -u +%FT%TZ) pruned_families=$n used=$(df -P /cache | awk 'NR==2{print $5}')"
+            sleep 120
+          done
+        volumeMounts: [{name: cache, mountPath: /cache}]
+        resources: {requests: {cpu: 20m, memory: 32Mi}}
+        securityContext: {runAsUser: 0}
+      volumes:
+      - name: cache
+        hostPath: {path: /var/lib/ate/image-cache/nydus-cache, type: DirectoryOrCreate}
