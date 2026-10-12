@@ -48,6 +48,11 @@ var nydusdReapers errgroup.Group
 // registry proxy and the node-wide chunk cache) and overlay the bundle's
 // private upper on top of it, so the workload sees the same rootfs it would
 // over unpacked layers.
+// nydusReadMergeBytes is the on-demand read amplification / prefetch merge size. 1 MiB
+// produced ~290 registry requests per actor-minute, which at 1,600 actors exceeded Artifact
+// Registry's 60k requests/min regional quota; 4 MiB trades bytes for request count.
+const nydusReadMergeBytes = 4 << 20
+
 func setupNydusRootfs(bundlePath string, spec *OverlaySpec) error {
 	n := spec.Nydus
 	rootfs := filepath.Join(bundlePath, "rootfs")
@@ -73,7 +78,9 @@ func setupNydusRootfs(bundlePath string, spec *OverlaySpec) error {
 				"type": "registry",
 				"config": map[string]any{
 					"scheme": backend.Scheme, "host": backend.Host, "repo": n.Repo,
-					"timeout": 30, "connect_timeout": 5, "retry_limit": 2,
+					// Registry rate limits (HTTP 429) surface as EIO in the guest once
+					// nydusd gives up, so allow more, slower retries than the defaults.
+					"timeout": 60, "connect_timeout": 5, "retry_limit": 4,
 				},
 			},
 			"cache": map[string]any{"type": "blobcache", "config": map[string]any{"work_dir": n.CacheDir}},
@@ -82,7 +89,10 @@ func setupNydusRootfs(bundlePath string, spec *OverlaySpec) error {
 		"digest_validate": false,
 		"iostats_files":   false,
 		"enable_xattr":    true,
-		"fs_prefetch":     map[string]any{"enable": true, "threads_count": 2, "merging_size": 1048576},
+		"fs_prefetch":     map[string]any{"enable": true, "threads_count": 2, "merging_size": nydusReadMergeBytes},
+		// Registry quotas count requests, not bytes: amplify each on-demand read so
+		// a fleet of per-actor nydusd instances issues fewer, larger range fetches.
+		"amplify_io": nydusReadMergeBytes,
 	}
 	cfgBytes, _ := json.Marshal(cfg)
 	cfgPath := filepath.Join(bundlePath, "nydusd.json")
