@@ -85,6 +85,9 @@ type fakeWorker struct {
 	// restoreErr, if set, fails every RestoreWorkload after it recorded the
 	// request, as a worker that could not start the sandbox would.
 	restoreErr error
+	// checkpointErr, if set, fails every CheckpointWorkload after it recorded
+	// the request, before it writes any snapshot file.
+	checkpointErr error
 	// actorDirs records the ActorDirs each RPC arrived with, by RPC name.
 	actorDirs map[string]*ateworkerpb.ActorDirs
 	// preserveRestoreDir records the PreserveRestoreDir flag from the most
@@ -134,6 +137,9 @@ func (f *fakeWorker) RunWorkload(_ context.Context, req *ateworkerpb.RunWorkload
 func (f *fakeWorker) CheckpointWorkload(ctx context.Context, req *ateworkerpb.CheckpointWorkloadRequest) (*ateworkerpb.CheckpointWorkloadResponse, error) {
 	f.recordActorDirs("CheckpointWorkload", req.GetActorDirs())
 	f.recordFidelity("CheckpointWorkload", req.GetFidelity())
+	if f.checkpointErr != nil {
+		return nil, f.checkpointErr
+	}
 	dir := req.GetActorDirs().GetCheckpointDir()
 	names := make([]string, 0, len(f.snapshotFiles))
 	for name, body := range f.snapshotFiles {
@@ -3510,22 +3516,22 @@ func TestRestoreStopsRetryingAfterConsecutiveUnavailableFailures(t *testing.T) {
 		}
 	}
 
-	failRetryably(maxConsecutiveRetryableRestoreFailures-1, "at first")
+	failRetryably(maxConsecutiveRetryableWorkerFailures-1, "at first")
 	if got := restoreCode(); got != codes.Internal {
-		t.Fatalf("Restore %d code = %v, want %v", maxConsecutiveRetryableRestoreFailures, got, codes.Internal)
+		t.Fatalf("Restore %d code = %v, want %v", maxConsecutiveRetryableWorkerFailures, got, codes.Internal)
 	}
 
 	// Giving up starts the count over, and so does a successful restore.
-	failRetryably(maxConsecutiveRetryableRestoreFailures-1, "after giving up")
+	failRetryably(maxConsecutiveRetryableWorkerFailures-1, "after giving up")
 	a.worker.restoreErr = nil
 	if got := restoreCode(); got != codes.OK {
 		t.Fatalf("successful Restore code = %v, want %v", got, codes.OK)
 	}
-	failRetryably(maxConsecutiveRetryableRestoreFailures-1, "after a success")
+	failRetryably(maxConsecutiveRetryableWorkerFailures-1, "after a success")
 
 	// Restoring another snapshot starts a new streak.
 	restoreReq = a.restoreRequest(t, a.checkpointed(t, "pause-snap-2", 2))
-	failRetryably(maxConsecutiveRetryableRestoreFailures-1, "of another snapshot")
+	failRetryably(maxConsecutiveRetryableWorkerFailures-1, "of another snapshot")
 
 	// So does a failure that crashes the actor: the control plane's crash
 	// handling does not call Terminate, so nothing else would clear the count
@@ -3534,7 +3540,7 @@ func TestRestoreStopsRetryingAfterConsecutiveUnavailableFailures(t *testing.T) {
 	if got := restoreCode(); got != codes.Internal {
 		t.Fatalf("Restore with a worker Internal error: code = %v, want %v", got, codes.Internal)
 	}
-	failRetryably(maxConsecutiveRetryableRestoreFailures-1, "after a crash")
+	failRetryably(maxConsecutiveRetryableWorkerFailures-1, "after a crash")
 
 	// So does a failure in atelet's own steps before the worker call, here a
 	// volume that does not mount.
@@ -3544,7 +3550,7 @@ func TestRestoreStopsRetryingAfterConsecutiveUnavailableFailures(t *testing.T) {
 		t.Fatalf("Restore with a failing volume mount: code = %v, want %v", got, codes.Internal)
 	}
 	volPlugin.mountErr = nil
-	failRetryably(maxConsecutiveRetryableRestoreFailures-1, "after a failed mount")
+	failRetryably(maxConsecutiveRetryableWorkerFailures-1, "after a failed mount")
 
 	// An attempt atelet stopped waiting on leaves the actor RESUMING, and the
 	// count as is, so the next retryable failure is the last.
@@ -3870,4 +3876,52 @@ func TestCheckpointFinishesWhenCallerCancels(t *testing.T) {
 		}
 		unlock()
 	})
+}
+
+// A worker that is unreachable when Checkpoint calls it fails the checkpoint
+// with Unavailable, so the control plane retries the suspend instead of
+// crashing the actor. The retry checkpoints once the worker answers again. As
+// with Restore, the maxConsecutiveRetryableWorkerFailures-th Unavailable in a
+// row is reported as Internal, so a worker that never comes back does not keep
+// the actor SUSPENDING forever. Any other worker failure is Internal.
+func TestCheckpointStopsRetryingAfterConsecutiveUnavailableFailures(t *testing.T) {
+	a := runPluginActor(t)
+	snap := a.snapshot("pause-snap-1", 1)
+	checkpointCode := func() codes.Code {
+		_, err := a.checkpoint(t, snap, ateletpb.UploadMode_UPLOAD_MODE_DEFERRED)
+		return apierror.Code(err)
+	}
+	failRetryably := func(times int, after string) {
+		t.Helper()
+		a.worker.checkpointErr = status.Error(codes.Unavailable, `connection error: desc = "transport: Error while dialing: dial unix /var/lib/ate/worker/sock: connect: no such file or directory"`)
+		for i := 1; i <= times; i++ {
+			if got := checkpointCode(); got != codes.Unavailable {
+				t.Fatalf("Checkpoint %d %s: code = %v, want %v", i, after, got, codes.Unavailable)
+			}
+		}
+	}
+
+	failRetryably(maxConsecutiveRetryableWorkerFailures-1, "at first")
+	if got := checkpointCode(); got != codes.Internal {
+		t.Fatalf("Checkpoint %d code = %v, want %v", maxConsecutiveRetryableWorkerFailures, got, codes.Internal)
+	}
+
+	// Giving up starts the count over.
+	failRetryably(maxConsecutiveRetryableWorkerFailures-1, "after giving up")
+	a.worker.checkpointErr = nil
+	if got := checkpointCode(); got != codes.OK {
+		t.Fatalf("Checkpoint retried with the worker back: code = %v, want %v", got, codes.OK)
+	}
+
+	// A successful checkpoint commits its snapshot, so the next names another
+	// one, which starts a new streak.
+	snap = a.snapshot("pause-snap-2", 2)
+	failRetryably(maxConsecutiveRetryableWorkerFailures-1, "of another snapshot")
+
+	// So does a failure that crashes the actor.
+	a.worker.checkpointErr = status.Error(codes.Internal, "runsc checkpoint failed")
+	if got := checkpointCode(); got != codes.Internal {
+		t.Fatalf("Checkpoint with a worker Internal error: code = %v, want %v", got, codes.Internal)
+	}
+	failRetryably(maxConsecutiveRetryableWorkerFailures-1, "after a crash")
 }
