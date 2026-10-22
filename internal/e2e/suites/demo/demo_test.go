@@ -1476,6 +1476,9 @@ func waitForActorStateWithTimeout(ctx context.Context, t *testing.T, clients *e2
 				t.Logf("Actor %q reached state %v", actorName, expectedState)
 				return
 			}
+			if resp.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_CRASHED {
+				t.Fatalf("Actor %q crashed while waiting for %v: %s", actorName, expectedState, resp.GetStatus().GetCrash().GetMessage())
+			}
 		}
 		time.Sleep(1 * time.Second)
 	}

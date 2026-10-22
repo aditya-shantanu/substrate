@@ -69,8 +69,8 @@ func ateletErrorCrashesActor(ctx context.Context, isTerminateRPC bool, err error
 		return false
 	}
 
-	// Workflow's own context ended: the caller went away or the actor lease
-	// was lost.
+	// The workflow's context ended: the caller left, the actor lease was
+	// lost, or the budget ran out.
 	if ctx.Err() != nil {
 		return false
 	}
@@ -97,8 +97,8 @@ func handleAteletError(ctx context.Context, st crashActorStore, actorRef resourc
 		return fmt.Errorf("actor %s crashed: %w", actorRef, err)
 	}
 
-	// The caller went away or its deadline passed: report that, not atelet's
-	// error. The actor keeps its assignment, so a retry can finish the operation.
+	// The workflow's context ended: report that, not atelet's error. The
+	// actor keeps its assignment, so a retry can finish the operation.
 	if ctx.Err() != nil {
 		return fmt.Errorf("while calling atelet %s: %w: %w", rpc, err, ctx.Err())
 	}

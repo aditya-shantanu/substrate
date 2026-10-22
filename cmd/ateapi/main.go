@@ -67,9 +67,6 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-// maxRPCDeadline is the max deadline for all RPC methods exposed by this server.
-const maxRPCDeadline = 10 * time.Minute
-
 const minResyncInterval = 250 * time.Millisecond
 
 var (
@@ -379,7 +376,7 @@ func main() {
 
 	unaryInterceptors := []grpc.UnaryServerInterceptor{
 		apiauthn.UnaryServerInterceptor(authCfg),
-		ateinterceptors.MaxDeadlineUnaryInterceptor(maxRPCDeadline),
+		ateinterceptors.MaxDeadlineUnaryInterceptor(controlapi.MaxRPCDeadline),
 		ateinterceptors.ServerUnaryInterceptor,
 		authz.UnaryServerInterceptor(authorizer),
 		ateinterceptors.RejectUnknownFieldsUnaryInterceptor,
@@ -394,7 +391,7 @@ func main() {
 		// to eventually reobtain backend IPs. https://github.com/grpc/grpc/issues/12295
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			MaxConnectionAge:      1 * time.Hour,
-			MaxConnectionAgeGrace: maxRPCDeadline + time.Minute,
+			MaxConnectionAgeGrace: controlapi.MaxRPCDeadline + time.Minute,
 		}),
 		grpc.ChainUnaryInterceptor(unaryInterceptors...),
 		grpc.ChainStreamInterceptor(

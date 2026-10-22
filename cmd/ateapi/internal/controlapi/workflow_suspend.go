@@ -74,6 +74,11 @@ func (m suspendMode) uploadMode() ateletpb.UploadMode {
 // is returned as it is, whatever the mode. Idempotent: a re-entered workflow
 // fast-forwards past the steps a previous attempt completed, deriving
 // progress from the persisted actor alone.
+// Once the actor is SUSPENDING the workflow runs to the end, within
+// MaxRPCDeadline, even if the caller goes away: it returns what the suspend
+// did, not the caller's cancellation. SIGTERM does not stop it either: the
+// workflow runs until the process exits and its lease row lingers up to the
+// lease TTL, so a retry right after a restart can get Aborted.
 func (w *ActorWorkflow) SuspendActor(ctx context.Context, actorRef resources.ActorRef, mode suspendMode) (_ *ateapipb.Actor, err error) {
 	ctx = preview.ContextWithOptIn(ctx)
 	start := time.Now()
@@ -93,9 +98,21 @@ func (w *ActorWorkflow) SuspendActor(ctx context.Context, actorRef resources.Act
 			attrs = lifecycleOpAttrs(actor, "", wireFidelity)
 		}
 		w.instruments.recordLifecycleOp(ctx, ateattr.OperationSuspend, start, err, attrs...)
+		// The interceptor logs the caller's view, so record the outcome the
+		// caller did not wait for.
+		if ctx.Err() != nil {
+			slog.LogAttrs(ctx, slog.LevelInfo, "SuspendActor finished after its caller left",
+				append(ateattr.ActorRefLogAttrs(actorRef), slog.Any("state", actor.GetStatus().GetState()), slog.Any("err", err))...)
+		}
 	}()
 
-	leaseCtx, lease, err := w.acquireActorLease(ctx, actorRef)
+	// The lease and the steps run detached from the caller's cancellation. A
+	// caller that gives up mid-checkpoint must not stop the workflow: a
+	// SUSPENDING actor is finalized by nothing else, and atelet's report of
+	// the snapshot it committed is refused while the actor transitions.
+	workCtx, cancelWork := context.WithTimeout(context.WithoutCancel(ctx), MaxRPCDeadline)
+	defer cancelWork()
+	leaseCtx, lease, err := w.acquireActorLease(workCtx, actorRef)
 	if err != nil {
 		return nil, err
 	}
@@ -111,6 +128,11 @@ func (w *ActorWorkflow) SuspendActor(ctx context.Context, actorRef resources.Act
 	// released the worker, so the record names none (#957).
 	if actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
 		return actor, nil
+	}
+	// Nothing is committed yet, so a caller that already gave up gets nothing
+	// started on its behalf.
+	if err = ctx.Err(); err != nil {
+		return nil, err
 	}
 	var marked *ateapipb.Actor
 	if marked, err = w.ensureMarkedSuspending(leaseCtx, actorRef, actor, actorTemplate, mode); err != nil {

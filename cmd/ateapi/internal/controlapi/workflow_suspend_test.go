@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -42,13 +43,11 @@ func TestSuspendActor_CheckpointError(t *testing.T) {
 	tests := []struct {
 		name      string
 		err       error
-		cancel    bool
 		wantCode  codes.Code
 		wantState ateapipb.ActorState
 	}{
-		{"snapshot conflict", apierror.Aborted("checkpoint rejected"), false, codes.Aborted, ateapipb.ActorState_ACTOR_STATE_SUSPENDING},
-		{"failed precondition", apierror.FailedPrecondition("checkpoint rejected"), false, codes.Internal, ateapipb.ActorState_ACTOR_STATE_CRASHED},
-		{"caller cancellation", apierror.Aborted("checkpoint rejected"), true, codes.Canceled, ateapipb.ActorState_ACTOR_STATE_SUSPENDING},
+		{"snapshot conflict", apierror.Aborted("checkpoint rejected"), codes.Aborted, ateapipb.ActorState_ACTOR_STATE_SUSPENDING},
+		{"failed precondition", apierror.FailedPrecondition("checkpoint rejected"), codes.Internal, ateapipb.ActorState_ACTOR_STATE_CRASHED},
 	}
 	for _, tt := range tests {
 		for _, mode := range suspendModes {
@@ -68,20 +67,10 @@ func TestSuspendActor_CheckpointError(t *testing.T) {
 					},
 				})
 				seedWireWorker(t, ctx, persistence, assignmentOf(actor))
-				callCtx, cancel := context.WithCancel(ctx)
-				defer cancel()
-				atelet.onCheckpoint = func(context.Context) error {
-					if tt.cancel {
-						cancel()
-					}
-					return tt.err
-				}
-				_, err := w.SuspendActor(callCtx, actorRef, mode.suspendMode)
+				atelet.onCheckpoint = func(context.Context) error { return tt.err }
+				_, err := w.SuspendActor(ctx, actorRef, mode.suspendMode)
 				if got := apierror.Code(err); got != tt.wantCode {
 					t.Fatalf("SuspendActor error = %v (code %v), want %v", err, got, tt.wantCode)
-				}
-				if tt.cancel && !errors.Is(err, context.Canceled) {
-					t.Errorf("SuspendActor error does not wrap context.Canceled: %v", err)
 				}
 				if checkpoints, _ := atelet.calls(); checkpoints != 1 {
 					t.Fatalf("Checkpoint calls = %d, want 1", checkpoints)
@@ -138,6 +127,146 @@ func TestSuspendActor_CheckpointError(t *testing.T) {
 			})
 		}
 	}
+}
+
+// TestSuspendActor_CallerCancels: a caller that gives up once the actor is
+// SUSPENDING no longer stops the suspend. The lease and the remaining steps
+// run detached from the caller, so the actor ends SUSPENDED instead of
+// staying SUSPENDING with a checkpoint atelet already took. A caller that is
+// gone before MarkSuspending starts nothing.
+func TestSuspendActor_CallerCancels(t *testing.T) {
+	tests := []struct {
+		name string
+		// duringCheckpoint cancels inside atelet's Checkpoint. Otherwise the
+		// cancel lands before GetActor call cancelAtGetActor: 1 loads the
+		// actor before MarkSuspending, 2 is FinalizeSuspended's re-read.
+		duringCheckpoint bool
+		cancelAtGetActor int32
+		wantCode         codes.Code
+		wantState        ateapipb.ActorState
+		wantCheckpoints  int
+	}{
+		{"client cancels before MarkSuspending", false, 1, codes.Canceled, ateapipb.ActorState_ACTOR_STATE_RUNNING, 0},
+		{"client cancels during Checkpoint", true, 0, codes.OK, ateapipb.ActorState_ACTOR_STATE_SUSPENDED, 1},
+		{"client cancels before finalize", false, 2, codes.OK, ateapipb.ActorState_ACTOR_STATE_SUSPENDED, 1},
+	}
+	for _, tt := range tests {
+		for _, mode := range suspendModes {
+			t.Run(tt.name+"/"+mode.name, func(t *testing.T) {
+				ctx := context.Background()
+				persistence := newTestPersistence(t)
+				seedSuspendTemplate(t, ctx, persistence, &ateapipb.SnapshotConfig{PreferredFidelity: ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY})
+				st := &getActorHookStore{Interface: persistence}
+				w, atelet := newWireCaptureWorkflow(t, st)
+				actorRef := resources.ActorRef{Atespace: "team-a", Name: "actor-1"}
+				actor := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
+					Metadata:      &ateapipb.ResourceMetadata{Atespace: actorRef.Atespace, Name: actorRef.Name},
+					ActorTemplate: suspendTestTemplateRef(),
+					Status: &ateapipb.ActorStatus{
+						State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+						AssignedNode:     wireTestAssignment().GetNodeName(),
+						WorkerAssignment: wireTestAssignment(),
+					},
+				})
+				seedWireWorker(t, ctx, persistence, assignmentOf(actor))
+
+				callCtx, cancel := context.WithCancel(ctx)
+				defer cancel()
+				cancelled := make(chan struct{})
+				release := make(chan struct{})
+				// checkpointCtxErr is the Checkpoint context's error as atelet
+				// returns, after the caller cancelled.
+				checkpointCtxErr := make(chan error, 1)
+				if tt.duringCheckpoint {
+					atelet.onCheckpoint = func(ctx context.Context) error {
+						cancel()
+						close(cancelled)
+						<-release
+						checkpointCtxErr <- ctx.Err()
+						return nil
+					}
+				} else {
+					st.beforeGetActor = func(call int32) {
+						if call == tt.cancelAtGetActor {
+							cancel()
+						}
+					}
+				}
+
+				type result struct {
+					actor *ateapipb.Actor
+					err   error
+				}
+				done := make(chan result, 1)
+				go func() {
+					finished, err := w.SuspendActor(callCtx, actorRef, mode.suspendMode)
+					done <- result{finished, err}
+				}()
+				if tt.duringCheckpoint {
+					<-cancelled
+					// The lease outlives the caller.
+					if lease, err := persistence.AcquireLease(ctx, actorLeaseKey(actorRef)); !errors.Is(err, store.ErrLeaseConflict) {
+						t.Errorf("AcquireLease while the cancelled suspend checkpoints = %v, want %v", err, store.ErrLeaseConflict)
+						if err == nil {
+							lease.Close()
+						}
+					}
+					close(release)
+				}
+				res := <-done
+				if got := apierror.Code(res.err); got != tt.wantCode {
+					t.Fatalf("SuspendActor after the caller cancelled = %v (code %v), want %v", res.err, got, tt.wantCode)
+				}
+				if tt.duringCheckpoint {
+					if err := <-checkpointCtxErr; err != nil {
+						t.Errorf("Checkpoint context ended with the caller's: %v", err)
+					}
+				}
+				if checkpoints, _ := atelet.calls(); checkpoints != tt.wantCheckpoints {
+					t.Errorf("Checkpoint calls = %d, want %d", checkpoints, tt.wantCheckpoints)
+				}
+				if res.err == nil && res.actor.GetStatus().GetState() != tt.wantState {
+					t.Errorf("SuspendActor returned state %v, want %v", res.actor.GetStatus().GetState(), tt.wantState)
+				}
+				stored := mustReadActor(t, ctx, persistence, actorRef)
+				if got := stored.GetStatus(); got.GetState() != tt.wantState || got.GetCrash() != nil {
+					t.Errorf("actor after the cancelled suspend = %v, want %v", got, tt.wantState)
+				}
+				if tt.wantState == ateapipb.ActorState_ACTOR_STATE_RUNNING {
+					if got := stored.GetStatus(); got.GetWorkerAssignment() == nil || len(got.GetSnapshots()) != 0 {
+						t.Errorf("actor after the cancelled suspend = %v, want its assignment and no snapshot", got)
+					}
+					return
+				}
+				if stored.GetStatus().GetWorkerAssignment() != nil {
+					t.Errorf("actor after the cancelled suspend keeps its assignment: %v", stored.GetStatus())
+				}
+				worker, err := persistence.GetWorker(ctx, wireTestAssignment().GetWorker().GetName())
+				if err != nil {
+					t.Fatalf("GetWorker: %v", err)
+				}
+				if got := worker.GetStatus().GetAllocated().GetActors(); got != 0 {
+					t.Errorf("worker allocated actors = %d, want 0", got)
+				}
+			})
+		}
+	}
+}
+
+// getActorHookStore runs beforeGetActor, when set, before each GetActor with
+// the 1-based count of GetActor calls so far.
+type getActorHookStore struct {
+	store.Interface
+	calls          atomic.Int32
+	beforeGetActor func(call int32)
+}
+
+func (s *getActorHookStore) GetActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error) {
+	call := s.calls.Add(1)
+	if s.beforeGetActor != nil {
+		s.beforeGetActor(call)
+	}
+	return s.Interface.GetActor(ctx, actorRef)
 }
 
 func TestSuspendActor_MarkedSuspending_SnapshotURI(t *testing.T) {
