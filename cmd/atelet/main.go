@@ -726,10 +726,10 @@ type Atelet struct {
 	// workerActorJWTs mints the JWT every snapshot transfer carries.
 	workerActorJWTs *workerActorJWTs
 
-	// workerFailures counts each actor's consecutive retryable worker restore
-	// or checkpoint failures, so one that can never succeed stops being
-	// retried (see boundRetryableWorkerError).
-	workerFailures workerFailureCounter
+	// restoreFailures counts each actor's consecutive retryable worker restore
+	// failures, so a restore that can never succeed stops being retried (see
+	// boundRetryableRestoreError).
+	restoreFailures restoreFailureCounter
 	// bootID is the node's boot ID (see readBootID), recorded in the manifest
 	// of each local snapshot. A local snapshot recording another, or none,
 	// was written before the node last rebooted.
@@ -996,15 +996,6 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 		return nil, err
 	}
 	defer unlockActor()
-	// End the actor's streak of retryable worker failures (see
-	// boundRetryableWorkerError) if this checkpoint succeeds or fails with an
-	// error that crashes the actor. Registered after unlockActor, so it runs
-	// while the actor's lock is still held.
-	defer func() {
-		if endsWorkerFailureStreak(err) {
-			s.workerFailures.reset(actorUID)
-		}
-	}()
 
 	// A detach in progress finishes first, and no detach starts until the
 	// checkpoint returns, so it cannot delete the snapshot being written.
@@ -1099,7 +1090,7 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 	if err != nil {
 		// TODO(#3046): Worker should classify checkpoint failures that left
 		// the workload intact as retriable.
-		return nil, s.boundRetryableWorkerError("CheckpointWorkload", actorUID, req.GetSnapshot().GetSnapshotUuid(), workerCallError("CheckpointWorkload", err))
+		return nil, workerCallError("CheckpointWorkload", err)
 	}
 	// The snapshot commits on this node once worker has written it, in either
 	// upload mode.
@@ -1645,12 +1636,12 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	}
 	defer unlockActor()
 	// End the actor's streak of retryable worker failures (see
-	// boundRetryableWorkerError) if this restore succeeds or fails with an
+	// boundRetryableRestoreError) if this restore succeeds or fails with an
 	// error that crashes the actor. Registered after unlockActor, so it runs
 	// while the actor's lock is still held.
 	defer func() {
-		if endsWorkerFailureStreak(err) {
-			s.workerFailures.reset(actorUID)
+		if endsRestoreFailureStreak(err) {
+			s.restoreFailures.reset(actorUID)
 		}
 	}()
 
@@ -1856,7 +1847,7 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	})
 	dWorker = time.Since(tWorker)
 	if err != nil {
-		return nil, s.boundRetryableWorkerError("RestoreWorkload", actorUID, req.GetSnapshot().GetSnapshotUuid(), workerRestoreError(ctx, err))
+		return nil, s.boundRetryableRestoreError(actorUID, req.GetSnapshot().GetSnapshotUuid(), workerRestoreError(ctx, err))
 	}
 
 	return &ateletpb.RestoreResponse{WorkerEpoch: workerResp.GetWorkerEpoch()}, nil
@@ -1864,10 +1855,11 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 
 // workerCallError is atelet's error for a failed call to the worker's rpc. A
 // worker that is unavailable, refusing workloads until it registers or
-// unreachable because its process is gone, is reported as Unavailable, so the
-// caller retries rather than crashes the actor. If the process restarted or
-// its pod is gone, the control plane crashes the actors it hosted on its own.
-// Anything else reaches the caller as Internal.
+// unreachable because its process is gone, is reported as Unavailable, so
+// ateapi keeps the actor's state and assignment for a retry instead of
+// crashing it. Once a restarted worker registers again, or when its pod is
+// gone, ateapi crashes the actors it hosted on its own. Anything else reaches
+// the caller as Internal.
 func workerCallError(rpc string, err error) error {
 	if status.Code(err) == codes.Unavailable {
 		return apierror.Unavailable("worker %s: the worker is unavailable: %s", rpc, status.Convert(err).Message())
@@ -1916,43 +1908,42 @@ func workerRestoreError(ctx context.Context, err error) error {
 	return fmt.Errorf("while calling worker RestoreWorkload: %w", err)
 }
 
-// maxConsecutiveRetryableWorkerFailures is the number of consecutive retryable
-// worker failures to restore or checkpoint one actor's snapshot at which atelet
-// gives up and reports that failure as Internal, crashing the actor. Contention
-// on a busy node should clear within a retry or two; a restore that keeps
-// failing (a guest that hangs on every resume of its snapshot, say) or a worker
-// that never comes back would otherwise keep the actor RESUMING or SUSPENDING
-// forever, visible only as 503s.
-const maxConsecutiveRetryableWorkerFailures = 3
+// maxConsecutiveRetryableRestoreFailures is the number of consecutive retryable
+// worker failures to restore one actor's snapshot at which atelet gives up and
+// reports that failure as Internal, crashing the actor. Contention on a busy
+// node should clear within a retry or two; a restore that keeps failing (a
+// guest that hangs on every resume of its snapshot, say) would otherwise keep
+// the actor RESUMING forever, visible only as 503s.
+const maxConsecutiveRetryableRestoreFailures = 3
 
-// workerFailureCounter counts each actor's consecutive retryable worker
-// restore or checkpoint failures on this node, per snapshot. The zero value is
-// ready to use. Entries for actors that left this node stay until the actor is
-// restored, checkpointed or terminated here again.
-type workerFailureCounter struct {
+// restoreFailureCounter counts each actor's consecutive retryable worker
+// restore failures on this node, per snapshot. The zero value is ready to use.
+// Entries for actors that left this node stay until the actor is restored or
+// terminated here again.
+type restoreFailureCounter struct {
 	mu      sync.Mutex
-	streaks map[string]workerFailureStreak
+	streaks map[string]restoreFailureStreak
 }
 
-// workerFailureStreak is one actor's run of consecutive retryable failures to
-// restore or checkpoint the snapshot snapshotUUID.
-type workerFailureStreak struct {
+// restoreFailureStreak is one actor's run of consecutive retryable restore
+// failures of the snapshot snapshotUUID.
+type restoreFailureStreak struct {
 	snapshotUUID string
 	failures     int
 }
 
-// add records another consecutive failure of snapshotUUID for actorUID and
-// returns the count. A failure for another snapshot than the actor's current
-// streak starts a new streak.
-func (c *workerFailureCounter) add(actorUID, snapshotUUID string) int {
+// add records another consecutive failure to restore snapshotUUID for actorUID
+// and returns the count. A failure for another snapshot than the actor's
+// current streak starts a new streak.
+func (c *restoreFailureCounter) add(actorUID, snapshotUUID string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.streaks == nil {
-		c.streaks = map[string]workerFailureStreak{}
+		c.streaks = map[string]restoreFailureStreak{}
 	}
 	streak := c.streaks[actorUID]
 	if streak.snapshotUUID != snapshotUUID {
-		streak = workerFailureStreak{snapshotUUID: snapshotUUID}
+		streak = restoreFailureStreak{snapshotUUID: snapshotUUID}
 	}
 	streak.failures++
 	c.streaks[actorUID] = streak
@@ -1960,37 +1951,37 @@ func (c *workerFailureCounter) add(actorUID, snapshotUUID string) int {
 }
 
 // reset forgets actorUID's consecutive failures.
-func (c *workerFailureCounter) reset(actorUID string) {
+func (c *restoreFailureCounter) reset(actorUID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.streaks, actorUID)
 }
 
-// boundRetryableWorkerError counts a retryable (Unavailable) failure of the
-// worker's rpc on snapshotUUID for actorUID and, once the actor has failed
-// maxConsecutiveRetryableWorkerFailures times in a row, reports it as Internal
+// boundRetryableRestoreError counts a retryable (Unavailable) worker failure to
+// restore snapshotUUID for actorUID and, once the actor has failed
+// maxConsecutiveRetryableRestoreFailures times in a row, reports it as Internal
 // instead so the control plane crashes the actor rather than retrying again.
 // Any other error passes through uncounted.
-func (s *Atelet) boundRetryableWorkerError(rpc, actorUID, snapshotUUID string, err error) error {
+func (s *Atelet) boundRetryableRestoreError(actorUID, snapshotUUID string, err error) error {
 	if apierror.Code(err) != codes.Unavailable {
 		return err
 	}
-	n := s.workerFailures.add(actorUID, snapshotUUID)
-	if n < maxConsecutiveRetryableWorkerFailures {
+	n := s.restoreFailures.add(actorUID, snapshotUUID)
+	if n < maxConsecutiveRetryableRestoreFailures {
 		return err
 	}
-	s.workerFailures.reset(actorUID)
-	return apierror.Internal("worker %s failed with a retryable error %d times in a row, giving up: %v", rpc, n, err)
+	s.restoreFailures.reset(actorUID)
+	return apierror.Internal("worker restore failed with a retryable error %d times in a row, giving up: %v", n, err)
 }
 
-// endsWorkerFailureStreak reports whether a Restore or Checkpoint that returned
-// err ends the actor's streak of retryable worker failures: it does if the
-// operation succeeded or failed with an error that crashes the actor. The
-// control plane keeps the actor RESUMING or SUSPENDING for another attempt on
-// Unavailable, Canceled and DeadlineExceeded (see ateletErrorCrashesActor in
-// ateapi), so those leave the streak as is: only a worker's Unavailable adds to
-// it (see boundRetryableWorkerError), and an attempt cut short adds nothing.
-func endsWorkerFailureStreak(err error) bool {
+// endsRestoreFailureStreak reports whether a Restore that returned err ends the
+// actor's streak of retryable worker failures: it does if the restore
+// succeeded or failed with an error that crashes the actor. The control plane
+// keeps the actor RESUMING for another attempt on Unavailable, Canceled and
+// DeadlineExceeded (see ateletErrorCrashesActor in ateapi), so those leave the
+// streak as is: only a worker's Unavailable adds to it (see
+// boundRetryableRestoreError), and an attempt cut short adds nothing.
+func endsRestoreFailureStreak(err error) bool {
 	switch apierror.Code(err) {
 	case codes.Unavailable, codes.Canceled, codes.DeadlineExceeded:
 		return false
@@ -2049,7 +2040,7 @@ func (s *Atelet) Terminate(ctx context.Context, req *ateletpb.TerminateRequest) 
 	if err := actordirs.RemoveActorDirs(actorUID); err != nil {
 		return nil, fmt.Errorf("failed to remove actor directories during terminate (actor: %s, actorUID: %s): %w", actorRef, actorUID, err)
 	}
-	s.workerFailures.reset(actorUID)
+	s.restoreFailures.reset(actorUID)
 
 	return &ateletpb.TerminateResponse{}, nil
 }
