@@ -107,8 +107,8 @@ func (d *demo) Settings() []config.Setting {
 			Usage: "Residents each pooled template keeps running",
 		},
 		{
-			Key: "demo.resident.sandboxClasses", Env: "ATE_DEMO_RESIDENT_SANDBOX_CLASSES",
-			Flag: "sandbox-classes", Kind: config.KindString, Default: "gvisor",
+			Key: "demo.resident.classes", Env: "ATE_DEMO_RESIDENT_CLASSES",
+			Flag: "classes", Kind: config.KindString, Default: "gvisor",
 			Usage: "Sandbox classes to measure, comma-separated from gvisor and microvm. Each gets its own WorkerPool and a template pair per guest, named <guest>-<class>-pooled and -plain.",
 		},
 		{
@@ -122,7 +122,7 @@ func (d *demo) Settings() []config.Setting {
 // classes reads the sandbox classes setting.
 func classes(e *steps.Env) ([]string, error) {
 	var out []string
-	for _, c := range strings.Split(e.Cfg.Resolved().String("demo.resident.sandboxClasses"), ",") {
+	for _, c := range strings.Split(e.Cfg.Resolved().String("demo.resident.classes"), ",") {
 		c = strings.TrimSpace(c)
 		switch c {
 		case "gvisor", "microvm":

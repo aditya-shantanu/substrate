@@ -18,7 +18,7 @@ size the pools with `--replicas`.
 
 Each sandbox class gets its own WorkerPool and its own template pair per
 guest, named `<guest>-<class>-pooled` and `<guest>-<class>-plain`.
-`--sandbox-classes gvisor,microvm` measures both; the default is gVisor only.
+`--classes gvisor,microvm` measures both; the default is gVisor only.
 A microVM pool needs an install with the `microvm` sandbox class and nodes
 with KVM (bare metal or nested virtualization), and its residents are whole
 VMs sized at the actor's memory, so the microVM pool asks for more memory per
