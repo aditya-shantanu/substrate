@@ -31,6 +31,12 @@ creates and resumes missing ones, deletes crashed or surplus ones, and reports
 external volumes cannot have a pool, because volumes are created per actor at
 its first resume.
 
+Size the pool for the claim rate times the time a resident takes to become
+useful, which is the restore plus a few seconds for the sandbox to settle. A
+resident taken under a second after its restore adopts in the usual 10 ms but
+answers its first request slowly, more so the more memory it holds. A claim
+that finds the pool empty falls back to a restore.
+
 ## The claim
 
 `CreateActor` for a template with a pool takes one `POOLED` resident, in one

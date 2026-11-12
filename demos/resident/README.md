@@ -84,7 +84,10 @@ Below that, pick a guest; each card claims from one of its templates. A bar is o
 adopted a resident is marked with a check. The dots above the bars are the pool
 refilling after each claim. "One every 300 ms" is an arrival rate a pool of
 six keeps up with; "back to back" drains it faster than it refills, so some
-claims fall back to a restore and show as plain bars.
+claims fall back to a restore and show as plain bars. Claims that arrive
+faster than the pool refills and settles take residents that are under a
+second old, and those answer their first request slowly. The large guests
+show it at 300 ms pacing and not at 1 s, so compare runs at the same pacing.
 
 For numbers without the page, run `claimbench` headless and build the same
 charts offline with `chart.py` (standard library only):
