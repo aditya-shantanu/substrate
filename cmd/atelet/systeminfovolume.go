@@ -130,6 +130,26 @@ func (r *systemInfoVolumeRefresher) Register(actorUID string, ref resources.Acto
 	return actor, nil
 }
 
+// Adopt registers actorUID's volumes again under ref and writes them for it.
+// Reports whether the actor was registered; a node whose atelet restarted
+// since the actor started has no registration to move.
+func (r *systemInfoVolumeRefresher) Adopt(actorUID string, ref resources.ActorRef) (bool, error) {
+	r.mu.Lock()
+	prev := r.actors[actorUID]
+	r.mu.Unlock()
+	if prev == nil {
+		return false, nil
+	}
+	prev.mu.Lock()
+	volumes := prev.volumes
+	prev.mu.Unlock()
+	r.Deregister(actorUID)
+	if _, err := r.Register(actorUID, ref, volumes); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 // Deregister drops actorUID's registration. After Deregister returns, no more
 // system-info volumes will be written for the actor.
 func (r *systemInfoVolumeRefresher) Deregister(actorUID string) {
