@@ -16,6 +16,8 @@ package demos
 
 import (
 	"context"
+	"maps"
+	"slices"
 	"time"
 
 	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
@@ -39,6 +41,11 @@ type SubstrateTemplate struct {
 	Manifest string
 	// Ref identifies the ActorTemplate by reference.
 	Ref resources.ActorTemplateRef
+	// Values are placeholder values for this template alone, over the demo's
+	// RenderValues, and Drop names the placeholders whose lines this template
+	// leaves out. A demo that renders one manifest several ways sets them.
+	Values map[string]string
+	Drop   []string
 }
 
 // Substrate covers demos in the substrate-resource shape: one CRD manifest
@@ -149,7 +156,12 @@ func (d *Substrate) Deploy(ctx context.Context, e *steps.Env) error {
 	}
 
 	for _, t := range d.Templates {
-		manifest, err := Render(e, t.Manifest, values, drop)
+		templateValues := maps.Clone(values)
+		if templateValues == nil {
+			templateValues = map[string]string{}
+		}
+		maps.Copy(templateValues, t.Values)
+		manifest, err := Render(e, t.Manifest, templateValues, append(slices.Clone(drop), t.Drop...))
 		if err != nil {
 			return err
 		}

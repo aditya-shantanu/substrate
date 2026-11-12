@@ -62,20 +62,27 @@ limitations under the License.
   <h1>Resident pools</h1>
   <div class="sub">time from <b>CreateActor</b> to the actor's <b>first HTTP response</b>, per claim</div>
 </header>
-<div class="race"><button class="primary" id="race">Claim 10 from each, one every 300 ms</button>&nbsp;<button id="clear">Clear</button></div>
+<div class="race"><label for="guest" style="color:var(--muted);margin-right:8px">guest</label><select id="guest" style="margin-right:14px;padding:6px 10px;border-radius:8px;background:#262c3a;color:var(--ink);border:1px solid #39415a"></select><button class="primary" id="race">Claim 10 from each, one every 300 ms</button>&nbsp;<button id="clear">Clear</button></div>
 <main id="main"></main>
 <footer>
   Each bar is one actor: <span class="legend"><span><i style="background:var(--create)"></i>CreateActor</span><span><i style="background:var(--resume)"></i>ResumeActor</span><span><i style="background:var(--first)"></i>first response through the router</span></span>
   A template with a resident pool keeps that many sandboxes restored and running ahead of demand; a claim adopts one instead of restoring the golden snapshot.
 </footer>
 <script>
-const state = { templates: [], scale: 600 };
+const state = { templates: [], scale: 600, guest: null };
 const cards = {};
+const guestSelect = document.getElementById('guest');
+function shortImage(ref) { if (!ref) return ''; const noDigest = ref.split('@')[0]; return noDigest.split('/').slice(-2).join('/'); }
+function showGuest(name) {
+  state.guest = name;
+  for (const n in cards) cards[n].el.style.display = cards[n].guest === name ? '' : 'none';
+}
 function pct(xs, p) { if (!xs.length) return 0; const s = [...xs].sort((a,b)=>a-b); return s[Math.min(s.length-1, Math.round(p/100*(s.length-1)))]; }
 function card(t) {
   const el = document.createElement('section'); el.className = 'card'; el.dataset.t = t.name;
   el.innerHTML = `
     <h2>${t.name} <span class="pill ${t.replicas>0?'on':''}">${t.replicas>0 ? 'resident pool: '+t.replicas : 'no pool'}</span></h2>
+    <div class="pool" style="margin:0">${shortImage(t.image)}${t.touch_mib ? ' · holds ' + t.touch_mib + ' MiB' : ''}</div>
     <div class="pool"><span class="poolText"></span><span class="dots"></span></div>
     <div class="actions"><button data-n="1">Claim 1</button><button data-n="10" data-i="300" class="primary">Claim 10, one every 300 ms</button><button data-n="10">Claim 10, back to back</button></div>
     <div class="stats">
@@ -87,7 +94,9 @@ function card(t) {
     <div class="bars"></div>`;
   el.querySelectorAll('button').forEach(b => b.onclick = () => run(t.name, +b.dataset.n, +(b.dataset.c||1), +(b.dataset.i||0)));
   document.getElementById('main').appendChild(el);
-  cards[t.name] = { el, claims: [] };
+  cards[t.name] = { el, claims: [], guest: t.guest };
+  if (![...guestSelect.options].some(o => o.value === t.guest)) { const o = document.createElement('option'); o.value = o.textContent = t.guest; guestSelect.appendChild(o); }
+  if (!state.guest) { guestSelect.value = t.guest; showGuest(t.guest); } else el.style.display = t.guest === state.guest ? '' : 'none';
   return cards[t.name];
 }
 function render(name) {
@@ -125,7 +134,8 @@ async function refresh() {
     }
   } catch (e) { console.warn(e); }
 }
-document.getElementById('race').onclick = () => { for (const name in cards) run(name, 10, 1, 300); };
+document.getElementById('race').onclick = () => { for (const name in cards) if (cards[name].guest === state.guest) run(name, 10, 1, 300); };
+guestSelect.onchange = () => showGuest(guestSelect.value);
 document.getElementById('clear').onclick = () => { for (const name in cards) { cards[name].claims = []; cards[name].el.querySelector('.bars').innerHTML = ''; render(name); } };
 refresh(); setInterval(refresh, 1000);
 </script>

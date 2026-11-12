@@ -12,17 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The counter workload without a resident pool: every claim restores the golden snapshot.
+# One guest of the resident pool demo, rendered twice per guest: with a pool
+# (${RESIDENT_POOL} kept) and without (dropped). The guest image is any OCI
+# image; the counter binary rides in as an image volume at /ate so the actor
+# answers HTTP whatever the image's own entrypoint is. ${TOUCH_MEMORY_ARG}
+# makes the golden carry that much memory.
 metadata:
   atespace: ate-demo-resident
-  name: counter-plain
+  name: ${NAME}
 workerSelector:
   matchLabels:
     workload: resident
 containers:
 - name: counter
-  image: ko://go.ate.dev/substrate/demos/counter
-  command: ["/ko-app/counter"]
+  image: ${GUEST_IMAGE}
+  command:
+  - ${COUNTER_COMMAND}
+${TOUCH_MEMORY_ARG}
   wakeupProbe:
     httpGet:
       path: /readyz
@@ -30,13 +36,15 @@ containers:
   volumeMounts:
   - name: data
     mountPath: /home/counter
+${COUNTER_VOLUME_MOUNT}
 resources:
   limits:
     cpuMillicores: 500
-    memoryBytes: 268435456 # 256Mi
+    memoryBytes: ${ACTOR_MEMORY_BYTES}
 snapshotConfig:
   preferredFidelity: SNAPSHOT_FIDELITY_MEMORY
 volumes:
 - name: data
   durableDir: {}
-
+${COUNTER_VOLUME}
+${RESIDENT_POOL}

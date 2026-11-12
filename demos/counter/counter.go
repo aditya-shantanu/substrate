@@ -73,6 +73,7 @@ func main() {
 	validateExistingFilePath := pflag.String("validate-existing-file-path", "", "Path to existing file to validate reading")
 	extraPort := pflag.Int("extra-port", 0, "Additional port to listen on, for exercising atenet-router's arbitrary-port ingress support; 0 disables it")
 	tcpPort := pflag.Int("tcp-port", 0, "Plain TCP echo port for exercising atunnel CONNECT ingress; 0 disables it")
+	touchMemoryMB := pflag.Int("touch-memory-mb", 0, "MiB of heap to fill with random bytes before reporting ready and keep for the process's life, so a snapshot carries that much memory; 0 disables it")
 	pflag.Parse()
 	ctx := context.Background()
 
@@ -203,6 +204,18 @@ func main() {
 		}()
 	}
 
+	// Hold the requested memory, filled so no page is a zero page a
+	// checkpoint can skip. The slice stays referenced below.
+	var touched []byte
+	if *touchMemoryMB > 0 {
+		touched = make([]byte, *touchMemoryMB<<20)
+		if _, err := rand.Read(touched); err != nil {
+			slog.ErrorContext(ctx, "Error filling memory", slog.Any("err", err))
+			os.Exit(1)
+		}
+		slog.InfoContext(ctx, "Holding memory", slog.Int("mib", *touchMemoryMB))
+	}
+
 	// Write some random data to a file in the root filesystem, to test
 	// filesystem checkpoint/restore.
 	if err := writeRandomFile(); err != nil {
@@ -220,7 +233,7 @@ func main() {
 
 	for range time.Tick(10 * time.Second) {
 		// TODO: Test outbound connectivity by pinging google.com
-		slog.InfoContext(ctx, "Count", slog.Int("count", count), slog.String("fshash", hashRandomFile()))
+		slog.InfoContext(ctx, "Count", slog.Int("count", count), slog.String("fshash", hashRandomFile()), slog.Int("held_mib", len(touched)>>20))
 		count++
 	}
 }

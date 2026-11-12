@@ -52,7 +52,7 @@ var uiHTML []byte
 var (
 	listen         = flag.String("listen", ":8080", "address of the page and the JSON API")
 	atespace       = flag.String("atespace", "ate-demo-resident", "atespace the claimed actors are created in")
-	templates      = flag.String("templates", "counter-pooled,counter-plain", "comma-separated ActorTemplates in the atespace to claim from")
+	templates      = flag.String("templates", "", "comma-separated ActorTemplates to claim from; empty lists the atespace's <guest>-pooled and <guest>-plain pairs")
 	controlAddr    = flag.String("control-addr", "api.ate-system.svc.cluster.local:443", "ate-api-server address")
 	apiServerName  = flag.String("api-server-name", "api.ate-system.svc", "name on ate-api-server's serving certificate")
 	routerAddr     = flag.String("router-addr", "atenet-router.ate-system.svc.cluster.local:443", "atenet-router HTTPS address")
@@ -347,11 +347,52 @@ func (b *bench) runMany(ctx context.Context, template string, n, concurrency int
 
 type templateState struct {
 	Name     string `json:"name"`
+	Guest    string `json:"guest"`
+	Image    string `json:"image"`
+	TouchMiB int    `json:"touch_mib"`
 	Replicas int32  `json:"replicas"`
 	Ready    int32  `json:"ready"`
 	Pending  int32  `json:"pending"`
 	Golden   bool   `json:"golden"`
 	Error    string `json:"error,omitempty"`
+}
+
+// templateNames returns the templates to show: the --templates list, or every
+// <guest>-pooled and <guest>-plain template in the atespace.
+func (b *bench) templateNames(ctx context.Context) ([]string, error) {
+	if *templates != "" {
+		return strings.Split(*templates, ","), nil
+	}
+	var names []string
+	for token := ""; ; {
+		resp, err := b.control.ListActorTemplates(ctx, &ateapi.ListActorTemplatesRequest{Atespace: *atespace, Options: &ateapi.ListOptions{PageToken: token}})
+		if err != nil {
+			return nil, err
+		}
+		for _, t := range resp.GetActorTemplates() {
+			if name := t.GetMetadata().GetName(); strings.HasSuffix(name, "-pooled") || strings.HasSuffix(name, "-plain") {
+				names = append(names, name)
+			}
+		}
+		if token = resp.GetNextPageToken(); token == "" {
+			break
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// describeTemplate reads the guest's image and held memory off the template.
+func describeTemplate(t *ateapi.ActorTemplate) (image string, touchMiB int) {
+	for _, ctr := range t.GetContainers() {
+		image = ctr.GetImage()
+		for _, arg := range ctr.GetCommand() {
+			if v, ok := strings.CutPrefix(arg, "--touch-memory-mb="); ok {
+				touchMiB, _ = strconv.Atoi(v)
+			}
+		}
+	}
+	return image, touchMiB
 }
 
 type workerState struct {
@@ -363,13 +404,20 @@ type workerState struct {
 
 func (b *bench) handleState(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	names, err := b.templateNames(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
 	var ts []templateState
-	for _, name := range strings.Split(*templates, ",") {
+	for _, name := range names {
 		t, err := b.control.GetActorTemplate(ctx, &ateapi.GetActorTemplateRequest{ActorTemplate: &ateapi.ObjectRef{Atespace: *atespace, Name: name}})
-		st := templateState{Name: name}
+		guest := strings.TrimSuffix(strings.TrimSuffix(name, "-pooled"), "-plain")
+		st := templateState{Name: name, Guest: guest}
 		if err != nil {
 			st.Error = err.Error()
 		} else {
+			st.Image, st.TouchMiB = describeTemplate(t)
 			st.Replicas = t.GetResidentPool().GetReplicas()
 			st.Ready = t.GetStatus().GetResidentPoolStatus().GetReady()
 			st.Pending = t.GetStatus().GetResidentPoolStatus().GetPending()
