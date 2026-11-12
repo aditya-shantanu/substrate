@@ -96,6 +96,59 @@ the first HTTP response on the 2.4 GB rootfs is most of it; the plain claims
 took 77, 198, 238, 431 and 304 ms. The adopted resume step was 12 ms for
 every guest against 68 to 349 ms for a restore.
 
+## Reproducing from nothing
+
+The steps above assume a cluster that already runs this branch. From scratch:
+
+1. Check out the branch: `git clone https://github.com/aditya-shantanu/substrate -b resident/actors`.
+   Everything below runs from its root.
+2. Make a cluster. On GKE follow the [GKE installation guide](../../docs/guides/operator-install.md):
+   it needs Workload Identity, the certificates.k8s.io beta APIs, and the GCP
+   resources `tools/setup-gcp` in [substrate-gke](https://github.com/ai-on-gke/substrate-gke)
+   creates (snapshot bucket, IAM, the snapshot transfer service account). Check
+   that the snapshot bucket has uniform bucket-level access, which the
+   object-store plugin requires; one bucket created during this work did not:
+   `gcloud storage buckets describe gs://<bucket> --format='value(uniform_bucket_level_access)'`.
+   For a laptop, `kind` per the [Quickstart](../../README.md#quickstart-development)
+   works with the small guest set in step 4.
+3. Install Substrate from the branch. The images are built from the checkout
+   with `ko`, and `envoy-dataplane` with Docker, so both must work locally
+   (`KO_DOCKER_REPO` set to a registry the cluster can pull from). On GKE:
+
+   ```bash
+   export KO_DOCKER_REPO=<registry> SNAPSHOT_TRANSFER_GSA_NAME=<transfer service account name>
+   ATE_CREDENTIAL_PROVIDER='{"name":"k8s.io"}' \
+   ATE_INGRESS_ALLOWED_SPIFFE_IDS=spiffe://cluster.local/ns/ate-demo-resident/sa/claimbench,spiffe://cluster.local/ns/ate-system/sa/ate-client \
+     go run ./cmd/ate-setup deploy ate-system --storage-bucket-name <bucket> --sandbox-classes=gvisor
+   ```
+
+   `kubectl ate` works against the install; `go install ./cmd/kubectl-ate`.
+4. Deploy the demo and its access policy (the "How to run" section). On a small
+   cluster or kind, keep the pool small and skip the large images:
+
+   ```bash
+   go run ./cmd/ate-setup deploy demo resident --replicas 2 \
+     --guests 'tiny|0|256|ko://go.ate.dev/substrate/demos/counter;slim|64|512|docker.io/library/python:3.12-slim@sha256:05a994d2344eb364cc186910f4fc8786a38215f39f00d0acc25bff33a08f4177'
+   kubectl ate create access-policy -a ate-demo-resident -f demos/resident/claimbench-access-policy.yaml
+   ```
+
+   `kubectl ate get actor-templates -a ate-demo-resident` shows each pooled
+   template's RESIDENTS column reach its replicas once the goldens exist; the
+   first pull of a large image can take minutes.
+5. Port-forward `claimbench` and run the experiment from the page, or headless
+   as above.
+6. To check the feature itself rather than its numbers, run the e2e test
+   against the cluster:
+
+   ```bash
+   KUBECTL_CONTEXT=<context> E2E_SANDBOX_CLASS=gvisor \
+     hack/run-e2e.sh ./internal/e2e/suites/demo -run TestResidentPoolLifecycle
+   ```
+
+   It needs the counter demo deployed first (`go run ./cmd/ate-setup deploy demo counter`)
+   and the e2e router client on the ingress allow-list,
+   `spiffe://cluster.local/ns/ate-e2e-router-client/sa/router-client`.
+
 ## Clean up
 
 ```bash
