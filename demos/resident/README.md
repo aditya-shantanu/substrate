@@ -20,16 +20,29 @@ size the pools with `--replicas`.
 
 - A cluster with Agent Substrate installed as in the
   [Quickstart](../../README.md#quickstart-development) or
-  [GKE Quickstart](../../README.md#gke-quickstart).
-- `claimbench` runs as the `claimbench` ServiceAccount in `ate-demo-resident`.
-  It needs the editor role on the atespace, and the router has to admit its
-  SPIFFE ID, `spiffe://cluster.local/ns/ate-demo-resident/sa/claimbench`, in
-  `--ingress-allowed-spiffe-ids`.
+  [GKE Quickstart](../../README.md#gke-quickstart), from a tree that has
+  resident pools (`ActorTemplate.resident_pool`).
+- `claimbench` runs as the `claimbench` ServiceAccount in `ate-demo-resident`
+  and reaches the actors through the router, so the install has to admit its
+  SPIFFE ID. Install, or reinstall, with it on the allow-list:
+
+  ```bash
+  ATE_INGRESS_ALLOWED_SPIFFE_IDS=spiffe://cluster.local/ns/ate-demo-resident/sa/claimbench,<existing IDs> \
+    go run ./cmd/ate-setup deploy ate-system
+  ```
+
+- Worker nodes with room for every guest's residents: the default guests keep
+  twenty residents of 500m CPU and 256Mi to 1.5Gi each, and the demo's
+  WorkerPool asks for two workers of 12 CPU and 32Gi.
+- The default `swe-rebench` guest is a 2.4 GB image in a private Artifact
+  Registry of the `gke-ai-eco-dev` project. Elsewhere, pass `--guests` with
+  images your nodes can pull; any digest-pinned OCI image works.
 
 ## How to run
 
 ```bash
 go run ./cmd/ate-setup deploy demo resident
+kubectl ate create access-policy -a ate-demo-resident -f demos/resident/claimbench-access-policy.yaml
 ```
 
 This builds the `counter` and `claimbench` images with `ko`, creates the
@@ -65,12 +78,23 @@ refilling after each claim. "One every 300 ms" is an arrival rate a pool of
 six keeps up with; "back to back" drains it faster than it refills, so some
 claims fall back to a restore and show as plain bars.
 
-For numbers without the page, run `claimbench` headless:
+For numbers without the page, run `claimbench` headless and build the same
+charts offline with `chart.py` (standard library only):
 
 ```bash
 kubectl exec -n ate-demo-resident deploy/claimbench -- \
-  /ko-app/claimbench --interval 300ms --run slim-plain=30,slim-pooled=30
+  /ko-app/claimbench --interval 300ms --run slim-plain=30,python-plain=30,slim-pooled=30,python-pooled=30 \
+  | tee results.txt
+curl -s localhost:8080/api/guests | python3 -c 'import json,sys; print(json.dumps({g["label"]: g for g in json.load(sys.stdin)}))' > guests.json
+python3 demos/resident/chart.py guests.json results.txt -o report.html
 ```
+
+The numbers this demo produced on a two-worker gVisor cluster of
+c3-standard-22 nodes, 30 paced claims per template, p90: a pooled claim took
+24 to 27 ms for the four smaller guests and 175 ms for `swe-rebench`, where
+the first HTTP response on the 2.4 GB rootfs is most of it; the plain claims
+took 77, 198, 238, 431 and 304 ms. The adopted resume step was 12 ms for
+every guest against 68 to 349 ms for a restore.
 
 ## Clean up
 
