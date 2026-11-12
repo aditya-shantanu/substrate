@@ -60,11 +60,12 @@ def page(guests, title, runtime, compact=False, theme="", pace="one claim every 
     ROW = 56
     # ---- dumbbell
     xmax = max(max(g["plain"]["total"][P], g["pooled"]["total"][P]) for g in guests) * 1.25
-    xmax = (int(xmax / 20) + 1) * 20
+    step = next(st for st in (20, 50, 100, 250, 500, 1000) if xmax / st <= 12)
+    xmax = (int(xmax / step) + 1) * step
     def x(v): return PAD_L + (W - PAD_L - PAD_R) * v / xmax
     H1 = 40 + ROW * len(guests) + 40
     d = []
-    for t in range(0, int(xmax) + 1, 20 if xmax <= 200 else 50):
+    for t in range(0, int(xmax) + 1, step):
         d.append(f'<line class="grid" x1="{x(t):.1f}" y1="30" x2="{x(t):.1f}" y2="{H1-40}"/><text class="tick" x="{x(t):.1f}" y="{H1-20}" text-anchor="middle">{t}</text>')
     d.append(f'<text class="axis" x="{(PAD_L+W-PAD_R)/2:.0f}" y="{H1-2}" text-anchor="middle">claim time, CreateActor to first HTTP response, p90 ms</text>')
     rows_html = []
@@ -80,7 +81,10 @@ def page(guests, title, runtime, compact=False, theme="", pace="one claim every 
             s = g[name]
             tip = f'{name} · p50 {s["total"][P]:.0f} ms · p90 {s["total"]["p90"]:.0f} ms · max {s["total"]["max"]:.0f} ms · resume p50 {s["resume"][P]:.0f} ms · {s["adopted"]}/{s["n"]} adopted'
             d.append(f'<g class="mark" tabindex="0" data-tip="{html.escape(tip)}"><circle class="hit" cx="{x(v):.1f}" cy="{cy}" r="14"/><circle class="ring" cx="{x(v):.1f}" cy="{cy}" r="7"/><circle class="dot {cls}" cx="{x(v):.1f}" cy="{cy}" r="5"/></g>')
-        d.append(f'<text class="value" x="{x(b)-12:.1f}" y="{cy+4}" text-anchor="end">{b:.0f}</text>')
+        if x(b) - PAD_L < 36:
+            d.append(f'<text class="value" x="{x(b):.1f}" y="{cy+19}" text-anchor="middle">{b:.0f}</text>')
+        else:
+            d.append(f'<text class="value" x="{x(b)-12:.1f}" y="{cy+4}" text-anchor="end">{b:.0f}</text>')
         d.append(f'<text class="value" x="{x(a)+12:.1f}" y="{cy+4}">{a:.0f}</text>')
         sign = "−" if saving >= 0 else "+"
         d.append(f'<text class="saving" x="{(x(a)+x(b))/2:.1f}" y="{cy-11}" text-anchor="middle">{sign}{abs(saving):.0f} ms · {ratio:.1f}×</text>')
