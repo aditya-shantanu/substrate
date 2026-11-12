@@ -45,6 +45,10 @@ func (w *ActorWorkflow) DeleteActorTemplate(ctx context.Context, templateRef res
 		return nil, err
 	}
 
+	if err := w.ensureResidentsDeleted(ctx, tmpl); err != nil {
+		return nil, err
+	}
+
 	// Both are named after the template's UID, in the template's atespace.
 	goldenName := tmpl.GetMetadata().GetUid()
 	if err := w.ensureGoldenActorDeleted(ctx, resources.ActorRef{Atespace: templateRef.Atespace, Name: goldenName}); err != nil {
@@ -88,6 +92,32 @@ func (w *ActorWorkflow) ensureTemplateMarkedForDeletion(ctx context.Context, tem
 		return nil, fmt.Errorf("while marking actor template %s for deletion: %w", templateRef, err)
 	}
 	return marked, nil
+}
+
+// ensureResidentsDeleted removes the template's pooled residents. Residents a
+// CreateActor already took are ordinary Actors and stay.
+func (w *ActorWorkflow) ensureResidentsDeleted(ctx context.Context, tmpl *ateapi.ActorTemplate) (err error) {
+	ctx, done := stepSpan(ctx, "DeleteResidents")
+	defer func() { err = done(err) }()
+
+	var residents []resources.ActorRef
+	if err := forEachResident(ctx, w.store, tmpl, func(actor *ateapi.Actor) {
+		if actor.GetStatus().GetResident().GetState() == ateapi.ResidentState_RESIDENT_STATE_POOLED {
+			residents = append(residents, resources.ActorRefFromActor(actor))
+		}
+	}); err != nil {
+		return err
+	}
+	if len(residents) == 0 {
+		markSkipped(ctx, "no residents")
+		return nil
+	}
+	for _, ref := range residents {
+		if _, err := w.DeleteActor(ctx, ref, store.DeletePreconditions{}); err != nil && apierror.Code(err) != codes.NotFound {
+			return fmt.Errorf("while deleting resident %s: %w", ref, err)
+		}
+	}
+	return nil
 }
 
 // ensureGoldenActorDeleted removes the template's golden actor, whatever state

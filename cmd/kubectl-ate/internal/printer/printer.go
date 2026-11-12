@@ -290,21 +290,26 @@ func PrintActorTemplatesTo(out io.Writer, templates []*ateapi.ActorTemplate, for
 		return printProto(out, &ateapi.ListActorTemplatesResponse{ActorTemplates: templates}, format)
 	case "table":
 		w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
-		fmt.Fprintln(w, "ATESPACE\tNAME\tGOLDEN TAG\tERROR\tAGE")
+		fmt.Fprintln(w, "ATESPACE\tNAME\tGOLDEN TAG\tRESIDENTS\tERROR\tAGE")
 		for _, t := range templates {
 			gss := t.GetStatus().GetGoldenSnapshotStatus()
 			goldenTag := gss.GetGoldenTag().GetName()
 			if t.GetSnapshotConfig().GetGoldenSnapshotConfig().GetMode() == ateapi.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_DISABLED {
 				goldenTag = "DISABLED"
 			}
+			// ready/replicas of the resident pool; blank when the template keeps none.
+			residents := ""
+			if rps := t.GetStatus().GetResidentPoolStatus(); t.GetResidentPool().GetReplicas() > 0 || rps.GetReady() > 0 || rps.GetPending() > 0 {
+				residents = fmt.Sprintf("%d/%d", rps.GetReady(), t.GetResidentPool().GetReplicas())
+			}
 			// Error messages are too long for a table cell.
 			errFlag := ""
-			if gss.GetErrorMessage() != "" {
+			if gss.GetErrorMessage() != "" || t.GetStatus().GetResidentPoolStatus().GetErrorMessage() != "" {
 				errFlag = "ERROR"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
 				t.GetMetadata().GetAtespace(), t.GetMetadata().GetName(),
-				goldenTag, errFlag,
+				goldenTag, residents, errFlag,
 				formatAge(t.GetMetadata().GetCreateTime()))
 		}
 		return w.Flush()

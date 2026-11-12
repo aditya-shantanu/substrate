@@ -335,13 +335,15 @@ const (
 // Values for SnapshotKindKey, set by ateapi from its own resume branching, so
 // the label is bounded at the producer: Local restores an in-node snapshot,
 // Latest pulls a durable snapshot from object storage (including a template's
-// golden snapshot), Boot is a from-scratch start (not a restore).
+// golden snapshot), Boot is a from-scratch start (not a restore), Resident
+// adopts a sandbox the template's resident pool restored ahead of the claim.
 // atelet derives the same values for its own histograms, where the kind is the
 // snapshot a restore reads or a checkpoint writes; Boot never appears there.
 const (
-	SnapshotKindLatest = "latest"
-	SnapshotKindLocal  = "local"
-	SnapshotKindBoot   = "boot"
+	SnapshotKindLatest   = "latest"
+	SnapshotKindLocal    = "local"
+	SnapshotKindBoot     = "boot"
+	SnapshotKindResident = "resident"
 )
 
 // Values for SnapshotFidelityKey, mirroring ateletpb.SnapshotFidelity.

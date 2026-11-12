@@ -474,11 +474,11 @@ func TestPrintActorTemplatesTo_Table(t *testing.T) {
 
 	// Sorted by atespace, then name. The ERROR column only flags that an
 	// error message exists; the full text is available via json/yaml.
-	expected := `ATESPACE                             NAME              GOLDEN TAG   ERROR   AGE
-ate-demo-counter-substrate           counter           golden-tag           5m
-ate-demo-counter-substrate           counter-2                              3d
-ate-demo-counter-substrate           counter-3         DISABLED             15m
-ate-demo-counter-substrate-microvm   counter-microvm                ERROR   5h
+	expected := `ATESPACE                             NAME              GOLDEN TAG   RESIDENTS   ERROR   AGE
+ate-demo-counter-substrate           counter           golden-tag                       5m
+ate-demo-counter-substrate           counter-2                                          3d
+ate-demo-counter-substrate           counter-3         DISABLED                         15m
+ate-demo-counter-substrate-microvm   counter-microvm                            ERROR   5h
 `
 	if diff := cmp.Diff(expected, buf.String()); diff != "" {
 		t.Errorf("output mismatch (-want +got):\n%s", diff)

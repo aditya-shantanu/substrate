@@ -314,6 +314,17 @@ type Interface interface {
 	// error leaves both unchanged.
 	UpdateActorAndRelease(ctx context.Context, actorRef resources.ActorRef, precondition Precondition, mutate func(toUpdate *ateapi.Actor) error) (*ateapi.Actor, error)
 
+	// AdoptResidentActor hands a pooled resident Actor's sandbox to a new Actor
+	// in one transaction: it inserts actor with the resident's uid, worker
+	// assignment, assigned node and snapshots, deletes the resident row, and
+	// points the assignment row at the new name. The booking on the Worker is
+	// untouched. actor's metadata.uid, version and timestamps are assigned by the
+	// store; its atespace must be the resident's. Returns ErrNotFound if the
+	// resident is gone, ErrUIDConflict if it is not residentUID, or
+	// ErrFailedPrecondition if it is no longer POOLED, and ErrAlreadyExists if
+	// actor's name is taken.
+	AdoptResidentActor(ctx context.Context, residentRef resources.ActorRef, residentUID string, actor *ateapi.Actor) (*ateapi.Actor, error)
+
 	// GetWorkerAssignment returns a Worker's assignment for actorUID, or
 	// ErrNotFound when the Worker is not hosting that Actor.
 	GetWorkerAssignment(ctx context.Context, workerName, actorUID string) (*ateapi.ActorAssignment, error)

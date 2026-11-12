@@ -2469,6 +2469,125 @@ func runWorkerAssignmentContractTests(t *testing.T, setup func(t *testing.T) sto
 		}
 	}
 
+	t.Run("AdoptResidentActor_MovesSandboxToNewName", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		mustCreateAtespace(t, s, testAtespace)
+		resident := newTestSuspendedActor(testAtespace, "rsd-1")
+		resident.Status.Resident = &ateapi.ResidentStatus{State: ateapi.ResidentState_RESIDENT_STATE_POOLED}
+		stored, err := s.CreateActor(ctx, resident)
+		if err != nil {
+			t.Fatalf("CreateActor(resident) failed: %v", err)
+		}
+		residentRef := resources.ActorRefFromActor(stored)
+		assignment := &ateapi.ActorAssignment{
+			Actor:     residentRef.ToObjectRef(),
+			ActorUid:  stored.GetMetadata().GetUid(),
+			Resources: resources.CPUMemory(500, 1<<20),
+		}
+		if _, err := s.BindActorToWorker(ctx, testWorkerName, assignment, nil, residentRef, store.PreconditionFrom(stored), func(a *ateapi.Actor) error {
+			a.Status.State = ateapi.ActorState_ACTOR_STATE_RUNNING
+			a.Status.WorkerAssignment = &ateapi.WorkerAssignment{Worker: &ateapi.ObjectRef{Name: testWorkerName}, NodeName: "node-1"}
+			a.Status.AssignedNode = "node-1"
+			return nil
+		}); err != nil {
+			t.Fatalf("BindActorToWorker failed: %v", err)
+		}
+
+		claim := newTestSuspendedActor(testAtespace, "session-1")
+		adopted, err := s.AdoptResidentActor(ctx, residentRef, stored.GetMetadata().GetUid(), claim)
+		if err != nil {
+			t.Fatalf("AdoptResidentActor failed: %v", err)
+		}
+		if adopted.GetMetadata().GetUid() != stored.GetMetadata().GetUid() {
+			t.Errorf("adopted uid %q, want the resident's %q", adopted.GetMetadata().GetUid(), stored.GetMetadata().GetUid())
+		}
+		if adopted.GetMetadata().GetName() != "session-1" || adopted.GetMetadata().GetVersion() != 1 {
+			t.Errorf("adopted metadata %v, want session-1 at version 1", adopted.GetMetadata())
+		}
+		if st := adopted.GetStatus(); st.GetState() != ateapi.ActorState_ACTOR_STATE_SUSPENDED ||
+			st.GetWorkerAssignment().GetWorker().GetName() != testWorkerName || st.GetAssignedNode() != "node-1" ||
+			st.GetResident().GetState() != ateapi.ResidentState_RESIDENT_STATE_RESERVED || st.GetResident().GetPooledName() != "rsd-1" {
+			t.Errorf("adopted status %v, want SUSPENDED, RESERVED from rsd-1, on %s/node-1", st, testWorkerName)
+		}
+		got, err := s.GetActor(ctx, resources.ActorRefFromActor(adopted))
+		if err != nil {
+			t.Fatalf("GetActor(adopted) failed: %v", err)
+		}
+		if diff := cmp.Diff(adopted, got, protocmp.Transform()); diff != "" {
+			t.Errorf("AdoptResidentActor return does not match stored state (-returned +got):\n%s", diff)
+		}
+		if _, err := s.GetActor(ctx, residentRef); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("GetActor(resident) err = %v, want ErrNotFound", err)
+		}
+		gotAssignment, err := s.GetWorkerAssignment(ctx, testWorkerName, stored.GetMetadata().GetUid())
+		if err != nil {
+			t.Fatalf("GetWorkerAssignment failed: %v", err)
+		}
+		if gotAssignment.GetActor().GetName() != "session-1" {
+			t.Errorf("assignment names actor %q, want session-1", gotAssignment.GetActor().GetName())
+		}
+		worker, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		want := &ateapi.WorkerResources{Actors: 1, CpuMillicores: 500, MemoryBytes: 1 << 20}
+		if diff := cmp.Diff(want, worker.GetStatus().GetAllocated(), protocmp.Transform()); diff != "" {
+			t.Errorf("allocation changed by adoption (-want +got):\n%s", diff)
+		}
+
+		// A second adoption finds no resident; a taken name is refused.
+		if _, err := s.AdoptResidentActor(ctx, residentRef, stored.GetMetadata().GetUid(), newTestSuspendedActor(testAtespace, "session-2")); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("second AdoptResidentActor err = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("AdoptResidentActor_Refusals", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		mustCreateAtespace(t, s, testAtespace)
+		unpooled, err := s.CreateActor(ctx, newTestSuspendedActor(testAtespace, "rsd-unpooled"))
+		if err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+		if _, err := s.AdoptResidentActor(ctx, resources.ActorRefFromActor(unpooled), unpooled.GetMetadata().GetUid(), newTestSuspendedActor(testAtespace, "s1")); !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Errorf("adopting an unpooled actor err = %v, want ErrFailedPrecondition", err)
+		}
+		if _, err := s.AdoptResidentActor(ctx, resources.ActorRefFromActor(unpooled), "other-uid", newTestSuspendedActor(testAtespace, "s1")); !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("adopting with the wrong uid err = %v, want ErrUIDConflict", err)
+		}
+
+		resident := newTestSuspendedActor(testAtespace, "rsd-2")
+		resident.Status.Resident = &ateapi.ResidentStatus{State: ateapi.ResidentState_RESIDENT_STATE_POOLED}
+		stored, err := s.CreateActor(ctx, resident)
+		if err != nil {
+			t.Fatalf("CreateActor(resident) failed: %v", err)
+		}
+		residentRef := resources.ActorRefFromActor(stored)
+		assignment := &ateapi.ActorAssignment{Actor: residentRef.ToObjectRef(), ActorUid: stored.GetMetadata().GetUid(), Resources: resources.CPUMemory(500, 1<<20)}
+		if _, err := s.BindActorToWorker(ctx, testWorkerName, assignment, nil, residentRef, store.PreconditionFrom(stored), func(a *ateapi.Actor) error {
+			a.Status.WorkerAssignment = &ateapi.WorkerAssignment{Worker: &ateapi.ObjectRef{Name: testWorkerName}, NodeName: "node-1"}
+			return nil
+		}); err != nil {
+			t.Fatalf("BindActorToWorker failed: %v", err)
+		}
+		if _, err := s.CreateActor(ctx, newTestSuspendedActor(testAtespace, "taken")); err != nil {
+			t.Fatalf("CreateActor(taken) failed: %v", err)
+		}
+		if _, err := s.AdoptResidentActor(ctx, residentRef, stored.GetMetadata().GetUid(), newTestSuspendedActor(testAtespace, "taken")); !errors.Is(err, store.ErrAlreadyExists) {
+			t.Errorf("adopting onto a taken name err = %v, want ErrAlreadyExists", err)
+		}
+		if _, err := s.GetActor(ctx, residentRef); err != nil {
+			t.Errorf("resident must survive a refused adoption, GetActor err = %v", err)
+		}
+	})
+
 	t.Run("BindActorToWorker_AddsAssignmentAndAllocation", func(t *testing.T) {
 		s := setup(t)
 		ctx := context.Background()

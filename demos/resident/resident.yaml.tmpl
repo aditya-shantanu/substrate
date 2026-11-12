@@ -1,0 +1,137 @@
+# Copyright 2026 The Agent Substrate Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The resident pool demo: one WorkerPool, two ActorTemplates of the counter
+# workload (one with a resident pool, one without), and claimbench, which
+# claims actors from both and serves a page showing each claim's latency.
+#
+# The ActorTemplates are not CRDs: they live in resident-*-template.yaml.tmpl
+# and are created through the ate API with `kubectl ate create actor-template`.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ate-demo-resident
+
+---
+
+apiVersion: ate.dev/v1
+kind: WorkerPool
+metadata:
+  name: resident
+  namespace: ate-demo-resident
+  labels:
+    workload: resident
+spec:
+  replicas: 2
+  workerImage: ko://go.ate.dev/substrate/cmd/ateworker-gvisor
+  sandboxClasses:
+  - name: gvisor
+  template:
+    # Capacity for the pool's residents plus the claims in flight: the
+    # templates size actors at 500m and 256Mi.
+    resources:
+      limits:
+        cpu: "4"
+        memory: 8Gi
+      requests:
+        cpu: "1"
+        memory: 8Gi
+
+---
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: claimbench
+  namespace: ate-demo-resident
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claimbench
+  namespace: ate-demo-resident
+  labels:
+    app: claimbench
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: claimbench
+  template:
+    metadata:
+      labels:
+        app: claimbench
+    spec:
+      serviceAccountName: claimbench
+      containers:
+      - name: claimbench
+        image: ko://go.ate.dev/substrate/demos/resident/claimbench
+        args:
+        - --atespace=ate-demo-resident
+        - --templates=counter-pooled,counter-plain
+        ports:
+        - name: http
+          containerPort: 8080
+        volumeMounts:
+        - name: ateapi-token
+          mountPath: /var/run/secrets/ateapi
+          readOnly: true
+        - name: podidentity
+          mountPath: /run/podidentity
+          readOnly: true
+        - name: servicedns-ca
+          mountPath: /run/servicedns-ca
+          readOnly: true
+      volumes:
+      - name: ateapi-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: api.ate-system.svc
+              expirationSeconds: 7200
+              path: token
+      - name: podidentity
+        projected:
+          sources:
+          - podCertificate:
+              credentialBundlePath: credential-bundle.pem
+              keyType: ECDSAP256
+              signerName: podidentity.podcert.ate.dev/identity
+      - name: servicedns-ca
+        projected:
+          sources:
+          - clusterTrustBundle:
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem
+              signerName: servicedns.podcert.ate.dev/identity
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: claimbench
+  namespace: ate-demo-resident
+spec:
+  selector:
+    app: claimbench
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http

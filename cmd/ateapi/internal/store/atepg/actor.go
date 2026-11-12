@@ -63,6 +63,92 @@ func (p *Persistence) CreateActor(ctx context.Context, actor *ateapi.Actor) (*at
 	return dbActor, nil
 }
 
+func (p *Persistence) AdoptResidentActor(ctx context.Context, residentRef resources.ActorRef, residentUID string, actor *ateapi.Actor) (*ateapi.Actor, error) {
+	atespace := actor.GetMetadata().GetAtespace()
+	name := actor.GetMetadata().GetName()
+	if atespace != residentRef.Atespace {
+		return nil, fmt.Errorf("adopting resident %s into atespace %s: %w", residentRef, atespace, store.ErrFailedPrecondition)
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning resident adoption: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	// Locked so a concurrent CreateActor cannot take the same resident.
+	var residentBytes []byte
+	err = tx.QueryRow(ctx, `SELECT proto FROM actors WHERE atespace = $1 AND name = $2 FOR UPDATE`, residentRef.Atespace, residentRef.Name).Scan(&residentBytes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("locking resident %s: %w", residentRef, err)
+	}
+	resident := &ateapi.Actor{}
+	if err := unmarshalStored(residentBytes, resident); err != nil {
+		return nil, fmt.Errorf("unmarshaling resident %s: %w", residentRef, err)
+	}
+	if resident.GetMetadata().GetUid() != residentUID {
+		return nil, store.ErrUIDConflict
+	}
+	if resident.GetStatus().GetResident().GetState() != ateapi.ResidentState_RESIDENT_STATE_POOLED ||
+		resident.GetStatus().GetWorkerAssignment() == nil {
+		return nil, fmt.Errorf("%w: resident %s is not pooled", store.ErrFailedPrecondition, residentRef)
+	}
+
+	dbActor := proto.Clone(actor).(*ateapi.Actor)
+	setCreateMetadata(dbActor.Metadata)
+	dbActor.Metadata.Uid = residentUID
+	if dbActor.Status == nil {
+		dbActor.Status = &ateapi.ActorStatus{}
+	}
+	dbActor.Status.WorkerAssignment = resident.GetStatus().GetWorkerAssignment()
+	dbActor.Status.AssignedNode = resident.GetStatus().GetAssignedNode()
+	dbActor.Status.Resident = &ateapi.ResidentStatus{State: ateapi.ResidentState_RESIDENT_STATE_RESERVED, PooledName: residentRef.Name}
+	if err := validateSnapshotURIs("actor "+resources.ActorRefFromActor(dbActor).String(), dbActor.GetStatus().GetSnapshots()...); err != nil {
+		return nil, err
+	}
+	protoBytes, err := proto.Marshal(dbActor)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling actor: %w", err)
+	}
+
+	// The resident goes first: the actors primary key is (atespace, name), so
+	// nothing collides, but its egress policy row cascades away with it.
+	if _, err := tx.Exec(ctx, `DELETE FROM actors WHERE atespace = $1 AND name = $2`, residentRef.Atespace, residentRef.Name); err != nil {
+		return nil, fmt.Errorf("deleting resident %s: %w", residentRef, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO actors (atespace, name, uid, version, proto)
+		VALUES ($1, $2, $3, $4, $5)`,
+		atespace, name, residentUID, dbActor.GetMetadata().GetVersion(), protoBytes); err != nil {
+		if isUniqueViolation(err) {
+			return nil, store.ErrAlreadyExists
+		}
+		return nil, fmt.Errorf("inserting actor %s/%s: %w", atespace, name, err)
+	}
+
+	// The assignment row is keyed by uid and keeps its booking; only the
+	// Actor it names changes.
+	assignment, workerName, err := getAssignmentRow(ctx, tx, residentUID)
+	if err != nil {
+		return nil, fmt.Errorf("reading the assignment of resident %s: %w", residentRef, err)
+	}
+	assignment.Actor = &ateapi.ObjectRef{Atespace: atespace, Name: name}
+	assignmentBytes, err := proto.Marshal(assignment)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling assignment: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE worker_assignments SET proto = $1 WHERE actor_uid = $2 AND worker_name = $3`,
+		assignmentBytes, residentUID, workerName); err != nil {
+		return nil, fmt.Errorf("renaming the assignment of resident %s: %w", residentRef, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing resident adoption %s -> %s/%s: %w", residentRef, atespace, name, err)
+	}
+	return dbActor, nil
+}
+
 func (p *Persistence) GetActor(ctx context.Context, actorRef resources.ActorRef) (*ateapi.Actor, error) {
 	var protoBytes []byte
 	err := p.pool.QueryRow(ctx, `SELECT proto FROM actors WHERE atespace = $1 AND name = $2`, actorRef.Atespace, actorRef.Name).Scan(&protoBytes)

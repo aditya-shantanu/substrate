@@ -231,7 +231,9 @@ func applyDetach(status *ateapi.ActorStatus, node string, upTo int32) error {
 		}
 	}
 	onNode := latestSnapshot(status, func(s *ateapi.Snapshot) bool { return s.GetLocality() == node })
-	if status.GetState() == ateapi.ActorState_ACTOR_STATE_SUSPENDED && status.GetAssignedNode() == node && onNode == nil {
+	// A reserved resident is SUSPENDED by state but its sandbox runs on the
+	// node, so the binding stays.
+	if status.GetState() == ateapi.ActorState_ACTOR_STATE_SUSPENDED && status.GetAssignedNode() == node && onNode == nil && status.GetResident() == nil {
 		status.AssignedNode = ""
 	}
 	return nil

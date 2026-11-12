@@ -37,7 +37,10 @@ import (
 // ServiceImpl for business logic and invariants.
 type RPCService struct {
 	ateapi.UnimplementedControlServer
-	impl                  serviceStore
+	impl serviceStore
+	// serviceImpl is impl as built here, for entry points that are not
+	// Control RPCs, such as the resident pool reconciler's.
+	serviceImpl           *ServiceImpl
 	persistence           serviceStore
 	workerCache           *workercache.Cache
 	dialer                *AteletDialer
@@ -91,6 +94,7 @@ func NewRPCService(
 	impl.clusterSnapshotLocation = snapshotLocation
 	s := &RPCService{
 		impl:                  impl,
+		serviceImpl:           impl,
 		persistence:           persistence,
 		workerCache:           workerCache,
 		csiDriverConfigLister: csiDriverConfigLister,

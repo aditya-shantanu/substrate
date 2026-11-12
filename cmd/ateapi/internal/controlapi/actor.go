@@ -19,7 +19,9 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
@@ -72,6 +74,50 @@ func (s *RPCService) CreateActor(ctx context.Context, req *ateapi.CreateActorReq
 }
 
 func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapi.Actor) (*ateapi.Actor, error) {
+	template, outActor, err := s.newActorFromTemplate(ctx, inActor)
+	if err != nil {
+		return nil, err
+	}
+	atespace := inActor.GetMetadata().GetAtespace()
+	name := inActor.GetMetadata().GetName()
+
+	// A pooled resident of the template takes the place of a fresh row: the
+	// Actor is born SUSPENDED like any other, but its first resume adopts the
+	// resident's running sandbox instead of restoring the golden snapshot.
+	if inActor.GetSourceTag() == nil && template.GetResidentPool().GetReplicas() > 0 {
+		stored, err := s.adoptResident(ctx, template, outActor)
+		if err != nil {
+			return nil, err
+		}
+		if stored != nil {
+			logActorStateChanged(ctx, stored, ateattr.OperationCreate)
+			return stored, nil
+		}
+	}
+
+	// Save the data in the storage layer.
+	stored, err := s.store.CreateActor(ctx, outActor)
+	if err != nil {
+		if errors.Is(err, store.ErrAlreadyExists) {
+			return nil, apierror.AlreadyExists("Actor %s already exists", name)
+		}
+		if errors.Is(err, store.ErrFailedPrecondition) {
+			return nil, apierror.FailedPrecondition("Atespace %s not found", atespace)
+		}
+		return nil, fmt.Errorf("while recording actor: %w", err)
+	}
+
+	// Without this an actor that is created and never resumed has no record at
+	// all, at any retention.
+	logActorStateChanged(ctx, stored, ateattr.OperationCreate)
+
+	return stored, nil
+}
+
+// newActorFromTemplate resolves inActor's template and source tag and returns
+// the validated Actor to store: SUSPENDED, with the tag's snapshot borrowed
+// when there is one.
+func (s *ServiceImpl) newActorFromTemplate(ctx context.Context, inActor *ateapi.Actor) (*ateapi.ActorTemplate, *ateapi.Actor, error) {
 	// Check that the referenced ActorTemplate exists.
 	// FIXME: This is not atomic and it is not a guarantee that the template
 	// will still exist later.  Checking it here produces a nice error UX, but
@@ -79,7 +125,7 @@ func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapi.Actor) (*
 	// UX inconsistent, at best.  Is it actually worth checking at all?
 	template, err := resolveActorTemplate(ctx, s.store, inActor)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Resolve the explicit tag, or freeze the template's current golden default.
@@ -92,7 +138,7 @@ func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapi.Actor) (*
 		for _, volume := range template.GetVolumes() {
 			if volume.GetExternal().GetTemplate() != nil {
 				// TODO: Permit cloning after CSI volume snapshots are supported.
-				return nil, apierror.FailedPrecondition("Tag cloning does not support ActorTemplates with external volumes")
+				return nil, nil, apierror.FailedPrecondition("Tag cloning does not support ActorTemplates with external volumes")
 			}
 		}
 	}
@@ -100,17 +146,14 @@ func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapi.Actor) (*
 	if tagRef != nil {
 		sourceTag, err = s.resolveTagSource(ctx, inActor.GetMetadata().GetAtespace(), tagRef, template)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-
-	atespace := inActor.GetMetadata().GetAtespace()
-	name := inActor.GetMetadata().GetName()
 
 	// Volume creation is completed asynchronously after the actor is recorded.
 	var initVols []*ateapi.ExternalVolumeStatus
 	if iv, err := initialExternalVolumes(ctx, s.storageClassLister, template); err != nil {
-		return nil, err
+		return nil, nil, err
 	} else if preview.IsEnabledFor(ctx, preview.GateExternalVolumes) {
 		initVols = iv
 	} else if len(iv) > 0 {
@@ -118,7 +161,7 @@ func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapi.Actor) (*
 			field.Forbidden(field.NewPath("actor", "actor_template"),
 				"ActorTemplates with external volumes require the ExternalVolumes preview gate to be enabled on the server and the client to opt in to preview features (kubectl ate --preview, or the "+preview.Header+" header)"),
 		}
-		return nil, resources.ToAPIError(errs)
+		return nil, nil, resources.ToAPIError(errs)
 	}
 
 	// Verify that the result is properly valid before storing it.
@@ -143,25 +186,131 @@ func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapi.Actor) (*
 		outActor.Status.LastAssignedGeneration = 1
 	}
 	if errs := apivalidation.ValidateActorUpdate(ctx, field.NewPath("actor"), outActor, inActor, true); len(errs) > 0 {
-		return nil, resources.ToInternalError(errs)
+		return nil, nil, resources.ToInternalError(errs)
 	}
+	return template, outActor, nil
+}
 
-	// Save the data in the storage layer.
+// residentNamePrefix starts the placeholder name of every pooled resident.
+const residentNamePrefix = "rsd-"
+
+// adoptResident stores outActor over one of template's pooled residents and
+// returns it, or nil when the pool has none to give. A resident another
+// CreateActor took first is skipped.
+func (s *ServiceImpl) adoptResident(ctx context.Context, template *ateapi.ActorTemplate, outActor *ateapi.Actor) (*ateapi.Actor, error) {
+	residents, err := listPooledResidents(ctx, s.store, template)
+	if err != nil {
+		return nil, err
+	}
+	for _, resident := range residents {
+		stored, err := s.store.AdoptResidentActor(ctx, resources.ActorRefFromActor(resident), resident.GetMetadata().GetUid(), outActor)
+		switch {
+		case err == nil:
+			slog.InfoContext(ctx, "Actor took a pooled resident",
+				slog.String("actor", resources.ActorRefFromActor(stored).String()),
+				slog.String("resident", resident.GetMetadata().GetName()),
+				slog.String("worker", stored.GetStatus().GetWorkerAssignment().GetWorker().GetName()))
+			return stored, nil
+		case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrUIDConflict), errors.Is(err, store.ErrFailedPrecondition):
+			// Taken, deleted or no longer pooled since the list.
+			continue
+		case errors.Is(err, store.ErrAlreadyExists):
+			return nil, apierror.AlreadyExists("Actor %s already exists", outActor.GetMetadata().GetName())
+		default:
+			return nil, fmt.Errorf("while adopting resident %s: %w", resident.GetMetadata().GetName(), err)
+		}
+	}
+	return nil, nil
+}
+
+// listPooledResidents returns template's residents that are running and
+// unclaimed, in the template's atespace.
+func listPooledResidents(ctx context.Context, lister actorLister, template *ateapi.ActorTemplate) ([]*ateapi.Actor, error) {
+	var pooled []*ateapi.Actor
+	err := forEachResident(ctx, lister, template, func(actor *ateapi.Actor) {
+		if actor.GetStatus().GetResident().GetState() == ateapi.ResidentState_RESIDENT_STATE_POOLED &&
+			actor.GetStatus().GetState() == ateapi.ActorState_ACTOR_STATE_RUNNING &&
+			actor.GetMetadata().GetDeleteTime() == nil {
+			pooled = append(pooled, actor)
+		}
+	})
+	return pooled, err
+}
+
+type actorLister interface {
+	ListActors(ctx context.Context, atespace string, opts store.ListOptions) (store.ListResponse[*ateapi.Actor], error)
+}
+
+// forEachResident calls fn for every Actor in template's atespace that the
+// resident pool created for this template. Residents keep the template's uid
+// in their name, so a recreated template of the same name never adopts the
+// old pool.
+func forEachResident(ctx context.Context, lister actorLister, template *ateapi.ActorTemplate, fn func(*ateapi.Actor)) error {
+	prefix := residentPrefixFor(template)
+	templateRef := resources.ActorTemplateRefFromActorTemplate(template)
+	for token := ""; ; {
+		page, err := lister.ListActors(ctx, template.GetMetadata().GetAtespace(), store.ListOptions{PageSize: maxPageSize, PageToken: token})
+		if err != nil {
+			return fmt.Errorf("while listing residents of %s: %w", templateRef, err)
+		}
+		for _, actor := range page.Items {
+			if !strings.HasPrefix(actor.GetMetadata().GetName(), prefix) || actor.GetStatus().GetResident() == nil {
+				continue
+			}
+			if resources.ActorTemplateRefFromObjectRef(actor.GetActorTemplate()) != templateRef {
+				continue
+			}
+			fn(actor)
+		}
+		if page.NextPageToken == "" {
+			return nil
+		}
+		token = page.NextPageToken
+	}
+}
+
+// residentPrefixFor is the name prefix of template's residents: "rsd-" and
+// the first eight characters of the template's uid.
+func residentPrefixFor(template *ateapi.ActorTemplate) string {
+	uid := template.GetMetadata().GetUid()
+	if len(uid) > 8 {
+		uid = uid[:8]
+	}
+	return residentNamePrefix + uid + "-"
+}
+
+// CreateResidentActor stores a new pooled resident of template: an Actor
+// under a placeholder name that the pool reconciler resumes and CreateActor
+// later hands to a caller. It is SUSPENDED at the golden snapshot like any new
+// Actor, marked POOLED.
+func (s *ServiceImpl) CreateResidentActor(ctx context.Context, template *ateapi.ActorTemplate) (*ateapi.Actor, error) {
+	inActor := &ateapi.Actor{
+		Metadata: &ateapi.ResourceMetadata{
+			Atespace: template.GetMetadata().GetAtespace(),
+			Name:     residentPrefixFor(template) + rand.Text()[:8],
+		},
+		ActorTemplate: resources.ActorTemplateRefFromActorTemplate(template).ToObjectRef(),
+	}
+	defaults.Apply(inActor)
+	if errs := apivalidation.ValidateCreateActorRequest(ctx, &ateapi.CreateActorRequest{Actor: inActor}); len(errs) > 0 {
+		return nil, resources.ToAPIError(errs)
+	}
+	_, outActor, err := s.newActorFromTemplate(ctx, inActor)
+	if err != nil {
+		return nil, err
+	}
+	outActor.Status.Resident = &ateapi.ResidentStatus{State: ateapi.ResidentState_RESIDENT_STATE_POOLED}
 	stored, err := s.store.CreateActor(ctx, outActor)
 	if err != nil {
 		if errors.Is(err, store.ErrAlreadyExists) {
-			return nil, apierror.AlreadyExists("Actor %s already exists", name)
+			return nil, apierror.AlreadyExists("Actor %s already exists", inActor.GetMetadata().GetName())
 		}
 		if errors.Is(err, store.ErrFailedPrecondition) {
-			return nil, apierror.FailedPrecondition("Atespace %s not found", atespace)
+			return nil, apierror.FailedPrecondition("Atespace %s not found", inActor.GetMetadata().GetAtespace())
 		}
-		return nil, fmt.Errorf("while recording actor: %w", err)
+		return nil, fmt.Errorf("while recording resident actor: %w", err)
 	}
-
-	// Without this an actor that is created and never resumed has no record at
-	// all, at any retention.
 	logActorStateChanged(ctx, stored, ateattr.OperationCreate)
-
 	return stored, nil
 }
 
@@ -217,6 +366,12 @@ func (s *RPCService) GetActor(ctx context.Context, req *ateapi.GetActorRequest) 
 
 func (s *ServiceImpl) GetActor(ctx context.Context, actorRef resources.ActorRef) (*ateapi.Actor, error) {
 	return s.store.GetActor(ctx, actorRef)
+}
+
+// CreateResidentActor is the in-process entry the resident pool reconciler
+// creates pool members through. It is not a Control RPC.
+func (s *RPCService) CreateResidentActor(ctx context.Context, template *ateapi.ActorTemplate) (*ateapi.Actor, error) {
+	return s.serviceImpl.CreateResidentActor(ctx, template)
 }
 
 func (s *RPCService) ListActors(ctx context.Context, req *ateapi.ListActorsRequest) (*ateapi.ListActorsResponse, error) {

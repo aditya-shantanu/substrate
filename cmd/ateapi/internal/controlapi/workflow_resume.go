@@ -96,6 +96,22 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	if wasRunning = actor.GetStatus().GetState() == ateapi.ActorState_ACTOR_STATE_RUNNING; wasRunning {
 		return actor, false, nil
 	}
+	if actor.GetStatus().GetResident().GetState() == ateapi.ResidentState_RESIDENT_STATE_RESERVED {
+		var adopted *ateapi.Actor
+		adopted, err = w.resumeReserved(leaseCtx, actorRef, actor, actorTemplate)
+		if err == nil {
+			tele.SnapshotKind = ateattr.SnapshotKindResident
+			actor = adopted
+			return actor, true, nil
+		}
+		if !errors.Is(err, errResidentUnusable) {
+			return nil, false, err
+		}
+		// The resident is gone and the Actor released; restore it as any other.
+		if actor, err = w.store.GetActor(leaseCtx, actorRef); err != nil {
+			return nil, false, err
+		}
+	}
 	var created *ateapi.Actor
 	if created, err = w.ensureVolumesCreated(leaseCtx, actorRef, actor, actorTemplate); err != nil {
 		return nil, false, err
@@ -125,7 +141,7 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 		return nil, false, err
 	}
 	var running *ateapi.Actor
-	if running, err = w.finalizeRunning(leaseCtx, actorRef, workerEpoch); err != nil {
+	if running, err = w.finalizeRunning(leaseCtx, actorRef, workerEpoch, nil); err != nil {
 		return nil, false, err
 	}
 	actor = running
@@ -852,7 +868,9 @@ func (w *ActorWorkflow) egressGateway() *ateletpb.EgressGateway {
 // started did not carry. If a later epoch is registered, that process has exited and taken
 // the sandbox with it, so RUNNING is not committed: the error is Unavailable,
 // and the retried resume restores the Actor on the current process.
-func (w *ActorWorkflow) finalizeRunning(ctx context.Context, actorRef resources.ActorRef, workerEpoch int64) (_ *ateapi.Actor, err error) {
+//
+// mutate, if set, edits the status in the same write.
+func (w *ActorWorkflow) finalizeRunning(ctx context.Context, actorRef resources.ActorRef, workerEpoch int64, mutate func(*ateapi.ActorStatus)) (_ *ateapi.Actor, err error) {
 	ctx, done := stepSpan(ctx, "FinalizeRunning")
 	defer func() { err = done(err) }()
 
@@ -890,6 +908,9 @@ func (w *ActorWorkflow) finalizeRunning(ctx context.Context, actorRef resources.
 			slog.WarnContext(ctx, "Restored a snapshot from its upload but could not record the upload",
 				slog.Any("actor", actorRef), slog.Any("err", err))
 		}
+		if mutate != nil {
+			mutate(toUpdate.Status)
+		}
 		return nil
 	})
 	if err != nil {
@@ -921,4 +942,83 @@ func recordRestoredUpload(ctx context.Context, status *ateapi.ActorStatus) error
 		return err
 	}
 	return applyDetach(status, node, snap.GetGeneration())
+}
+
+// errResidentUnusable reports that the reserved resident was terminated and
+// the Actor released, so the resume continues from its snapshot.
+var errResidentUnusable = errors.New("reserved resident could not be adopted")
+
+// resumeReserved activates the pooled sandbox a CreateActor reserved for the
+// Actor: it marks the Actor RESUMING, has atelet adopt the sandbox under the
+// Actor's name, and commits RUNNING. The worker, its booking and the sandbox
+// are the resident's. When the adoption fails, the sandbox is terminated, the
+// Actor released, and errResidentUnusable returned.
+func (w *ActorWorkflow) resumeReserved(ctx context.Context, actorRef resources.ActorRef, actor *ateapi.Actor, actorTemplate *ateapi.ActorTemplate) (_ *ateapi.Actor, err error) {
+	ctx, done := stepSpan(ctx, "AdoptResident")
+	defer func() { err = done(err) }()
+
+	assignment := actor.GetStatus().GetWorkerAssignment()
+	pooledName := actor.GetStatus().GetResident().GetPooledName()
+	if assignment == nil || pooledName == "" {
+		return nil, w.releaseResident(ctx, actorRef, actor, actorTemplate, errors.New("reserved resident has no worker assignment or pooled name"))
+	}
+	resuming, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapi.Actor) error {
+		switch toUpdate.GetStatus().GetState() {
+		case ateapi.ActorState_ACTOR_STATE_SUSPENDED, ateapi.ActorState_ACTOR_STATE_RESUMING:
+		default:
+			return apierror.FailedPrecondition("Actor %s is %s, not resumable", actorRef, toUpdate.GetStatus().GetState())
+		}
+		toUpdate.Status.State = ateapi.ActorState_ACTOR_STATE_RESUMING
+		return nil
+	})
+	if err != nil {
+		return nil, actorWriteError(actorRef, err)
+	}
+
+	conn, err := w.dialer.DialForAteletOnNode(assignment.GetNodeName())
+	if err != nil {
+		return nil, w.releaseResident(ctx, actorRef, resuming, actorTemplate, err)
+	}
+	resp, err := ateletpb.NewAteletClient(conn).Adopt(ctx, &ateletpb.AdoptRequest{
+		WorkerPodUid:          assignment.GetWorkerPodUid(),
+		Atespace:              actor.GetMetadata().GetAtespace(),
+		ActorUid:              actor.GetMetadata().GetUid(),
+		PreviousActorName:     pooledName,
+		ActorName:             actor.GetMetadata().GetName(),
+		ActorTemplateAtespace: actor.GetActorTemplate().GetAtespace(),
+		ActorTemplateName:     actor.GetActorTemplate().GetName(),
+		EgressGateway:         w.egressGateway(),
+	})
+	if err != nil {
+		return nil, w.releaseResident(ctx, actorRef, resuming, actorTemplate, err)
+	}
+	return w.finalizeRunning(ctx, actorRef, resp.GetWorkerEpoch(), func(status *ateapi.ActorStatus) {
+		status.Resident = &ateapi.ResidentStatus{State: ateapi.ResidentState_RESIDENT_STATE_ADOPTED, PooledName: pooledName}
+	})
+}
+
+// releaseResident terminates the reserved resident's sandbox and returns the
+// Actor to plain SUSPENDED with no worker, then reports errResidentUnusable
+// so the caller restores it from its snapshot.
+func (w *ActorWorkflow) releaseResident(ctx context.Context, actorRef resources.ActorRef, actor *ateapi.Actor, actorTemplate *ateapi.ActorTemplate, cause error) error {
+	slog.LogAttrs(ctx, slog.LevelWarn, "Releasing the reserved resident; resuming from the snapshot instead",
+		append(ateattr.ActorRefLogAttrs(actorRef), slog.String("resident", actor.GetStatus().GetResident().GetPooledName()), slog.Any("err", cause))...)
+	if err := w.ensureAteletTerminated(ctx, actorRef, actor, actorTemplate, ateattr.OperationResume); err != nil {
+		return fmt.Errorf("while terminating the reserved resident of %s: %w", actorRef, err)
+	}
+	latest, err := w.store.GetActor(ctx, actorRef)
+	if err != nil {
+		return err
+	}
+	precondition := store.Precondition{UID: actor.GetMetadata().GetUid(), Version: latest.GetMetadata().GetVersion()}
+	if _, err := w.store.UpdateActorAndRelease(ctx, actorRef, precondition, func(toUpdate *ateapi.Actor) error {
+		toUpdate.Status.State = ateapi.ActorState_ACTOR_STATE_SUSPENDED
+		toUpdate.Status.WorkerAssignment = nil
+		toUpdate.Status.AssignedNode = ""
+		toUpdate.Status.Resident = nil
+		return nil
+	}); err != nil {
+		return actorWriteError(actorRef, err)
+	}
+	return errResidentUnusable
 }

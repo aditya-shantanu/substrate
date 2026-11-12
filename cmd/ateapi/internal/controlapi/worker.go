@@ -217,6 +217,10 @@ func (s *ServiceImpl) UpdateActorAndRelease(ctx context.Context, actorRef resour
 	return s.store.UpdateActorAndRelease(ctx, actorRef, precondition, s.validatedActorMutation(ctx, mutate))
 }
 
+func (s *ServiceImpl) AdoptResidentActor(ctx context.Context, residentRef resources.ActorRef, residentUID string, actor *ateapi.Actor) (*ateapi.Actor, error) {
+	return s.store.AdoptResidentActor(ctx, residentRef, residentUID, actor)
+}
+
 func (s *ServiceImpl) GetWorkerAssignment(ctx context.Context, workerName, actorUID string) (*ateapi.ActorAssignment, error) {
 	return s.store.GetWorkerAssignment(ctx, workerName, actorUID)
 }

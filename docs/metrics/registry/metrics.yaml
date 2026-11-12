@@ -313,6 +313,13 @@ groups:
               stability: development
               value: boot
               brief: A start from nothing. This is not a restore. It does not occur on the atelet histograms.
+            - id: resident
+              stability: development
+              value: resident
+              brief: >
+                A sandbox the template's resident pool restored before the
+                claim. The resume adopts it instead of restoring a snapshot.
+                It does not occur on the atelet histograms.
       - id: ate.snapshot.fidelity
         stability: development
         brief: The state layers the snapshot holds.

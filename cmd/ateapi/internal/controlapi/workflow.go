@@ -170,6 +170,7 @@ func (w *ActorWorkflow) copySnapshot(ctx context.Context, src, dst resources.Sto
 // ActorWorkflow and nothing more.
 type actorWorkflowStore interface {
 	GetActor(ctx context.Context, actorRef resources.ActorRef) (*ateapi.Actor, error)
+	ListActors(ctx context.Context, atespace string, opts store.ListOptions) (store.ListResponse[*ateapi.Actor], error)
 	UpdateActor(ctx context.Context, actorRef resources.ActorRef, precondition store.Precondition, mutate func(toUpdate *ateapi.Actor) error) (*ateapi.Actor, error)
 	MarkActorForDeletion(ctx context.Context, actorRef resources.ActorRef, precondition store.DeletePreconditions, mutate func(toUpdate *ateapi.Actor) error) (*ateapi.Actor, error)
 	DeleteActor(ctx context.Context, actorRef resources.ActorRef, precondition store.DeletePreconditions) (*ateapi.Actor, error)

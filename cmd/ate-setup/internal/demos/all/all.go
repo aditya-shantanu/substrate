@@ -29,5 +29,6 @@ import (
 	_ "go.ate.dev/substrate/cmd/ate-setup/internal/demos/jupyter"
 	_ "go.ate.dev/substrate/cmd/ate-setup/internal/demos/multitemplate"
 	_ "go.ate.dev/substrate/cmd/ate-setup/internal/demos/parking"
+	_ "go.ate.dev/substrate/cmd/ate-setup/internal/demos/resident"
 	_ "go.ate.dev/substrate/cmd/ate-setup/internal/demos/sandbox"
 )

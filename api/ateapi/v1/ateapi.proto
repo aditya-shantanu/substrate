@@ -946,6 +946,44 @@ message ActorStatus {
   // +k8s:minimum=0
   // +k8s:update=NoUnset
   int32 last_assigned_generation = 7;
+
+  // resident is set while the Actor's sandbox comes from its template's
+  // resident pool: a sandbox restored from the golden snapshot ahead of any
+  // claim. Unset for Actors that never touched the pool.
+  //
+  // +k8s:optional
+  ResidentStatus resident = 8;
+}
+
+// ResidentState is where an Actor stands in its template's resident pool.
+enum ResidentState {
+  RESIDENT_STATE_UNSPECIFIED = 0;
+  // POOLED: the Actor is a pool member under a placeholder name, running and
+  // waiting for a CreateActor to take it.
+  RESIDENT_STATE_POOLED = 1;
+  // RESERVED: a CreateActor took the member. The Actor reads SUSPENDED and
+  // keeps the member's worker assignment; its first resume adopts the
+  // sandbox instead of restoring a snapshot.
+  RESIDENT_STATE_RESERVED = 2;
+  // ADOPTED: the first resume completed on the pooled sandbox.
+  RESIDENT_STATE_ADOPTED = 3;
+  // Keep this in sync with ResidentStatus.state's maximum.
+}
+
+// ResidentStatus records an Actor's relation to its template's resident pool.
+message ResidentStatus {
+  // +k8s:required
+  // +k8s:minimum=1
+  // +k8s:maximum=3 # keep this in sync with the ResidentState enum
+  ResidentState state = 1;
+
+  // pooled_name is the placeholder name the sandbox was restored under. Set
+  // when a CreateActor takes the member; the first resume hands it to atelet
+  // so the node can retire that identity.
+  //
+  // +k8s:optional
+  // +k8s:format=k8s-short-name
+  string pooled_name = 2;
 }
 
 // ActorCrash describes the failure that moved an Actor to CRASHED.
@@ -1212,8 +1250,52 @@ message ActorTemplate {
   // +k8s:optional
   EgressPolicyTemplate golden_egress_policy = 9;
 
+  // resident_pool keeps sandboxes of this template restored ahead of demand.
+  // The pool reconciler holds replicas Actors restored from the golden
+  // snapshot and running under placeholder names. CreateActor takes one when
+  // it can, and that Actor's first resume adopts the running sandbox instead
+  // of restoring the snapshot. Pool members book worker capacity like any
+  // running Actor. Unset or zero replicas keeps no pool.
+  //
+  // +k8s:optional
+  ResidentPool resident_pool = 10;
+
   // +k8s:optional
   ActorTemplateStatus status = 7;
+}
+
+// ResidentPool sizes an ActorTemplate's pool of pre-restored sandboxes.
+message ResidentPool {
+  // replicas is how many pooled Actors the reconciler keeps running. A
+  // template with external volumes or a disabled golden snapshot cannot have
+  // a pool.
+  //
+  // +k8s:required
+  // +k8s:minimum=0
+  // +k8s:maximum=1000
+  int32 replicas = 1;
+}
+
+// ResidentPoolStatus is the observed state of an ActorTemplate's resident pool.
+message ResidentPoolStatus {
+  // ready is how many pooled Actors are running and available to CreateActor.
+  //
+  // +k8s:optional
+  // +k8s:minimum=0
+  int32 ready = 1;
+
+  // pending is how many pooled Actors are still being created or restored.
+  //
+  // +k8s:optional
+  // +k8s:minimum=0
+  int32 pending = 2;
+
+  // error_message is the last error the pool reconciler hit, if any. Cleared
+  // once a pass succeeds.
+  //
+  // +k8s:optional
+  // +k8s:maxLength=4096
+  string error_message = 3;
 }
 
 // ResourceRequirements are the compute resources a workload may use.
@@ -1264,6 +1346,9 @@ message GoldenSnapshotStatus {
 message ActorTemplateStatus {
   // +k8s:optional
   GoldenSnapshotStatus golden_snapshot_status = 1;
+
+  // +k8s:optional
+  ResidentPoolStatus resident_pool_status = 2;
 }
 
 // SnapshotConfig selects what actor snapshots capture and where they are

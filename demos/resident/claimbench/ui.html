@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Resident pools: claim latency</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --ink:#e7e9ee; --muted:#8b93a7; --create:#5b8def; --resume:#f2a93b; --first:#3ecf8e; --line:#262b36; }
+  * { box-sizing: border-box; }
+  body { margin:0; font: 15px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background:var(--bg); color:var(--ink); }
+  header { padding:22px 32px 10px; display:flex; align-items:baseline; gap:18px; }
+  header h1 { margin:0; font-size:22px; font-weight:600; }
+  header .sub { color:var(--muted); }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:20px; padding:12px 32px 32px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px; min-height:520px; display:flex; flex-direction:column; }
+  .card h2 { margin:0 0 4px; font-size:17px; font-weight:600; display:flex; align-items:center; gap:10px; }
+  .pill { font-size:12px; padding:2px 8px; border-radius:999px; background:#232838; color:var(--muted); }
+  .pill.on { background:#1f3b2d; color:var(--first); }
+  .pool { margin:10px 0 14px; color:var(--muted); font-size:13px; }
+  .pool .dots { display:inline-flex; gap:5px; margin-left:8px; vertical-align:middle; }
+  .pool .dot { width:12px; height:12px; border-radius:50%; background:#2a3142; border:1px solid #39415a; transition: background .3s; }
+  .pool .dot.ready { background:var(--first); border-color:var(--first); }
+  .pool .dot.pending { background:var(--resume); border-color:var(--resume); }
+  .actions { display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap; }
+  button { background:#262c3a; color:var(--ink); border:1px solid #39415a; border-radius:8px; padding:7px 12px; font-size:14px; cursor:pointer; }
+  button:hover { background:#2f3647; }
+  button.primary { background:#2b4a8c; border-color:#3a63b8; }
+  .stats { display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-bottom:12px; }
+  .stat { background:#11141b; border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
+  .stat .v { font-size:24px; font-weight:600; font-variant-numeric: tabular-nums; }
+  .stat .k { font-size:12px; color:var(--muted); }
+  .bars { flex:1; overflow:auto; display:flex; flex-direction:column; gap:6px; }
+  .row { display:grid; grid-template-columns: 90px 1fr 70px; gap:10px; align-items:center; font-size:13px; }
+  .row .name { color:var(--muted); font-family: ui-monospace, Menlo, monospace; font-size:12px; }
+  .bar { height:16px; display:flex; background:#11141b; border-radius:4px; overflow:hidden; }
+  .seg { height:100%; }
+  .seg.create { background:var(--create); } .seg.resume { background:var(--resume); } .seg.first { background:var(--first); }
+  .row .ms { text-align:right; font-variant-numeric: tabular-nums; }
+  .row.err .bar { background:#3b1d1d; }
+  .legend { display:flex; gap:16px; font-size:12px; color:var(--muted); margin-top:10px; }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:middle; }
+  footer { padding:0 32px 24px; color:var(--muted); font-size:13px; }
+  .race { display:flex; justify-content:center; padding:0 32px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Resident pools</h1>
+  <div class="sub">time from <b>CreateActor</b> to the actor's <b>first HTTP response</b>, per claim</div>
+</header>
+<div class="race"><button class="primary" id="race">Claim 10 from each, side by side</button>&nbsp;<button id="clear">Clear</button></div>
+<main id="main"></main>
+<footer>
+  Each bar is one actor: <span class="legend"><span><i style="background:var(--create)"></i>CreateActor</span><span><i style="background:var(--resume)"></i>ResumeActor</span><span><i style="background:var(--first)"></i>first response through the router</span></span>
+  A template with a resident pool keeps that many sandboxes restored and running ahead of demand; a claim adopts one instead of restoring the golden snapshot.
+</footer>
+<script>
+const state = { templates: [], scale: 600 };
+const cards = {};
+function pct(xs, p) { if (!xs.length) return 0; const s = [...xs].sort((a,b)=>a-b); return s[Math.min(s.length-1, Math.round(p/100*(s.length-1)))]; }
+function card(t) {
+  const el = document.createElement('section'); el.className = 'card'; el.dataset.t = t.name;
+  el.innerHTML = `
+    <h2>${t.name} <span class="pill ${t.replicas>0?'on':''}">${t.replicas>0 ? 'resident pool: '+t.replicas : 'no pool'}</span></h2>
+    <div class="pool"><span class="poolText"></span><span class="dots"></span></div>
+    <div class="actions"><button data-n="1">Claim 1</button><button data-n="10" class="primary">Claim 10</button><button data-n="10" data-c="5">Claim 10, 5 at a time</button></div>
+    <div class="stats">
+      <div class="stat"><div class="v" id="p50">–</div><div class="k">total p50 ms</div></div>
+      <div class="stat"><div class="v" id="p90">–</div><div class="k">total p90 ms</div></div>
+      <div class="stat"><div class="v" id="res">–</div><div class="k">resume p50 ms</div></div>
+      <div class="stat"><div class="v" id="n">0</div><div class="k">claims (adopted)</div></div>
+    </div>
+    <div class="bars"></div>`;
+  el.querySelectorAll('button').forEach(b => b.onclick = () => run(t.name, +b.dataset.n, +(b.dataset.c||1)));
+  document.getElementById('main').appendChild(el);
+  cards[t.name] = { el, claims: [] };
+  return cards[t.name];
+}
+function render(name) {
+  const c = cards[name]; const ok = c.claims.filter(x => !x.error);
+  c.el.querySelector('#p50').textContent = ok.length ? Math.round(pct(ok.map(x=>x.total_ms),50)) : '–';
+  c.el.querySelector('#p90').textContent = ok.length ? Math.round(pct(ok.map(x=>x.total_ms),90)) : '–';
+  c.el.querySelector('#res').textContent = ok.length ? Math.round(pct(ok.map(x=>x.resume_ms),50)) : '–';
+  c.el.querySelector('#n').textContent = `${c.claims.length} (${ok.filter(x=>x.source==='resident').length})`;
+}
+function addRow(x) {
+  const c = cards[x.template]; c.claims.push(x);
+  const row = document.createElement('div'); row.className = 'row' + (x.error ? ' err' : '');
+  const w = v => Math.max(0, Math.min(100, 100*v/state.scale)) + '%';
+  row.innerHTML = `<span class="name">${x.actor}${x.source==='resident'?' ✓':''}</span>
+    <div class="bar"><div class="seg create" style="width:${w(x.create_ms)}" title="create ${x.create_ms.toFixed(0)} ms"></div><div class="seg resume" style="width:${w(x.resume_ms)}" title="resume ${x.resume_ms.toFixed(0)} ms"></div><div class="seg first" style="width:${w(x.first_ms)}" title="first response ${x.first_ms.toFixed(0)} ms"></div></div>
+    <span class="ms">${x.error ? 'error' : Math.round(x.total_ms) + ' ms'}</span>`;
+  const bars = c.el.querySelector('.bars'); bars.prepend(row);
+  render(x.template);
+}
+function run(template, n, concurrency) {
+  const es = new EventSource(`/api/run?template=${encodeURIComponent(template)}&n=${n}&concurrency=${concurrency}`);
+  es.onmessage = e => addRow(JSON.parse(e.data));
+  es.addEventListener('done', () => es.close());
+  es.onerror = () => es.close();
+}
+async function refresh() {
+  try {
+    const s = await (await fetch('/api/state')).json();
+    for (const t of s.templates) {
+      const c = cards[t.name] || card(t);
+      const dots = c.el.querySelector('.dots'); dots.innerHTML = '';
+      for (let i = 0; i < t.replicas; i++) { const d = document.createElement('span'); d.className = 'dot ' + (i < t.ready ? 'ready' : i < t.ready + t.pending ? 'pending' : ''); dots.appendChild(d); }
+      c.el.querySelector('.poolText').textContent = t.replicas > 0 ? `${t.ready} of ${t.replicas} residents ready${t.pending ? ', ' + t.pending + ' restoring' : ''}` : (t.golden ? 'every claim restores the golden snapshot' : 'golden snapshot not built yet');
+      c.el.querySelector('.pill').className = 'pill' + (t.replicas > 0 ? ' on' : '');
+    }
+  } catch (e) { console.warn(e); }
+}
+document.getElementById('race').onclick = () => { for (const name in cards) run(name, 10, 1); };
+document.getElementById('clear').onclick = () => { for (const name in cards) { cards[name].claims = []; cards[name].el.querySelector('.bars').innerHTML = ''; render(name); } };
+refresh(); setInterval(refresh, 1000);
+</script>
+</body>
+</html>

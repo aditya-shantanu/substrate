@@ -18,9 +18,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/internal/ateattr"
 	"go.ate.dev/substrate/internal/preview"
 	"go.ate.dev/substrate/internal/resources"
 )
@@ -180,5 +182,27 @@ func (w *WorkerWorkflow) releaseEarlierAssignment(ctx context.Context, worker *a
 		// Restore was cut short by the restart.
 		return nil
 	}
+	if actor.GetStatus().GetResident().GetState() == ateapi.ResidentState_RESIDENT_STATE_RESERVED {
+		// The sandbox reserved for the Actor died with the worker before the
+		// Actor ever ran. Release it; the first resume restores the snapshot.
+		return w.releaseReservedResident(ctx, worker, actorRef, actor)
+	}
 	return w.crashBoundActor(ctx, worker, actorRef, actor, "Releasing actor from a restarted worker", crashMessageWorkerRestarted)
+}
+
+// releaseReservedResident returns an Actor whose reserved resident is gone to
+// plain SUSPENDED with no worker, in the write that releases its assignment.
+func (w *WorkerWorkflow) releaseReservedResident(ctx context.Context, worker *ateapi.Worker, actorRef resources.ActorRef, actor *ateapi.Actor) error {
+	slog.LogAttrs(ctx, slog.LevelInfo, "Releasing the reserved resident of an actor from a restarted worker",
+		append(ateattr.ActorRefLogAttrs(actorRef), slog.String("worker", worker.GetMetadata().GetName()))...)
+	if _, err := w.store.UpdateActorAndRelease(ctx, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapi.Actor) error {
+		toUpdate.Status.State = ateapi.ActorState_ACTOR_STATE_SUSPENDED
+		toUpdate.Status.WorkerAssignment = nil
+		toUpdate.Status.AssignedNode = ""
+		toUpdate.Status.Resident = nil
+		return nil
+	}); err != nil {
+		return fmt.Errorf("while releasing the reserved resident of %s: %w", actorRef, err)
+	}
+	return nil
 }

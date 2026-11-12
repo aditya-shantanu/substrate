@@ -114,6 +114,7 @@ var (
 	snapshotLocation        = pflag.String("snapshot-location", "", "Base object-storage URI (for example gs://BUCKET/PREFIX/) that actor snapshots are stored under. Required unless the PerTemplateSnapshotLocation preview gate is enabled; with the gate, an actor template's snapshotConfig.storageLocation overrides it.")
 
 	templateResyncInterval = pflag.Duration("template-resync-interval", 20*time.Second, fmt.Sprintf("Interval between actor template resyncs. Must be at least %s.", minResyncInterval))
+	residentPoolResyncInterval = pflag.Duration("resident-pool-resync-interval", 10*time.Second, "Interval between resident pool resyncs, which top up each ActorTemplate's pool.")
 
 	showVersion  = pflag.Bool("version", false, "Print version and exit.")
 	previewFlags = pflag.StringSlice("preview", nil, "Preview gates to enable.")
@@ -361,6 +362,10 @@ func main() {
 	// Drive stored ActorTemplates through the golden actor flow.
 	templateReconciler := controlapi.NewActorTemplateReconciler(persistence, controlSrv, *templateResyncInterval)
 	templateReconciler.Start(shutdownCtx)
+
+	// Keep each ActorTemplate's resident pool at its replicas.
+	residentReconciler := controlapi.NewResidentPoolReconciler(persistence, controlSrv, *residentPoolResyncInterval)
+	residentReconciler.Start(shutdownCtx)
 
 	// Crash the Actors lost when a Worker's worker restarts.
 	workerAssignmentReconciler := controlapi.NewWorkerAssignmentReconciler(persistence, workerCache)
