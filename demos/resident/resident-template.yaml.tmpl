@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# One guest of the resident pool demo, rendered twice per guest: with a pool
-# (${RESIDENT_POOL} kept) and without (dropped). The guest image is any OCI
+# One guest of the resident pool demo, rendered twice per guest: with the
+# resident pool lines kept and with them dropped. The guest image is any OCI
 # image; the counter binary rides in as an image volume at /ate so the actor
-# answers HTTP whatever the image's own entrypoint is. ${TOUCH_MEMORY_ARG}
-# makes the golden carry that much memory.
+# answers HTTP whatever the image's own entrypoint is, and its touch-memory
+# flag makes the golden carry that much memory. The placeholders are filled by
+# cmd/ate-setup/internal/demos/resident.
 metadata:
   atespace: ate-demo-resident
   name: ${NAME}
