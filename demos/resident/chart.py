@@ -55,7 +55,7 @@ def summarize(rows, guests, cls):
 def fmt_mb(mb):
     return f"{mb/1000:.1f} GB" if mb >= 1000 else f"{mb} MB"
 
-def page(guests, title, runtime, compact=False, theme=""):
+def page(guests, title, runtime, compact=False, theme="", pace="one claim every 300 ms"):
     W, PAD_L, PAD_R = 920, 250, 40
     ROW = 56
     # ---- dumbbell
@@ -153,7 +153,7 @@ details{{margin-top:26px}} table{{border-collapse:collapse;font-size:13px;font-v
 footer{{color:var(--text2);font-size:13px;margin-top:30px}}
 </style></head><body><main>
 <h1>{html.escape(title)}</h1>
-<div class="sub">A fresh actor's claim, CreateActor to first HTTP response through the router, with and without a resident pool, across guest images from {fmt_mb(guests[0]["size_mb"])} to {fmt_mb(guests[-1]["size_mb"])}. {html.escape(runtime)}, in-cluster, 30 claims per bar, one claim every 300 ms. Marks and labels are p90.</div>
+<div class="sub">A fresh actor's claim, CreateActor to first HTTP response through the router, with and without a resident pool, across guest images from {fmt_mb(guests[0]["size_mb"])} to {fmt_mb(guests[-1]["size_mb"])}. {html.escape(runtime)}, in-cluster, 30 claims per bar, {html.escape(pace)}. Marks and labels are p90.</div>
 <div class="tiles">{tiles_html}</div>
 <h2>Claim time per guest</h2>{legend}{dumbbell}
 {"" if compact else f'<h2>The resume step against the memory a guest holds</h2><div class="sub">The restore varies with the guest; the adoption does not, because nothing is restored.</div>{legend}{linechart}<details><summary>Table view</summary>{table}</details>'}
@@ -172,12 +172,13 @@ def main():
     ap.add_argument("--subtitle", default="", help="replaces the runtime words in the subtitle, e.g. 'microVM on one c3-standard-192-metal node'")
     ap.add_argument("--compact", action="store_true", help="tiles and the dumbbell only, for a message attachment")
     ap.add_argument("--theme", default="", choices=["", "light", "dark"], help="pin the color scheme instead of following the viewer's")
+    ap.add_argument("--pace", default="one claim every 300 ms", help="how the claims were paced, for the subtitle")
     a = ap.parse_args()
     guests = summarize(load(a.results), json.load(open(a.guests)), a.cls)
     guests = [g for g in guests if g["plain"]["n"] and g["pooled"]["n"]]
     if not guests:
         sys.exit("no complete guests in the results")
-    open(a.out, "w").write(page(guests, a.title, a.subtitle or a.cls, a.compact, a.theme))
+    open(a.out, "w").write(page(guests, a.title, a.subtitle or a.cls, a.compact, a.theme, a.pace))
     print("wrote", a.out, "guests:", [g["label"] for g in guests])
 
 if __name__ == "__main__":
