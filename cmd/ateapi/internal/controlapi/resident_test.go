@@ -17,9 +17,11 @@ package controlapi
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/apivalidation"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store/storetest"
 	"go.ate.dev/substrate/internal/apierror"
@@ -132,5 +134,42 @@ func TestResumeActor_ReleasesResidentWhenAdoptFails(t *testing.T) {
 	}
 	if _, err := st.GetWorkerAssignment(ctx, wireTestAssignment().GetWorker().GetName(), actor.GetMetadata().GetUid()); apierror.Code(err) == codes.OK {
 		t.Error("the resident's assignment row survived the release")
+	}
+}
+
+// TestCreateResidentActor pins the row the pool reconciler stores: a valid
+// placeholder name under the template's uid prefix, SUSPENDED, POOLED.
+func TestCreateResidentActor(t *testing.T) {
+	ctx := context.Background()
+	st := newTestPersistence(t)
+	newTestActorWorkflow(t, st, "ns", "tmpl1")
+	tmpl, err := st.GetActorTemplate(ctx, resources.ActorTemplateRef{Atespace: "ns", Name: "tmpl1"})
+	if err != nil {
+		t.Fatalf("GetActorTemplate: %v", err)
+	}
+	s := newServiceImpl(st, nil)
+
+	actor, err := s.CreateResidentActor(ctx, tmpl)
+	if err != nil {
+		t.Fatalf("CreateResidentActor: %v", err)
+	}
+	name := actor.GetMetadata().GetName()
+	wantPrefix := residentPrefixFor(tmpl)
+	if !strings.HasPrefix(name, wantPrefix) || len(name) != len(wantPrefix)+8 || strings.ToLower(name) != name {
+		t.Errorf("resident name = %q, want %s plus eight lower-case characters", name, wantPrefix)
+	}
+	if errs := apivalidation.ValidateCreateActorRequest(ctx, &ateapi.CreateActorRequest{Actor: &ateapi.Actor{Metadata: &ateapi.ResourceMetadata{Atespace: "ns", Name: name}, ActorTemplate: actor.GetActorTemplate()}}); len(errs) > 0 {
+		t.Errorf("resident name %q fails validation: %v", name, errs)
+	}
+	if st := actor.GetStatus(); st.GetState() != ateapi.ActorState_ACTOR_STATE_SUSPENDED || st.GetResident().GetState() != ateapi.ResidentState_RESIDENT_STATE_POOLED {
+		t.Errorf("status = %v, want SUSPENDED and POOLED", st)
+	}
+	pooled, err := listPooledResidents(ctx, st, tmpl)
+	if err != nil {
+		t.Fatalf("listPooledResidents: %v", err)
+	}
+	// Not RUNNING yet, so not claimable.
+	if len(pooled) != 0 {
+		t.Errorf("listPooledResidents = %d residents, want 0 before the resident runs", len(pooled))
 	}
 }

@@ -287,7 +287,7 @@ func (s *ServiceImpl) CreateResidentActor(ctx context.Context, template *ateapi.
 	inActor := &ateapi.Actor{
 		Metadata: &ateapi.ResourceMetadata{
 			Atespace: template.GetMetadata().GetAtespace(),
-			Name:     residentPrefixFor(template) + rand.Text()[:8],
+			Name:     residentPrefixFor(template) + strings.ToLower(rand.Text()[:8]),
 		},
 		ActorTemplate: resources.ActorTemplateRefFromActorTemplate(template).ToObjectRef(),
 	}
