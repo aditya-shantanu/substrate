@@ -1383,3 +1383,56 @@ func TestIngressReincarnationSurvivesStaleDeactivate(t *testing.T) {
 		t.Error("Deactivate left the actor active")
 	}
 }
+
+// Adopt moves an actor's ingress to its new name: the new name serves, the
+// previous one stops, and an older incarnation under the new name is
+// replaced. The previous name must be active under the actor's UID.
+func TestAdoptMovesIngressToTheNewName(t *testing.T) {
+	upstream, err := url.Parse("http://actor.internal:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServer(t, upstream)
+	if err := s.Activate("team-a", "resident", "uid-1", testDial); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Activate("team-a", "client", "uid-old", testDial); err != nil {
+		t.Fatal(err)
+	}
+	older := s.active[resources.ActorRef{Atespace: "team-a", Name: "client"}]
+
+	if err := s.Adopt(context.Background(), "team-a", "other", "client", "uid-1", testDial); err == nil {
+		t.Fatal("Adopt from a name the actor is not active under succeeded")
+	}
+	if err := s.Adopt(context.Background(), "team-a", "resident", "client", "uid-2", testDial); err == nil {
+		t.Fatal("Adopt with another actor's UID succeeded")
+	}
+	if err := s.Adopt(context.Background(), "team-a", "resident", "client", "uid-1", testDial); err != nil {
+		t.Fatal(err)
+	}
+	if older.ctx.Err() == nil {
+		t.Error("the older incarnation under the new name was not canceled")
+	}
+	setActorTransport(t, s, "team-a", "client", roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: http.NoBody}, nil
+	}))
+	for _, tc := range []struct {
+		name string
+		want int
+	}{
+		{name: "client", want: http.StatusNoContent},
+		{name: "resident", want: http.StatusMisdirectedRequest},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "https://worker/", nil)
+		req.Host = tc.name + ".team-a.actors.resources.substrate.ate.dev"
+		req.Header.Set(atenet.TargetActorHeader, "team-a/"+tc.name)
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if rec.Code != tc.want {
+			t.Errorf("%s: status = %d, want %d", tc.name, rec.Code, tc.want)
+		}
+	}
+	if got := s.active[resources.ActorRef{Atespace: "team-a", Name: "client"}]; got == nil || got.uid != "uid-1" {
+		t.Fatalf("after Adopt, client = %v, want uid-1", got)
+	}
+}

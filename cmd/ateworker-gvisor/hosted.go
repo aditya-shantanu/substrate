@@ -27,6 +27,7 @@ import (
 	"go.ate.dev/substrate/internal/apierror"
 	"go.ate.dev/substrate/internal/ateworker/actornet"
 	"go.ate.dev/substrate/internal/ateworker/cgroup"
+	"go.ate.dev/substrate/internal/atunnel"
 	"go.ate.dev/substrate/internal/atunnel/ingress"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
 	"go.ate.dev/substrate/internal/resources"
@@ -35,9 +36,14 @@ import (
 
 // hostedActor holds one actor's attribution, network, and runtime state.
 type hostedActor struct {
-	// Attribution is available during boot.
-	attribution resources.ActorAttribution
-	network     *actornet.SandboxSession
+	uid string
+	// identity is the actor's attribution, available during boot. adopt
+	// replaces it; read it through attribution.
+	identity atomic.Pointer[resources.ActorAttribution]
+	network  *actornet.SandboxSession
+	// dnsPolicy is the egress policy source of the actor's DNS relay. Set with
+	// network.
+	dnsPolicy *atunnel.EgressPolicySource
 	// Set once the containers exist.
 	session *workloadSession
 	// usage is this activation's epoch, CPU baseline, and latest sample.
@@ -60,6 +66,23 @@ type hostedActor struct {
 	memory cgroup.MemoryGuard
 }
 
+// newHostedActor hosts attribution's actor with no network or session yet.
+func newHostedActor(attribution resources.ActorAttribution) *hostedActor {
+	h := &hostedActor{uid: attribution.UID}
+	h.identity.Store(&attribution)
+	return h
+}
+
+// attribution returns the actor's current identity.
+func (h *hostedActor) attribution() resources.ActorAttribution {
+	return *h.identity.Load()
+}
+
+// adopt gives the actor a new identity. Its UID does not change.
+func (h *hostedActor) adopt(attribution resources.ActorAttribution) {
+	h.identity.Store(&attribution)
+}
+
 // admitActor reserves capacity before network setup. An actor that is already
 // hosted keeps its slot; its old network is returned for the caller to close.
 func (s *AteWorkerService) admitActor(attribution resources.ActorAttribution, memoryBytes int64) (*hostedActor, *actornet.SandboxSession, error) {
@@ -80,8 +103,10 @@ func (s *AteWorkerService) admitActor(attribution resources.ActorAttribution, me
 	}
 	// The sandbox cgroup is new with every activation, so its counters start
 	// at zero.
-	ctx, cancel := context.WithCancel(context.Background())
-	hosted := &hostedActor{attribution: attribution, usage: workerstats.NewActivation(time.Now(), false), ctx: ctx, cancel: cancel, memoryBytes: memoryBytes}
+	hosted := newHostedActor(attribution)
+	hosted.usage = workerstats.NewActivation(time.Now(), false)
+	hosted.ctx, hosted.cancel = context.WithCancel(context.Background())
+	hosted.memoryBytes = memoryBytes
 	s.actors[attribution.UID] = hosted
 	return hosted, stale, nil
 }
@@ -109,11 +134,12 @@ func (s *AteWorkerService) hostActor(ctx context.Context, attribution resources.
 		}
 	}
 
+	dnsPolicy := s.tunnel.ActorEgressPolicy(attribution)
 	session, err := actornet.ServeSandbox(ctx, actornet.SandboxNetworkConfig{
 		ActorUID:   uid,
 		Veth:       true,
 		EgressPort: s.tunnel.EgressPort,
-		DNSPolicy:  s.tunnel.ActorEgressPolicy(attribution),
+		DNSPolicy:  dnsPolicy,
 	}, s.tunnel.Egress, s.tunnel.DNSRelay)
 	if err != nil {
 		evict()
@@ -122,6 +148,7 @@ func (s *AteWorkerService) hostActor(ctx context.Context, attribution resources.
 
 	s.actorsMu.Lock()
 	hosted.network = session
+	hosted.dnsPolicy = dnsPolicy
 	s.actorsMu.Unlock()
 	return hosted, nil
 }
@@ -166,7 +193,7 @@ func (s *AteWorkerService) unhostActor(ctx context.Context, actorUID string) err
 func (s *AteWorkerService) pinSandbox(ctx context.Context, hosted *hostedActor, actorDirs *ateworkerpb.ActorDirs) {
 	sandbox, err := openSandboxProcess(actorDirs)
 	if err != nil {
-		slog.WarnContext(ctx, "Cannot pin the sandbox process", slog.String("actorUID", hosted.attribution.UID), slog.Any("err", err))
+		slog.WarnContext(ctx, "Cannot pin the sandbox process", slog.String("actorUID", hosted.uid), slog.Any("err", err))
 		return
 	}
 	s.actorsMu.Lock()

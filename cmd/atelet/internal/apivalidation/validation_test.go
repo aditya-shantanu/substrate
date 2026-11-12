@@ -872,6 +872,91 @@ func TestValidatePromoteSnapshotRequest(t *testing.T) {
 	}
 }
 
+func TestValidateAdoptRequest(t *testing.T) {
+	valid := func(mutate ...func(*ateletpb.AdoptRequest)) *ateletpb.AdoptRequest {
+		r := &ateletpb.AdoptRequest{
+			WorkerPodUid:          "0f9a3b1c-2d4e-5f60-7182-93a4b5c6d7e8",
+			Atespace:              "team-a",
+			ActorUid:              "01234567-89ab-cdef-0123-456789abcdef",
+			PreviousActorName:     "resident-1",
+			ActorName:             "actor-1",
+			ActorTemplateAtespace: "team-a",
+			ActorTemplateName:     "tmpl-1",
+			EgressGateway:         &ateletpb.EgressGateway{Address: "gateway:443"},
+		}
+		for _, m := range mutate {
+			m(r)
+		}
+		return r
+	}
+
+	tests := []struct {
+		name string
+		obj  *ateletpb.AdoptRequest
+		want field.ErrorList
+	}{{
+		name: "valid",
+		obj:  valid(),
+	}, {
+		name: "valid: no egress gateway or template",
+		obj: valid(func(r *ateletpb.AdoptRequest) {
+			r.EgressGateway = nil
+			r.ActorTemplateAtespace = ""
+			r.ActorTemplateName = ""
+		}),
+	}, {
+		name: "missing worker_pod_uid",
+		obj:  valid(func(r *ateletpb.AdoptRequest) { r.WorkerPodUid = "" }),
+		want: field.ErrorList{field.Required(field.NewPath("worker_pod_uid"), "")},
+	}, {
+		name: "invalid worker_pod_uid: not a pod UID",
+		obj:  valid(func(r *ateletpb.AdoptRequest) { r.WorkerPodUid = "worker-1" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("worker_pod_uid"), nil, "").WithOrigin("format=k8s-uuid")},
+	}, {
+		name: "missing atespace",
+		obj:  valid(func(r *ateletpb.AdoptRequest) { r.Atespace = "" }),
+		want: field.ErrorList{field.Required(field.NewPath("atespace"), "")},
+	}, {
+		name: "missing actor_uid",
+		obj:  valid(func(r *ateletpb.AdoptRequest) { r.ActorUid = "" }),
+		want: field.ErrorList{field.Required(field.NewPath("actor_uid"), "")},
+	}, {
+		name: "invalid actor_uid: not a uuid",
+		obj:  valid(func(r *ateletpb.AdoptRequest) { r.ActorUid = "not-a-uuid" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("actor_uid"), nil, "").WithOrigin("format=k8s-uuid")},
+	}, {
+		name: "missing previous_actor_name",
+		obj:  valid(func(r *ateletpb.AdoptRequest) { r.PreviousActorName = "" }),
+		want: field.ErrorList{field.Required(field.NewPath("previous_actor_name"), "")},
+	}, {
+		name: "invalid previous_actor_name: uppercase",
+		obj:  valid(func(r *ateletpb.AdoptRequest) { r.PreviousActorName = "Resident-1" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("previous_actor_name"), nil, "").WithOrigin("format=k8s-short-name")},
+	}, {
+		name: "missing actor_name",
+		obj:  valid(func(r *ateletpb.AdoptRequest) { r.ActorName = "" }),
+		want: field.ErrorList{field.Required(field.NewPath("actor_name"), "")},
+	}, {
+		name: "invalid actor_name: path escape",
+		obj:  valid(func(r *ateletpb.AdoptRequest) { r.ActorName = "../escape" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("actor_name"), nil, "").WithOrigin("format=k8s-short-name")},
+	}, {
+		name: "invalid actor_template_atespace: uppercase",
+		obj:  valid(func(r *ateletpb.AdoptRequest) { r.ActorTemplateAtespace = "Team-A" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("actor_template_atespace"), nil, "").WithOrigin("format=k8s-short-name")},
+	}, {
+		name: "egress_gateway address without port",
+		obj:  valid(func(r *ateletpb.AdoptRequest) { r.EgressGateway.Address = "gateway" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("egress_gateway", "address"), nil, "")},
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			matcher := field.ErrorMatcher{}.ByType().ByField().ByOrigin()
+			matcher.Test(t, tt.want, ValidateAdoptRequest(context.Background(), tt.obj))
+		})
+	}
+}
+
 func TestValidateTerminateRequest(t *testing.T) {
 	valid := func(mutate ...func(*ateletpb.TerminateRequest)) *ateletpb.TerminateRequest {
 		r := &ateletpb.TerminateRequest{

@@ -38,13 +38,15 @@ type BrokerCertificateSource struct {
 	socketPath string
 
 	actorAtespace string
-	actorName     string
 	actorUID      string
 
 	tlsConfig  *tls.Config
 	privateKey *ecdsa.PrivateKey
 
-	mu          sync.RWMutex
+	mu sync.RWMutex
+	// actorName is the name the next mint requests a certificate for. Rename
+	// changes it.
+	actorName   string
 	certificate *tls.Certificate
 }
 
@@ -108,6 +110,15 @@ func NewBrokerCertificateSource(cfg BrokerConfig) (*BrokerCertificateSource, err
 // a failed mint fails the restore that needs the certificate.
 const mintAttempts = 4
 
+// Rename changes the actor name the next mint requests a certificate for and
+// returns the previous name. The current certificate stays until that mint.
+func (s *BrokerCertificateSource) Rename(actorName string) (previous string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous, s.actorName = s.actorName, actorName
+	return previous
+}
+
 // MintWorkerCertificate requests and installs a fresh certificate for the source's existing
 // actor key. It returns the new expiry for renewal scheduling. A mint that fails with
 // Unavailable is retried a few times with a short back-off; every other error is final.
@@ -144,9 +155,12 @@ func (s *BrokerCertificateSource) mintOnce(ctx context.Context, csr []byte) (tim
 		return time.Time{}, err
 	}
 	defer conn.Close()
+	s.mu.RLock()
+	actorName := s.actorName
+	s.mu.RUnlock()
 	resp, err := ateletpb.NewWorkerSupportClient(conn).MintActorCertificate(ctx, &ateletpb.MintActorCertificateRequest{
 		ActorAtespace:             s.actorAtespace,
-		ActorName:                 s.actorName,
+		ActorName:                 actorName,
 		ActorUid:                  s.actorUID,
 		CertificateSigningRequest: csr,
 	})
@@ -177,8 +191,13 @@ func (s *BrokerCertificateSource) mintOnce(ctx context.Context, csr []byte) (tim
 	}
 	cert := &tls.Certificate{Certificate: chain, PrivateKey: s.privateKey, Leaf: leaf}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	// A Rename that raced this mint wins: its own mint installs the
+	// certificate for the new name.
+	if s.actorName != actorName {
+		return time.Time{}, fmt.Errorf("egress: actor %s was renamed to %s during the mint", actorName, s.actorName)
+	}
 	s.certificate = cert
-	s.mu.Unlock()
 	return leaf.NotAfter, nil
 }
 

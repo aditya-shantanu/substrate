@@ -36,6 +36,7 @@ const (
 	Worker_RunWorkload_FullMethodName            = "/ateworker.Worker/RunWorkload"
 	Worker_CheckpointWorkload_FullMethodName     = "/ateworker.Worker/CheckpointWorkload"
 	Worker_RestoreWorkload_FullMethodName        = "/ateworker.Worker/RestoreWorkload"
+	Worker_AdoptWorkload_FullMethodName          = "/ateworker.Worker/AdoptWorkload"
 	Worker_GetWorkloadStats_FullMethodName       = "/ateworker.Worker/GetWorkloadStats"
 	Worker_GetActiveWorkloadStats_FullMethodName = "/ateworker.Worker/GetActiveWorkloadStats"
 	Worker_TerminateWorkload_FullMethodName      = "/ateworker.Worker/TerminateWorkload"
@@ -70,6 +71,14 @@ type WorkerClient interface {
 	// written by CheckpointWorkload.  The worker will handle downloading the correct
 	// gVisor / runsc version to match the checkpoint.
 	RestoreWorkload(ctx context.Context, in *RestoreWorkloadRequest, opts ...grpc.CallOption) (*RestoreWorkloadResponse, error)
+	// AdoptWorkload hands a running workload to another actor name with the
+	// same UID and atespace. The sandbox keeps running; only the host state
+	// bound to the name changes: the egress certificate, the egress policy
+	// source, the ingress registration, and the attribution on stats, crash
+	// reports, and logs. Returns NOT_FOUND when the worker does not host
+	// actor_uid and FAILED_PRECONDITION when previous_actor_name is not the
+	// name it hosts the actor under.
+	AdoptWorkload(ctx context.Context, in *AdoptWorkloadRequest, opts ...grpc.CallOption) (*AdoptWorkloadResponse, error)
 	// GetWorkloadStats returns a point-in-time resource-usage sample for the
 	// workload this worker is currently executing.
 	//
@@ -165,6 +174,16 @@ func (c *workerClient) RestoreWorkload(ctx context.Context, in *RestoreWorkloadR
 	return out, nil
 }
 
+func (c *workerClient) AdoptWorkload(ctx context.Context, in *AdoptWorkloadRequest, opts ...grpc.CallOption) (*AdoptWorkloadResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AdoptWorkloadResponse)
+	err := c.cc.Invoke(ctx, Worker_AdoptWorkload_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *workerClient) GetWorkloadStats(ctx context.Context, in *GetWorkloadStatsRequest, opts ...grpc.CallOption) (*GetWorkloadStatsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetWorkloadStatsResponse)
@@ -224,6 +243,14 @@ type WorkerServer interface {
 	// written by CheckpointWorkload.  The worker will handle downloading the correct
 	// gVisor / runsc version to match the checkpoint.
 	RestoreWorkload(context.Context, *RestoreWorkloadRequest) (*RestoreWorkloadResponse, error)
+	// AdoptWorkload hands a running workload to another actor name with the
+	// same UID and atespace. The sandbox keeps running; only the host state
+	// bound to the name changes: the egress certificate, the egress policy
+	// source, the ingress registration, and the attribution on stats, crash
+	// reports, and logs. Returns NOT_FOUND when the worker does not host
+	// actor_uid and FAILED_PRECONDITION when previous_actor_name is not the
+	// name it hosts the actor under.
+	AdoptWorkload(context.Context, *AdoptWorkloadRequest) (*AdoptWorkloadResponse, error)
 	// GetWorkloadStats returns a point-in-time resource-usage sample for the
 	// workload this worker is currently executing.
 	//
@@ -297,6 +324,9 @@ func (UnimplementedWorkerServer) CheckpointWorkload(context.Context, *Checkpoint
 }
 func (UnimplementedWorkerServer) RestoreWorkload(context.Context, *RestoreWorkloadRequest) (*RestoreWorkloadResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RestoreWorkload not implemented")
+}
+func (UnimplementedWorkerServer) AdoptWorkload(context.Context, *AdoptWorkloadRequest) (*AdoptWorkloadResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AdoptWorkload not implemented")
 }
 func (UnimplementedWorkerServer) GetWorkloadStats(context.Context, *GetWorkloadStatsRequest) (*GetWorkloadStatsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetWorkloadStats not implemented")
@@ -382,6 +412,24 @@ func _Worker_RestoreWorkload_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Worker_AdoptWorkload_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AdoptWorkloadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServer).AdoptWorkload(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Worker_AdoptWorkload_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServer).AdoptWorkload(ctx, req.(*AdoptWorkloadRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Worker_GetWorkloadStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetWorkloadStatsRequest)
 	if err := dec(in); err != nil {
@@ -454,6 +502,10 @@ var Worker_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RestoreWorkload",
 			Handler:    _Worker_RestoreWorkload_Handler,
+		},
+		{
+			MethodName: "AdoptWorkload",
+			Handler:    _Worker_AdoptWorkload_Handler,
 		},
 		{
 			MethodName: "GetWorkloadStats",

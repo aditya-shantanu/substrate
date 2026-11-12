@@ -101,7 +101,7 @@ func TestRemoveStaleSandboxLeaf(t *testing.T) {
 func TestCheckMemoryKillsOncePausesForCheckpoint(t *testing.T) {
 	root := t.TempDir()
 	s := &AteWorkerService{cgroupRoot: root, throttleMemory: true}
-	h := &hostedActor{attribution: resources.ActorAttribution{UID: "uid-a"}}
+	h := newHostedActor(resources.ActorAttribution{UID: "uid-a"})
 	leaf := s.sandboxLeaf("uid-a")
 	if err := os.Mkdir(leaf, 0o755); err != nil {
 		t.Fatal(err)

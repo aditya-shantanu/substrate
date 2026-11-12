@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -541,6 +542,8 @@ type fakeActorCertificateSource struct {
 	release   <-chan struct{}
 }
 
+func (s fakeActorCertificateSource) Rename(string) string { return "" }
+
 func (s fakeActorCertificateSource) MintWorkerCertificate(context.Context) (time.Time, error) {
 	if s.calls != nil {
 		s.calls.Add(1)
@@ -648,4 +651,104 @@ func (c *closeNotifyingConn) Close() error {
 	err := c.Conn.Close()
 	c.once.Do(func() { close(c.closed) })
 	return err
+}
+
+// renamingSource records the actor name each mint was for.
+type renamingSource struct {
+	mu      sync.Mutex
+	name    string
+	mintErr error
+	minted  []string
+}
+
+func (s *renamingSource) Rename(name string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.name
+	s.name = name
+	return previous
+}
+
+func (s *renamingSource) MintWorkerCertificate(context.Context) (time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.minted = append(s.minted, s.name)
+	if s.mintErr != nil {
+		return time.Time{}, s.mintErr
+	}
+	return time.Now().Add(2 * time.Hour), nil
+}
+
+func (s *renamingSource) current() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.name
+}
+
+func TestRename(t *testing.T) {
+	mintErr := errors.New("broker refused")
+	for _, tc := range []struct {
+		name       string
+		activate   bool
+		mintErr    error
+		wantErr    error
+		wantName   string
+		wantMinted []string
+	}{{
+		name:       "mints for the new name",
+		activate:   true,
+		wantName:   "actor-new",
+		wantMinted: []string{"actor-new"},
+	}, {
+		name:       "a failed mint keeps the previous name",
+		activate:   true,
+		mintErr:    mintErr,
+		wantErr:    mintErr,
+		wantName:   "actor-old",
+		wantMinted: []string{"actor-new"},
+	}, {
+		name:     "no active egress",
+		wantErr:  ErrNotActive,
+		wantName: "actor-old",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			egress, err := New(func(net.Conn) (string, error) { return "example.com:443", nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			source := &renamingSource{name: "actor-old", mintErr: tc.mintErr}
+			expiresAt := time.Now().Add(time.Hour)
+			if tc.activate {
+				dialer := tunnelDialerFunc(func(context.Context, string) (net.Conn, error) {
+					return nil, errors.New("not dialed in this test")
+				})
+				if err := egress.Activate(testActorUID, dialer, source, expiresAt); err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = egress.Deactivate(context.Background(), testActorUID) }()
+			}
+			if got := egress.Active(testActorUID); got != tc.activate {
+				t.Fatalf("Active() = %v, want %v", got, tc.activate)
+			}
+
+			err = egress.Rename(context.Background(), testActorUID, "actor-new")
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Rename() error = %v, want %v", err, tc.wantErr)
+			}
+			if got := source.current(); got != tc.wantName {
+				t.Errorf("source name = %q, want %q", got, tc.wantName)
+			}
+			if !slices.Equal(source.minted, tc.wantMinted) {
+				t.Errorf("minted for %v, want %v", source.minted, tc.wantMinted)
+			}
+			if tc.activate && tc.wantErr == nil {
+				egress.mu.Lock()
+				got := egress.active[testActorUID].expiresAt
+				egress.mu.Unlock()
+				if !got.After(expiresAt) {
+					t.Errorf("activation expiry = %v, want the new certificate's, after %v", got, expiresAt)
+				}
+			}
+		})
+	}
 }

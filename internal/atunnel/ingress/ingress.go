@@ -445,16 +445,48 @@ func (w flushingWriter) Write(p []byte) (int, error) {
 // Requests are routed by name, so an older incarnation still active under the
 // same name is replaced.
 func (s *Server) Activate(atespace, actorName, actorUID string, dial DialFunc) error {
+	if err := validateActivation(atespace, actorName, dial); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.activateLocked(resources.ActorRef{Atespace: atespace, Name: actorName}, actorUID, dial)
+}
+
+// Adopt moves the actor's ingress from previousName to actorName: requests for
+// actorName reach it through dial, and previousName stops serving once its
+// requests drain. Fails, changing nothing, unless the actor is active under
+// previousName. An older incarnation active under actorName is replaced, as
+// Activate replaces it.
+func (s *Server) Adopt(ctx context.Context, atespace, previousName, actorName, actorUID string, dial DialFunc) error {
+	if err := validateActivation(atespace, actorName, dial); err != nil {
+		return err
+	}
+	previous := resources.ActorRef{Atespace: atespace, Name: previousName}
+	s.mu.Lock()
+	if old, ok := s.active[previous]; !ok || old.uid != actorUID {
+		s.mu.Unlock()
+		return fmt.Errorf("ingress: actor %s (%s) is not active", previous, actorUID)
+	}
+	err := s.activateLocked(resources.ActorRef{Atespace: atespace, Name: actorName}, actorUID, dial)
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return s.Deactivate(ctx, atespace, previousName, actorUID)
+}
+
+func validateActivation(atespace, actorName string, dial DialFunc) error {
 	if !resources.IsValidResourceName(atespace) || !resources.IsValidResourceName(actorName) {
 		return fmt.Errorf("ingress: invalid actor reference %q/%q", atespace, actorName)
 	}
 	if dial == nil {
 		return fmt.Errorf("ingress: actor dialer is required")
 	}
-	ref := resources.ActorRef{Atespace: atespace, Name: actorName}
+	return nil
+}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Server) activateLocked(ref resources.ActorRef, actorUID string, dial DialFunc) error {
 	if old, ok := s.active[ref]; ok {
 		if old.uid == actorUID {
 			return fmt.Errorf("ingress: actor %s is already active", ref)

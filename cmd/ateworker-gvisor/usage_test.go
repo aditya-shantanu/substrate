@@ -40,7 +40,8 @@ func withUsageRecorder(s *AteWorkerService) *workerstatstest.Recorder {
 
 // hostWithEpoch hosts testActor; running means its initial reading is done.
 func hostWithEpoch(s *AteWorkerService, epoch time.Time, running bool) *hostedActor {
-	h := &hostedActor{attribution: testActor, usage: workerstats.NewActivation(epoch, false)}
+	h := newHostedActor(testActor)
+	h.usage = workerstats.NewActivation(epoch, false)
 	if running {
 		h.usage.Initial(nil, nil)
 	}

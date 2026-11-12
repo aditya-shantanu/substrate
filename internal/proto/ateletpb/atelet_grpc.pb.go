@@ -436,6 +436,7 @@ const (
 	Atelet_Run_FullMethodName             = "/atelet.Atelet/Run"
 	Atelet_Checkpoint_FullMethodName      = "/atelet.Atelet/Checkpoint"
 	Atelet_Restore_FullMethodName         = "/atelet.Atelet/Restore"
+	Atelet_Adopt_FullMethodName           = "/atelet.Atelet/Adopt"
 	Atelet_PromoteSnapshot_FullMethodName = "/atelet.Atelet/PromoteSnapshot"
 	Atelet_DetachActor_FullMethodName     = "/atelet.Atelet/DetachActor"
 	Atelet_Terminate_FullMethodName       = "/atelet.Atelet/Terminate"
@@ -471,6 +472,13 @@ type AteletClient interface {
 	Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
 	// Restore restores a workload from a snapshot onto a worker.
 	Restore(ctx context.Context, in *RestoreRequest, opts ...grpc.CallOption) (*RestoreResponse, error)
+	// Adopt hands a workload running on a worker to another actor name with
+	// the same UID and atespace. The sandbox keeps running; atelet and the
+	// worker swap only the host state bound to the name. Returns NOT_FOUND
+	// when no sandbox was started for actor_uid on this node, and
+	// FAILED_PRECONDITION when the worker hosts the actor under another name
+	// than previous_actor_name. A micro-VM worker answers UNIMPLEMENTED.
+	Adopt(ctx context.Context, in *AdoptRequest, opts ...grpc.CallOption) (*AdoptResponse, error)
 	// PromoteSnapshot makes `snapshot` durable in object storage while keeping
 	// its local copy on this node. Used when a snapshot needs to be in object
 	// storage (e.g. for tagging) without evicting the suspended actor's local
@@ -542,6 +550,16 @@ func (c *ateletClient) Restore(ctx context.Context, in *RestoreRequest, opts ...
 	return out, nil
 }
 
+func (c *ateletClient) Adopt(ctx context.Context, in *AdoptRequest, opts ...grpc.CallOption) (*AdoptResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AdoptResponse)
+	err := c.cc.Invoke(ctx, Atelet_Adopt_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *ateletClient) PromoteSnapshot(ctx context.Context, in *PromoteSnapshotRequest, opts ...grpc.CallOption) (*PromoteSnapshotResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PromoteSnapshotResponse)
@@ -602,6 +620,13 @@ type AteletServer interface {
 	Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error)
 	// Restore restores a workload from a snapshot onto a worker.
 	Restore(context.Context, *RestoreRequest) (*RestoreResponse, error)
+	// Adopt hands a workload running on a worker to another actor name with
+	// the same UID and atespace. The sandbox keeps running; atelet and the
+	// worker swap only the host state bound to the name. Returns NOT_FOUND
+	// when no sandbox was started for actor_uid on this node, and
+	// FAILED_PRECONDITION when the worker hosts the actor under another name
+	// than previous_actor_name. A micro-VM worker answers UNIMPLEMENTED.
+	Adopt(context.Context, *AdoptRequest) (*AdoptResponse, error)
 	// PromoteSnapshot makes `snapshot` durable in object storage while keeping
 	// its local copy on this node. Used when a snapshot needs to be in object
 	// storage (e.g. for tagging) without evicting the suspended actor's local
@@ -651,6 +676,9 @@ func (UnimplementedAteletServer) Checkpoint(context.Context, *CheckpointRequest)
 }
 func (UnimplementedAteletServer) Restore(context.Context, *RestoreRequest) (*RestoreResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Restore not implemented")
+}
+func (UnimplementedAteletServer) Adopt(context.Context, *AdoptRequest) (*AdoptResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Adopt not implemented")
 }
 func (UnimplementedAteletServer) PromoteSnapshot(context.Context, *PromoteSnapshotRequest) (*PromoteSnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PromoteSnapshot not implemented")
@@ -736,6 +764,24 @@ func _Atelet_Restore_Handler(srv interface{}, ctx context.Context, dec func(inte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Atelet_Adopt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AdoptRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AteletServer).Adopt(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Atelet_Adopt_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AteletServer).Adopt(ctx, req.(*AdoptRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Atelet_PromoteSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PromoteSnapshotRequest)
 	if err := dec(in); err != nil {
@@ -808,6 +854,10 @@ var Atelet_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Restore",
 			Handler:    _Atelet_Restore_Handler,
+		},
+		{
+			MethodName: "Adopt",
+			Handler:    _Atelet_Adopt_Handler,
 		},
 		{
 			MethodName: "PromoteSnapshot",

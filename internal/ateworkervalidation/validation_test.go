@@ -689,6 +689,96 @@ func TestValidateRestoreWorkloadRequest(t *testing.T) {
 	}
 }
 
+func validAdoptWorkloadRequest(mutate ...func(*ateworkerpb.AdoptWorkloadRequest)) *ateworkerpb.AdoptWorkloadRequest {
+	r := &ateworkerpb.AdoptWorkloadRequest{
+		Atespace:              "team-a",
+		ActorUid:              "01234567-89ab-cdef-0123-456789abcdef",
+		PreviousActorName:     "resident-1",
+		ActorName:             "actor-1",
+		ActorTemplateAtespace: "team-a",
+		ActorTemplateName:     "template-1",
+		EgressGateway:         &ateworkerpb.EgressGateway{Address: "gateway:443"},
+	}
+	for _, m := range mutate {
+		m(r)
+	}
+	return r
+}
+
+func TestValidateAdoptWorkloadRequest(t *testing.T) {
+	valid := validAdoptWorkloadRequest
+
+	tests := []struct {
+		name string
+		obj  *ateworkerpb.AdoptWorkloadRequest
+		want field.ErrorList
+	}{{
+		name: "valid",
+		obj:  valid(),
+	}, {
+		name: "valid: no egress gateway or template",
+		obj: valid(func(r *ateworkerpb.AdoptWorkloadRequest) {
+			r.EgressGateway = nil
+			r.ActorTemplateAtespace = ""
+			r.ActorTemplateName = ""
+		}),
+	}, {
+		name: "missing atespace",
+		obj:  valid(func(r *ateworkerpb.AdoptWorkloadRequest) { r.Atespace = "" }),
+		want: field.ErrorList{field.Required(field.NewPath("atespace"), "")},
+	}, {
+		name: "missing actor_uid",
+		obj:  valid(func(r *ateworkerpb.AdoptWorkloadRequest) { r.ActorUid = "" }),
+		want: field.ErrorList{field.Required(field.NewPath("actor_uid"), "")},
+	}, {
+		name: "invalid actor_uid: not a uuid",
+		obj:  valid(func(r *ateworkerpb.AdoptWorkloadRequest) { r.ActorUid = "not-a-uuid" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("actor_uid"), nil, "").WithOrigin("format=k8s-uuid")},
+	}, {
+		name: "missing previous_actor_name",
+		obj:  valid(func(r *ateworkerpb.AdoptWorkloadRequest) { r.PreviousActorName = "" }),
+		want: field.ErrorList{field.Required(field.NewPath("previous_actor_name"), "")},
+	}, {
+		name: "invalid previous_actor_name: uppercase",
+		obj:  valid(func(r *ateworkerpb.AdoptWorkloadRequest) { r.PreviousActorName = "Resident-1" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("previous_actor_name"), nil, "").WithOrigin("format=k8s-short-name")},
+	}, {
+		name: "missing actor_name",
+		obj:  valid(func(r *ateworkerpb.AdoptWorkloadRequest) { r.ActorName = "" }),
+		want: field.ErrorList{field.Required(field.NewPath("actor_name"), "")},
+	}, {
+		name: "invalid actor_name: path escape",
+		obj:  valid(func(r *ateworkerpb.AdoptWorkloadRequest) { r.ActorName = "../escape" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("actor_name"), nil, "").WithOrigin("format=k8s-short-name")},
+	}, {
+		name: "invalid actor_template_name: uppercase",
+		obj:  valid(func(r *ateworkerpb.AdoptWorkloadRequest) { r.ActorTemplateName = "Template-1" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("actor_template_name"), nil, "").WithOrigin("format=k8s-short-name")},
+	}, {
+		name: "egress_gateway address without port",
+		obj:  valid(func(r *ateworkerpb.AdoptWorkloadRequest) { r.EgressGateway.Address = "gateway" }),
+		want: field.ErrorList{field.Invalid(field.NewPath("egress_gateway", "address"), nil, "")},
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			matcher := field.ErrorMatcher{}.ByType().ByField().ByOrigin()
+			matcher.Test(t, tt.want, Validate_AdoptWorkloadRequest(context.Background(), createOp(), nil, tt.obj, nil))
+		})
+	}
+}
+
+// TestValidateAdoptWorkloadRequestEdge covers the handler-facing wrapper:
+// valid passes, invalid comes back as InvalidArgument.
+func TestValidateAdoptWorkloadRequestEdge(t *testing.T) {
+	if err := ValidateAdoptWorkloadRequest(context.Background(), validAdoptWorkloadRequest()); err != nil {
+		t.Fatalf("valid request rejected: %v", err)
+	}
+	err := ValidateAdoptWorkloadRequest(context.Background(), &ateworkerpb.AdoptWorkloadRequest{})
+	if apierror.Code(err) != codes.InvalidArgument {
+		t.Fatalf("empty request error = %v, want InvalidArgument", err)
+	}
+}
+
 // TestValidateRestoreWorkloadRequestEdge covers the handler-facing wrapper:
 // valid passes, invalid comes back as InvalidArgument.
 func TestValidateRestoreWorkloadRequestEdge(t *testing.T) {

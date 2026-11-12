@@ -262,3 +262,37 @@ func TestBrokerCertificateSourceDoesNotRetryOtherErrors(t *testing.T) {
 		t.Fatalf("broker calls = %d, want 1 (no retry)", broker.calls)
 	}
 }
+
+// A rename mints the next certificate for the new name with the same key, and
+// a rename back restores the old name.
+func TestBrokerCertificateSourceRenameMintsForTheNewName(t *testing.T) {
+	source, broker := newTestBrokerCertificateSource(t, testAteletIdentity("node-a"), time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	if _, err := source.MintWorkerCertificate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if previous := source.Rename("adopted-name"); previous != "actor-name" {
+		t.Fatalf("Rename returned previous name %q, want actor-name", previous)
+	}
+	if _, err := source.MintWorkerCertificate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first := receiveWithin(t, broker.publicKeys, "first certificate public key")
+	second := receiveWithin(t, broker.publicKeys, "second certificate public key")
+	if string(first) != string(second) {
+		t.Fatal("the rename replaced the actor private key")
+	}
+	cert, err := source.GetClientCertificate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantURI := "spiffe://substrate-actor.local/worker/actor/actor-atespace/adopted-name"
+	if len(cert.Leaf.URIs) != 1 || cert.Leaf.URIs[0].String() != wantURI {
+		t.Fatalf("cert.Leaf.URIs = %v, want [%s]", cert.Leaf.URIs, wantURI)
+	}
+	if previous := source.Rename("actor-name"); previous != "adopted-name" {
+		t.Fatalf("Rename returned previous name %q, want adopted-name", previous)
+	}
+}

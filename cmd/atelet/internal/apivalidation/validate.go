@@ -64,6 +64,11 @@ func ValidateRestoreRequest(ctx context.Context, req *ateletpb.RestoreRequest) f
 	return Validate_RestoreRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)
 }
 
+// ValidateAdoptRequest runs the generated validation for req.
+func ValidateAdoptRequest(ctx context.Context, req *ateletpb.AdoptRequest) field.ErrorList {
+	return Validate_AdoptRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)
+}
+
 // ValidatePromoteSnapshotRequest runs the generated validation for req.
 func ValidatePromoteSnapshotRequest(ctx context.Context, req *ateletpb.PromoteSnapshotRequest) field.ErrorList {
 	return Validate_PromoteSnapshotRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)

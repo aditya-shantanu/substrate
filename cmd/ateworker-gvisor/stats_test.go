@@ -103,7 +103,7 @@ func setHostedActor(s *AteWorkerService, attribution *resources.ActorAttribution
 	defer s.actorsMu.Unlock()
 	s.actors = map[string]*hostedActor{}
 	if attribution != nil {
-		s.actors[attribution.UID] = &hostedActor{attribution: *attribution, usage: testActivation()}
+		s.actors[attribution.UID] = hostedForStats(*attribution)
 	}
 }
 
@@ -408,8 +408,8 @@ func TestGetActiveWorkloadStatsSeveralActors(t *testing.T) {
 
 	s.actorsMu.Lock()
 	s.actors = map[string]*hostedActor{
-		testActor.UID: {attribution: testActor, usage: testActivation()},
-		second.UID:    {attribution: second, usage: testActivation()},
+		testActor.UID: hostedForStats(testActor),
+		second.UID:    hostedForStats(second),
 	}
 	s.actorsMu.Unlock()
 
@@ -440,9 +440,9 @@ func TestGetActiveWorkloadStatsOneNoCgroup(t *testing.T) {
 	s := newStatsService(t, healthyCgroup)
 	s.actorsMu.Lock()
 	s.actors = map[string]*hostedActor{
-		testActor.UID: {attribution: testActor, usage: testActivation()},
+		testActor.UID: hostedForStats(testActor),
 		// No cgroup leaf: the sandbox is gone.
-		gone.UID: {attribution: gone, usage: testActivation()},
+		gone.UID: hostedForStats(gone),
 	}
 	s.actorsMu.Unlock()
 
@@ -477,8 +477,8 @@ func TestGetActiveWorkloadStatsOneUnreadable(t *testing.T) {
 	}
 	s.actorsMu.Lock()
 	s.actors = map[string]*hostedActor{
-		testActor.UID: {attribution: testActor, usage: testActivation()},
-		broken.UID:    {attribution: broken, usage: testActivation()},
+		testActor.UID: hostedForStats(testActor),
+		broken.UID:    hostedForStats(broken),
 	}
 	s.actorsMu.Unlock()
 
@@ -505,6 +505,13 @@ func testActivation() *workerstats.Activation {
 	a := workerstats.NewActivation(time.Unix(0, 0), false)
 	a.Initial(nil, nil)
 	return a
+}
+
+// hostedForStats hosts a with a fresh activation.
+func hostedForStats(a resources.ActorAttribution) *hostedActor {
+	h := newHostedActor(a)
+	h.usage = testActivation()
+	return h
 }
 
 // sweepAndList runs one sampler sweep, then the discovery read that serves it.
@@ -590,7 +597,7 @@ func TestWarnDeadSandboxStaleRecord(t *testing.T) {
 	logs := captureWarnings(t)
 	s := newStatsService(t, deadCgroup)
 	setHostedActor(s, &testActor)
-	stale := &hostedActor{attribution: testActor}
+	stale := newHostedActor(testActor)
 
 	s.warnDeadSandbox(context.Background(), stale, cgroupstats.Sample{Empty: true})
 

@@ -42,9 +42,9 @@ func (s *AteWorkerService) throttleSandboxMemory(ctx context.Context, hosted *ho
 	if !s.throttleMemory {
 		return
 	}
-	limit, err := swapMemoryMaxForHigh(s.sandboxLeaf(hosted.attribution.UID))
+	limit, err := swapMemoryMaxForHigh(s.sandboxLeaf(hosted.uid))
 	if err != nil {
-		attrs := append(ateattr.ActorLogAttrs(hosted.attribution), slog.Any("err", err))
+		attrs := append(ateattr.ActorLogAttrs(hosted.attribution()), slog.Any("err", err))
 		slog.LogAttrs(ctx, slog.LevelWarn, "Sandbox keeps its memory.max, an OOM kill in it will restart the worker", attrs...)
 		return
 	}
@@ -123,11 +123,11 @@ func (s *AteWorkerService) checkMemory(ctx context.Context, h *hostedActor) {
 	if h.stopping.Load() {
 		return
 	}
-	kill, ok := h.memory.Check(ctx, s.cgroupRoot, filepath.Base(s.sandboxLeaf(h.attribution.UID)))
+	kill, ok := h.memory.Check(ctx, s.cgroupRoot, filepath.Base(s.sandboxLeaf(h.uid)))
 	if !ok {
 		return
 	}
-	attrs := append(ateattr.ActorLogAttrs(h.attribution),
+	attrs := append(ateattr.ActorLogAttrs(h.attribution()),
 		slog.Uint64("memoryLimitBytes", kill.Limit),
 		slog.Uint64(string(ateattr.StatsMemoryUsageKey), kill.Current))
 	slog.LogAttrs(ctx, slog.LevelWarn, "Killing a sandbox over its memory limit", attrs...)

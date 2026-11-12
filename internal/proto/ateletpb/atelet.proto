@@ -474,6 +474,14 @@ service Atelet {
   // Restore restores a workload from a snapshot onto a worker.
   rpc Restore(RestoreRequest) returns (RestoreResponse) {}
 
+  // Adopt hands a workload running on a worker to another actor name with
+  // the same UID and atespace. The sandbox keeps running; atelet and the
+  // worker swap only the host state bound to the name. Returns NOT_FOUND
+  // when no sandbox was started for actor_uid on this node, and
+  // FAILED_PRECONDITION when the worker hosts the actor under another name
+  // than previous_actor_name. A micro-VM worker answers UNIMPLEMENTED.
+  rpc Adopt(AdoptRequest) returns (AdoptResponse) {}
+
   // PromoteSnapshot makes `snapshot` durable in object storage while keeping
   // its local copy on this node. Used when a snapshot needs to be in object
   // storage (e.g. for tagging) without evicting the suspended actor's local
@@ -1227,6 +1235,56 @@ message RestoreRequest {
 
 message RestoreResponse {
   // The epoch of the worker process that restored the workload, as it
+  // registered with the control plane.
+  int64 worker_epoch = 1;
+}
+
+message AdoptRequest {
+  // The UID of the worker pod whose worker hosts the actor.
+  //
+  // +k8s:required
+  // +k8s:format=k8s-uuid
+  string worker_pod_uid = 1;
+
+  // +k8s:required
+  // +k8s:format=k8s-short-name
+  string atespace = 2;
+
+  // +k8s:required
+  // +k8s:format=k8s-uuid
+  string actor_uid = 3;
+
+  // The name the worker hosts the actor under now.
+  //
+  // +k8s:required
+  // +k8s:format=k8s-short-name
+  string previous_actor_name = 4;
+
+  // The name the actor takes.
+  //
+  // +k8s:required
+  // +k8s:format=k8s-short-name
+  string actor_name = 5;
+
+  // The template identity is carried for metrics attribution.
+  //
+  // +k8s:optional
+  // +k8s:format=k8s-short-name
+  string actor_template_atespace = 6;
+
+  // +k8s:optional
+  // +k8s:format=k8s-short-name
+  string actor_template_name = 7;
+
+  // Must match the workload's egress: present when the workload runs with
+  // tunneled egress, absent when it has none.
+  //
+  // +k8s:optional
+  optional EgressGateway egress_gateway = 8;
+}
+
+message AdoptResponse {
+  // The epoch of the worker process that hosts the workload, as it
   // registered with the control plane.
   int64 worker_epoch = 1;
 }

@@ -143,7 +143,7 @@ func (s *AteWorkerService) GetActiveWorkloadStats(ctx context.Context, req *atew
 	for _, h := range hosted {
 		sample := h.usage.Latest()
 		if sample == nil {
-			sample = h.usage.WithEpoch(pendingSample(&h.attribution))
+			sample = h.usage.WithEpoch(pendingSample(h.identity.Load()))
 		}
 		samples = append(samples, sample)
 	}
@@ -167,16 +167,16 @@ func (s *AteWorkerService) sweepUsage(ctx context.Context) {
 		sample, raw, err := s.measure(ctx, h)
 		if err != nil {
 			if !errors.Is(err, fs.ErrNotExist) {
-				attrs := append(ateattr.ActorLogAttrs(h.attribution), slog.Any("err", err))
+				attrs := append(ateattr.ActorLogAttrs(h.attribution()), slog.Any("err", err))
 				slog.LogAttrs(ctx, slog.LevelWarn, "Failed to read sandbox cgroup", attrs...)
 			}
-			sample = h.usage.WithEpoch(pendingSample(&h.attribution))
+			sample = h.usage.WithEpoch(pendingSample(h.identity.Load()))
 		}
 		// The read holds no lifecycle lock, and the cgroup is found by UID
 		// alone. If the actor was re-hosted meanwhile, perhaps on another
 		// template, the numbers are the new activation's: drop them, and let
 		// the new activation start with its own initial reading.
-		if s.lookupActor(h.attribution.UID) != h {
+		if s.lookupActor(h.uid) != h {
 			continue
 		}
 		if raw.Empty { // a failed read returns a zero Sample
@@ -191,7 +191,7 @@ func (s *AteWorkerService) sweepUsage(ctx context.Context) {
 func (s *AteWorkerService) recordInitial(ctx context.Context, h *hostedActor) {
 	sample, _, err := s.measure(ctx, h)
 	if err != nil {
-		slog.WarnContext(ctx, "No initial usage sample", slog.String(string(ateattr.ActorUIDKey), h.attribution.UID), slog.Any("err", err))
+		slog.WarnContext(ctx, "No initial usage sample", slog.String(string(ateattr.ActorUIDKey), h.uid), slog.Any("err", err))
 		sample = nil
 	}
 	h.usage.Initial(sample, func() { s.usage.Emit(ctx, ateattr.StatsKindInitial, sample) })
@@ -210,7 +210,7 @@ func (s *AteWorkerService) readFinal(ctx context.Context, h *hostedActor) {
 // its activation down, which unhosts the actor even when a later step fails.
 // The caller holds the actor's lock.
 func (s *AteWorkerService) recordFinalIfEnded(ctx context.Context, h *hostedActor) {
-	if h != nil && s.lookupActor(h.attribution.UID) != h {
+	if h != nil && s.lookupActor(h.uid) != h {
 		s.recordFinal(ctx, h)
 	}
 }
@@ -218,7 +218,7 @@ func (s *AteWorkerService) recordFinalIfEnded(ctx context.Context, h *hostedActo
 // recordFinal writes the final record of an activation that a checkpoint or a
 // terminate ended, from its newest measured sample.
 func (s *AteWorkerService) recordFinal(ctx context.Context, h *hostedActor) {
-	pending := h.usage.WithEpoch(pendingSample(&h.attribution))
+	pending := h.usage.WithEpoch(pendingSample(h.identity.Load()))
 	h.usage.Final(func(measured *ateworkerpb.WorkloadStatsSample) {
 		if measured == nil {
 			measured = pending
@@ -250,7 +250,7 @@ func pendingSample(active *resources.ActorAttribution) *ateworkerpb.WorkloadStat
 func (s *AteWorkerService) measure(ctx context.Context, h *hostedActor) (*ateworkerpb.WorkloadStatsSample, cgroupstats.Sample, error) {
 	var raw cgroupstats.Sample
 	sample, err := h.usage.Measure(ctx, func() (*ateworkerpb.WorkloadStatsSample, map[string]uint64, error) {
-		sample, r, err := s.sampleSandbox(&h.attribution)
+		sample, r, err := s.sampleSandbox(h.identity.Load())
 		raw = r
 		return sample, nil, err
 	})
@@ -306,12 +306,12 @@ func (s *AteWorkerService) warnDeadSandbox(ctx context.Context, h *hostedActor, 
 	if h.deadReported.Load() {
 		return
 	}
-	if s.locks.Busy(h.attribution.UID) || s.lookupActor(h.attribution.UID) != h {
+	if s.locks.Busy(h.uid) || s.lookupActor(h.uid) != h {
 		return
 	}
 	if !h.deadReported.CompareAndSwap(false, true) {
 		return
 	}
-	attrs := append(ateattr.ActorLogAttrs(h.attribution), slog.Uint64(string(ateattr.SandboxOOMKillsKey), raw.OOMKills))
+	attrs := append(ateattr.ActorLogAttrs(h.attribution()), slog.Uint64(string(ateattr.SandboxOOMKillsKey), raw.OOMKills))
 	slog.LogAttrs(ctx, slog.LevelWarn, "Sandbox has no processes left while the actor is hosted", attrs...)
 }

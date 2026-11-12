@@ -118,6 +118,11 @@ type fakeWorker struct {
 	stoppedByResp *ateworkerpb.CheckpointWorkloadResponse
 	// terminations counts TerminateWorkload calls.
 	terminations atomic.Int32
+	// adopted is the most recent AdoptWorkload request. Guarded by mu.
+	adopted *ateworkerpb.AdoptWorkloadRequest
+	// adoptErr, if set, fails every AdoptWorkload after it recorded the
+	// request.
+	adoptErr error
 }
 
 // setStoppedBy records the response of the checkpoint that stopped the
@@ -216,6 +221,16 @@ func (f *fakeWorker) RestoreWorkload(_ context.Context, req *ateworkerpb.Restore
 		f.restored[name] = string(body)
 	}
 	return &ateworkerpb.RestoreWorkloadResponse{WorkerEpoch: f.workerEpoch}, nil
+}
+
+func (f *fakeWorker) AdoptWorkload(_ context.Context, req *ateworkerpb.AdoptWorkloadRequest) (*ateworkerpb.AdoptWorkloadResponse, error) {
+	f.mu.Lock()
+	f.adopted = req
+	f.mu.Unlock()
+	if f.adoptErr != nil {
+		return nil, f.adoptErr
+	}
+	return &ateworkerpb.AdoptWorkloadResponse{WorkerEpoch: f.workerEpoch}, nil
 }
 
 func (f *fakeWorker) TerminateWorkload(_ context.Context, req *ateworkerpb.TerminateWorkloadRequest) (*ateworkerpb.TerminateWorkloadResponse, error) {

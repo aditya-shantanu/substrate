@@ -96,6 +96,12 @@ func (j *workerActorJWTs) get(ctx context.Context, actor actorRef) (string, erro
 	return resp.GetActorJwt(), nil
 }
 
+// forget drops the actor's cached JWT, so the next transfer mints one for its
+// current name.
+func (j *workerActorJWTs) forget(actorUID string) {
+	j.cache.Remove(actorUID)
+}
+
 // workerActorJWT is the JWT a transfer for actor carries.
 func (s *Atelet) workerActorJWT(ctx context.Context, actor actorRef) (string, error) {
 	if s.workerActorJWTs == nil {
