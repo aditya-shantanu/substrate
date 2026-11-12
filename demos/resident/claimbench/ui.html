@@ -235,7 +235,7 @@ function renderResults(r) {
 }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function dumbbell(gs, P) {
-  const W = 900, PL = 220, PR = 40, ROW = 52, xmax = (Math.floor(Math.max(...gs.map(g => Math.max(g.plain_result.total[P], g.pooled_result.total[P]))) * 1.25 / 20) + 1) * 20;
+  const W = 900, PL = 250, PR = 40, ROW = 52, xmax = (Math.floor(Math.max(...gs.map(g => Math.max(g.plain_result.total[P], g.pooled_result.total[P]))) * 1.25 / 20) + 1) * 20;
   const x = v => PL + (W - PL - PR) * v / xmax, H = 30 + ROW * gs.length + 40, step = xmax <= 200 ? 20 : xmax <= 600 ? 50 : 100;
   let d = '';
   for (let t = 0; t <= xmax; t += step) d += `<line class="grid" x1="${x(t)}" y1="20" x2="${x(t)}" y2="${H-40}"/><text class="ctick" x="${x(t)}" y="${H-20}" text-anchor="middle">${t}</text>`;
@@ -248,7 +248,7 @@ function dumbbell(gs, P) {
       const tip = `${name} · p50 ${s.total.p50.toFixed(0)} ms · p90 ${s.total.p90.toFixed(0)} ms · max ${s.total.max.toFixed(0)} ms · resume p90 ${s.resume.p90.toFixed(0)} ms · ${s.adopted}/${s.n} adopted`;
       d += `<g class="cmark" tabindex="0" data-tip="${esc(tip)}"><circle class="chit" cx="${x(v)}" cy="${cy}" r="14"/><circle class="cring" cx="${x(v)}" cy="${cy}" r="7"/><circle class="cdot ${name}" cx="${x(v)}" cy="${cy}" r="5"/></g>`;
     }
-    d += `<text class="cvalue" x="${x(b)-12}" y="${cy+4}" text-anchor="end">${b.toFixed(0)}</text><text class="cvalue" x="${x(a)+12}" y="${cy+4}">${a.toFixed(0)}</text><text class="csaving" x="${(x(a)+x(b))/2}" y="${cy-11}" text-anchor="middle">−${(a-b).toFixed(0)} ms · ${(a/b).toFixed(1)}×</text>`;
+    d += `<text class="cvalue" x="${x(b)-12}" y="${cy+4}" text-anchor="end">${b.toFixed(0)}</text><text class="cvalue" x="${x(a)+12}" y="${cy+4}">${a.toFixed(0)}</text><text class="csaving" x="${(x(a)+x(b))/2}" y="${cy-11}" text-anchor="middle">${a >= b ? '−' + (a-b).toFixed(0) : '+' + (b-a).toFixed(0)} ms · ${(a/b).toFixed(1)}×</text>`;
   });
   return `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="claim time per guest">${d}</svg>`;
 }
