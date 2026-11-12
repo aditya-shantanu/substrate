@@ -40,7 +40,7 @@ var _ crashReporter = (*register.CrashReporter)(nil)
 // watchVM handles the actor's VMM or virtiofsd dying while nothing is tearing
 // them down: the actor is torn down here, since the control plane will not
 // reach this worker for it again, and then reported crashed.
-func (s *AteWorkerService) watchVM(attribution resources.ActorAttribution, actorDirs *ateworkerpb.ActorDirs, ra *runningActor) {
+func (s *AteWorkerService) watchVM(actorUID string, actorDirs *ateworkerpb.ActorDirs, ra *runningActor) {
 	what, exit := "cloud-hypervisor", ""
 	select {
 	case <-ra.chProc.Done():
@@ -56,29 +56,32 @@ func (s *AteWorkerService) watchVM(attribution resources.ActorAttribution, actor
 	if ra.memory.Killed() {
 		message = "killed for exceeding its memory limit"
 	}
-	slog.WarnContext(ctx, "Micro-VM died", slog.String("actorUID", attribution.UID), slog.String("reason", message))
+	slog.WarnContext(ctx, "Micro-VM died", slog.String("actorUID", actorUID), slog.String("reason", message))
 
 	// Not reported under the actor's lock: a suspend in flight holds the
 	// actor's lease while it waits on that lock for its Checkpoint.
-	if !s.locks.Lock(ctx, attribution.UID) {
+	if !s.locks.Lock(ctx, actorUID) {
 		return
 	}
-	ours := s.runningVM(attribution.UID) == ra && !ra.stopping.Load()
+	ours := s.runningVM(actorUID) == ra && !ra.stopping.Load()
+	var attribution resources.ActorAttribution
 	if ours {
-		hosted := s.lookupActor(attribution.UID)
+		hosted := s.lookupActor(actorUID)
+		// Read at exit, not at start: an adopt may have renamed the actor.
+		attribution = hosted.attribution()
 		if err := s.terminateWorkload(ctx, attribution, actorDirs); err != nil {
-			slog.WarnContext(ctx, "Failed to tear down the dead micro-VM", slog.String("actorUID", attribution.UID), slog.Any("err", err))
+			slog.WarnContext(ctx, "Failed to tear down the dead micro-VM", slog.String("actorUID", actorUID), slog.Any("err", err))
 		}
 		// not measured first: the guest is gone
 		s.recordFinalIfEnded(ctx, hosted)
 	}
-	s.locks.Unlock(attribution.UID)
+	s.locks.Unlock(actorUID)
 	if !ours || s.crashReporter == nil {
 		return
 	}
 	reportCtx, cancel := context.WithTimeout(ctx, crashReportTimeout)
 	defer cancel()
 	if err := s.crashReporter.ReportCrashed(reportCtx, attribution, message); err != nil {
-		slog.ErrorContext(ctx, "Failed to report the actor crashed", slog.String("actorUID", attribution.UID), slog.Any("err", err))
+		slog.ErrorContext(ctx, "Failed to report the actor crashed", slog.String("actorUID", actorUID), slog.Any("err", err))
 	}
 }

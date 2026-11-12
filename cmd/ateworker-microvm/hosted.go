@@ -21,12 +21,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/kata"
 	"go.ate.dev/substrate/internal/apierror"
 	"go.ate.dev/substrate/internal/ateworker/actornet"
 	"go.ate.dev/substrate/internal/ateworker/cgroup"
+	"go.ate.dev/substrate/internal/atunnel"
 	"go.ate.dev/substrate/internal/atunnel/ingress"
 	"go.ate.dev/substrate/internal/netns"
 	"go.ate.dev/substrate/internal/resources"
@@ -35,11 +37,16 @@ import (
 
 // hostedActor holds one actor's attribution, network, and runtime state.
 type hostedActor struct {
-	// Immutable after admission.
-	attribution resources.ActorAttribution
+	uid string
+	// identity is the actor's attribution, available during boot. adopt
+	// replaces it; read it through attribution.
+	identity atomic.Pointer[resources.ActorAttribution]
 
 	// Mutable fields are guarded by actorsMu.
 	network *actornet.SandboxSession
+	// dnsPolicy is the egress policy source of the actor's DNS relay. Set with
+	// network.
+	dnsPolicy *atunnel.EgressPolicySource
 	// Nil until boot publishes the VM.
 	vm *runningActor
 	// Nil when no guest stats connection is available.
@@ -51,6 +58,23 @@ type hostedActor struct {
 	// memoryBytes is the actor's memory limit, what it books on the worker.
 	// Immutable after admission.
 	memoryBytes int64
+}
+
+// newHostedActor hosts attribution's actor with no network or VM yet.
+func newHostedActor(attribution resources.ActorAttribution) *hostedActor {
+	h := &hostedActor{uid: attribution.UID}
+	h.identity.Store(&attribution)
+	return h
+}
+
+// attribution returns the actor's current identity.
+func (h *hostedActor) attribution() resources.ActorAttribution {
+	return *h.identity.Load()
+}
+
+// adopt gives the actor a new identity. Its UID does not change.
+func (h *hostedActor) adopt(attribution resources.ActorAttribution) {
+	h.identity.Store(&attribution)
 }
 
 // admitActor reserves capacity before network setup. An actor that is already
@@ -66,7 +90,9 @@ func (s *AteWorkerService) admitActor(attribution resources.ActorAttribution, re
 	} else if len(s.actors)+s.draining >= s.maxActors {
 		return nil, nil, apierror.ResourceExhausted("worker is full: %d actors", s.maxActors)
 	}
-	hosted := &hostedActor{attribution: attribution, usage: workerstats.NewActivation(time.Now(), resumesGuest), memoryBytes: memoryBytes}
+	hosted := newHostedActor(attribution)
+	hosted.usage = workerstats.NewActivation(time.Now(), resumesGuest)
+	hosted.memoryBytes = memoryBytes
 	s.actors[attribution.UID] = hosted
 	return hosted, stale, nil
 }
@@ -90,10 +116,11 @@ func (s *AteWorkerService) hostActor(ctx context.Context, attribution resources.
 	}
 
 	// The tap and atunnel share a namespace; the guest owns the other end.
+	dnsPolicy := s.tunnel.ActorEgressPolicy(attribution)
 	session, err := actornet.ServeSandbox(ctx, actornet.SandboxNetworkConfig{
 		ActorUID:   uid,
 		EgressPort: s.tunnel.EgressPort,
-		DNSPolicy:  s.tunnel.ActorEgressPolicy(attribution),
+		DNSPolicy:  dnsPolicy,
 	}, s.tunnel.Egress, s.tunnel.DNSRelay)
 	if err != nil {
 		s.actorsMu.Lock()
@@ -104,6 +131,7 @@ func (s *AteWorkerService) hostActor(ctx context.Context, attribution resources.
 
 	s.actorsMu.Lock()
 	hosted.network = session
+	hosted.dnsPolicy = dnsPolicy
 	s.actorsMu.Unlock()
 	return hosted, nil
 }

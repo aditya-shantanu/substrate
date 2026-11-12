@@ -616,7 +616,7 @@ func (s *AteWorkerService) coldBootActor(ctx context.Context, p actorBootParams)
 	}
 	ra.memory.Resume(uint64(s.leafMemoryHigh(p.size.MemoryBytes)))
 	s.setRunningVM(actorUID, ra)
-	go s.watchVM(p.attribution(), p.actorDirs, ra)
+	go s.watchVM(actorUID, p.actorDirs, ra)
 
 	// Forward each container's stdout/stderr into the pod logs, keyed by the
 	// container id (see StartRootfsContainer). The goroutines read over ac for

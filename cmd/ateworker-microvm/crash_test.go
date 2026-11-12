@@ -57,7 +57,7 @@ func TestWatchVMIgnoresTeardown(t *testing.T) {
 	s := &AteWorkerService{locks: actorlock.New(), actors: map[string]*hostedActor{}, crashReporter: reporter}
 	ra := fakeVM(t)
 	ra.stopping.Store(true)
-	s.watchVM(resources.ActorAttribution{UID: "actor-a"}, nil, ra)
+	s.watchVM("actor-a", nil, ra)
 	select {
 	case msg := <-reporter.reports:
 		t.Fatalf("reported %q for a VM being torn down", msg)
@@ -67,16 +67,17 @@ func TestWatchVMIgnoresTeardown(t *testing.T) {
 
 func TestWatchVMIgnoresAReplacedVM(t *testing.T) {
 	reporter := &fakeCrashReporter{reports: make(chan string, 1)}
-	attribution := resources.ActorAttribution{UID: "actor-a"}
 	// the actor is hosted with a different VM than the one that died
+	hosted := newHostedActor(resources.ActorAttribution{UID: "actor-a"})
+	hosted.vm = &runningActor{}
 	s := &AteWorkerService{
 		locks:         actorlock.New(),
-		actors:        map[string]*hostedActor{"actor-a": {attribution: attribution, vm: &runningActor{}}},
+		actors:        map[string]*hostedActor{"actor-a": hosted},
 		crashReporter: reporter,
 	}
 	done := make(chan struct{})
 	go func() {
-		s.watchVM(attribution, nil, fakeVM(t))
+		s.watchVM("actor-a", nil, fakeVM(t))
 		close(done)
 	}()
 	select {

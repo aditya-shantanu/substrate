@@ -31,9 +31,6 @@ import (
 // running sandbox, the pool refills, and deleting the template removes what
 // is left of it.
 func TestResidentPoolLifecycle(t *testing.T) {
-	if e2e.IsMicroVM() {
-		t.Skip("ateworker-microvm does not adopt yet; the resume falls back to a restore")
-	}
 	ctx := t.Context()
 	clients := e2e.GetClients()
 	ns := e2e.CreateNamespace(t)

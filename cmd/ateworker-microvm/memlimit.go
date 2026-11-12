@@ -62,11 +62,11 @@ func (s *AteWorkerService) checkMemory(ctx context.Context, h *hostedActor) {
 	if ra == nil || ra.stopping.Load() {
 		return
 	}
-	kill, ok := ra.memory.Check(ctx, cgroup.Root, h.attribution.UID)
+	kill, ok := ra.memory.Check(ctx, cgroup.Root, h.uid)
 	if !ok {
 		return
 	}
-	attrs := append(ateattr.ActorLogAttrs(h.attribution),
+	attrs := append(ateattr.ActorLogAttrs(h.attribution()),
 		slog.Uint64("memoryLimitBytes", kill.Limit),
 		slog.Uint64(string(ateattr.StatsMemoryUsageKey), kill.Current))
 	slog.LogAttrs(ctx, slog.LevelWarn, "Killing a microVM over its memory limit", attrs...)

@@ -546,7 +546,7 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 	}
 	ra.memory.Resume(uint64(s.leafMemoryHigh(p.size.MemoryBytes)))
 	s.setRunningVM(actorUID, ra)
-	go s.watchVM(p.attribution(), p.actorDirs, ra)
+	go s.watchVM(actorUID, p.actorDirs, ra)
 
 	// Publish the guest to GetWorkloadStats, past the last error return above
 	// for the same reason as in coldBootActor. Same client the forwarding above
