@@ -99,7 +99,7 @@ func (r *ResidentPoolReconciler) Start(ctx context.Context) {
 	}()
 }
 
-// resync enqueues every template that wants a pool or still reports one, and
+// resync enqueues every template with a nonzero replicas or a reported pool, and
 // every sweepEvery passes deletes pooled residents whose template is gone.
 func (r *ResidentPoolReconciler) resync(ctx context.Context) {
 	templates := map[resources.ActorTemplateRef]bool{}
