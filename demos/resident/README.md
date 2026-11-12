@@ -44,13 +44,15 @@ open http://localhost:8080
 Each card claims from one template. A bar is one actor: `CreateActor`,
 `ResumeActor`, and the first HTTP response through the router. A claim that
 adopted a resident is marked with a check. The dots above the bars are the pool
-refilling after each claim.
+refilling after each claim. "One every 300 ms" is an arrival rate a pool of
+six keeps up with; "back to back" drains it faster than it refills, so some
+claims fall back to a restore and show as plain bars.
 
 For numbers without the page, run `claimbench` headless:
 
 ```bash
 kubectl exec -n ate-demo-resident deploy/claimbench -- \
-  /ko-app/claimbench --run counter-plain=30,counter-pooled=30
+  /ko-app/claimbench --interval 300ms --run counter-plain=30,counter-pooled=30
 ```
 
 ## Clean up
