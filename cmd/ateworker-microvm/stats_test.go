@@ -211,7 +211,9 @@ func hostTestActor(s *AteWorkerService, attribution resources.ActorAttribution, 
 	if s.actors == nil {
 		s.actors = map[string]*hostedActor{}
 	}
-	hosted := &hostedActor{attribution: attribution, guest: target, usage: testActivation()}
+	hosted := newHostedActor(attribution)
+	hosted.guest = target
+	hosted.usage = testActivation()
 	s.actors[attribution.UID] = hosted
 	return hosted
 }

@@ -151,7 +151,7 @@ func (s *AteWorkerService) GetActiveWorkloadStats(ctx context.Context, req *atew
 	for _, h := range hosted {
 		sample := h.usage.Latest()
 		if sample == nil {
-			sample = h.usage.WithEpoch(pendingSample(&h.attribution))
+			sample = h.usage.WithEpoch(pendingSample(h.identity.Load()))
 		}
 		samples = append(samples, sample)
 	}
@@ -176,7 +176,7 @@ func (s *AteWorkerService) sweepUsage(ctx context.Context) {
 			// The reads run here, outside the sampler's own recover.
 			defer func() {
 				if r := recover(); r != nil {
-					slog.ErrorContext(ctx, "Usage sample panicked", slog.String(string(ateattr.ActorUIDKey), h.attribution.UID),
+					slog.ErrorContext(ctx, "Usage sample panicked", slog.String(string(ateattr.ActorUIDKey), h.uid),
 						slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 				}
 			}()
@@ -194,12 +194,12 @@ func (s *AteWorkerService) sampleHostedGuest(ctx context.Context, h *hostedActor
 	if !h.usage.Sampling() {
 		return
 	}
-	sample := h.usage.WithEpoch(pendingSample(&h.attribution))
+	sample := h.usage.WithEpoch(pendingSample(h.identity.Load()))
 	measured, err := h.usage.Measure(ctx, func() (*ateworkerpb.WorkloadStatsSample, map[string]uint64, error) {
 		return s.sampleGuestInSlot(ctx, h)
 	})
 	if errors.Is(err, errStaleGuestTarget) {
-		slog.ErrorContext(ctx, "Guest stats target belongs to another actor", slog.String(string(ateattr.ActorUIDKey), h.attribution.UID), slog.Any("err", err))
+		slog.ErrorContext(ctx, "Guest stats target belongs to another actor", slog.String(string(ateattr.ActorUIDKey), h.uid), slog.Any("err", err))
 	}
 	// Otherwise an error is boot, restore, teardown in progress, a guest that
 	// has stopped answering, or the sweep's budget: all routine.
@@ -209,7 +209,7 @@ func (s *AteWorkerService) sampleHostedGuest(ctx context.Context, h *hostedActor
 	// The guest is found by UID alone. If the actor was re-hosted meanwhile,
 	// perhaps on another template, the numbers are the new activation's: drop
 	// them, and let the new activation start with its own initial reading.
-	if s.lookupActor(h.attribution.UID) != h {
+	if s.lookupActor(h.uid) != h {
 		return
 	}
 	h.usage.Periodic(sample, func() { s.usage.Emit(ctx, ateattr.StatsKindPeriodic, sample) })
@@ -241,7 +241,7 @@ func (s *AteWorkerService) sampleGuestInSlot(ctx context.Context, h *hostedActor
 // it runs on its own goroutine, where a panic would take the ateworker down. The
 // activation is then sampled without an initial record.
 func (s *AteWorkerService) recordInitial(ctx context.Context, h *hostedActor) {
-	actorUID := h.attribution.UID
+	actorUID := h.uid
 	defer func() {
 		if r := recover(); r != nil {
 			slog.ErrorContext(ctx, "Initial usage sample panicked", slog.String(string(ateattr.ActorUIDKey), actorUID),
@@ -265,7 +265,7 @@ func (s *AteWorkerService) recordInitial(ctx context.Context, h *hostedActor) {
 // its activation down, which unhosts the actor even when a later step fails.
 // The caller holds the actor's lock.
 func (s *AteWorkerService) recordFinalIfEnded(ctx context.Context, h *hostedActor) {
-	if h != nil && s.lookupActor(h.attribution.UID) != h {
+	if h != nil && s.lookupActor(h.uid) != h {
 		s.recordFinal(ctx, h)
 	}
 }
@@ -280,7 +280,7 @@ func (s *AteWorkerService) readFinal(ctx context.Context, h *hostedActor) {
 	sample, err := s.measureGuest(readCtx, h)
 	if err != nil {
 		slog.LogAttrs(ctx, slog.LevelDebug, "Final usage reading failed; using the newest sample",
-			append(ateattr.ActorLogAttrs(h.attribution), slog.Any("err", err))...)
+			append(ateattr.ActorLogAttrs(h.attribution()), slog.Any("err", err))...)
 		return
 	}
 	h.usage.Store(sample)
@@ -289,7 +289,7 @@ func (s *AteWorkerService) readFinal(ctx context.Context, h *hostedActor) {
 // recordFinal writes the final record of an activation that a checkpoint or a
 // terminate ended, from its newest measured sample.
 func (s *AteWorkerService) recordFinal(ctx context.Context, h *hostedActor) {
-	pending := h.usage.WithEpoch(pendingSample(&h.attribution))
+	pending := h.usage.WithEpoch(pendingSample(h.identity.Load()))
 	h.usage.Final(func(measured *ateworkerpb.WorkloadStatsSample) {
 		if measured == nil {
 			measured = pending
@@ -333,7 +333,7 @@ var errStaleGuestTarget = errors.New("guest agent connection belongs to a differ
 // read, a pending sample for the sweep. The read holds no lifecycle lock, so
 // the keyed caller re-checks the actor record it loaded after this returns.
 func (s *AteWorkerService) sampleGuest(ctx context.Context, h *hostedActor) (*ateworkerpb.WorkloadStatsSample, map[string]uint64, error) {
-	active := &h.attribution
+	active := h.identity.Load()
 	// The actor is the one here, but there is no guest to ask yet. Usually that
 	// is a poll landing in the boot or the restore: the ateworker retains the
 	// attribution from the moment it accepts the actor, and the target is only
