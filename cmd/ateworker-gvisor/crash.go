@@ -40,15 +40,14 @@ var _ crashReporter = (*register.CrashReporter)(nil)
 // the actor is torn down here, since the control plane will not reach this
 // worker for it again, and then reported crashed.
 func (s *AteWorkerService) watchSandbox(ctx context.Context, hosted *hostedActor, runscPath string, actorDirs *ateworkerpb.ActorDirs, containers []*ateworkerpb.Container) {
-	attribution := hosted.attribution
 	if hosted.sandbox == nil {
-		slog.WarnContext(ctx, "Cannot watch the sandbox, a crash will go unreported: it was never pinned", slog.String("actorUID", attribution.UID))
+		slog.WarnContext(ctx, "Cannot watch the sandbox, a crash will go unreported: it was never pinned", slog.String("actorUID", hosted.uid))
 		return
 	}
 	pid := hosted.sandbox.pid
 	exited, err := hosted.sandbox.exited()
 	if err != nil {
-		slog.WarnContext(ctx, "Cannot watch the sandbox, a crash will go unreported", slog.String("actorUID", attribution.UID), slog.Any("err", err))
+		slog.WarnContext(ctx, "Cannot watch the sandbox, a crash will go unreported", slog.String("actorUID", hosted.uid), slog.Any("err", err))
 		return
 	}
 	go func() {
@@ -57,6 +56,8 @@ func (s *AteWorkerService) watchSandbox(ctx context.Context, hosted *hostedActor
 			return
 		}
 		ctx := context.Background()
+		// Read at exit, not at start: an adopt may have renamed the actor.
+		attribution := hosted.attribution()
 		message := "gVisor sandbox exited"
 		if hosted.memory.Killed() {
 			message = "killed for exceeding its memory limit"

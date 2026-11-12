@@ -74,7 +74,8 @@ func TestWatchSandboxIgnoresExpectedExits(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(sandbox.Close)
-			hosted := &hostedActor{attribution: resources.ActorAttribution{UID: "actor-a"}, sandbox: sandbox}
+			hosted := newHostedActor(resources.ActorAttribution{UID: "actor-a"})
+			hosted.sandbox = sandbox
 			s := &AteWorkerService{locks: actorlock.New(), actors: map[string]*hostedActor{"actor-a": hosted}, crashReporter: reporter}
 			tc.setup(s, hosted)
 			s.watchSandbox(context.Background(), hosted, "", actorDirs, nil)

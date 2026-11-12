@@ -38,6 +38,7 @@ type attributionSource interface {
 var (
 	_ attributionSource = (*ateworkerpb.RunWorkloadRequest)(nil)
 	_ attributionSource = (*ateworkerpb.RestoreWorkloadRequest)(nil)
+	_ attributionSource = (*ateworkerpb.AdoptWorkloadRequest)(nil)
 	_ attributionSource = (*ateworkerpb.CheckpointWorkloadRequest)(nil)
 	_ attributionSource = (*ateworkerpb.TerminateWorkloadRequest)(nil)
 )
