@@ -33,6 +33,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -424,7 +425,9 @@ func (b *bench) headless(ctx context.Context, spec string) error {
 		if err != nil {
 			return fmt.Errorf("bad count in %q: %w", part, err)
 		}
-		order = append(order, template)
+		if !slices.Contains(order, template) {
+			order = append(order, template)
+		}
 		b.runMany(ctx, template, n, 1, *interval, func(c claim) {
 			byTemplate[template] = append(byTemplate[template], c)
 			line, _ := json.Marshal(c)
