@@ -227,3 +227,23 @@ func TestAdoptWorkload(t *testing.T) {
 		})
 	}
 }
+
+// A terminate that arrives under the placeholder name after an adopt the
+// control plane never recorded retires the ingress under the adopted name
+// too.
+func TestTerminateWorkloadRetiresTheAdoptedName(t *testing.T) {
+	f := newAdoptFixture(t)
+	if _, err := f.s.AdoptWorkload(t.Context(), f.request()); err != nil {
+		t.Fatalf("AdoptWorkload: %v", err)
+	}
+	dir := t.TempDir()
+	actorDirs := &ateworkerpb.ActorDirs{RootDir: dir, OciBundleDir: filepath.Join(dir, "bundle")}
+	if err := f.s.terminateWorkload(t.Context(), f.previous, actorDirs); err != nil {
+		t.Fatalf("terminateWorkload: %v", err)
+	}
+	for _, name := range []string{adoptPrevious, adoptName} {
+		if f.ingressActive(t, name) {
+			t.Errorf("ingress is still registered under %q", name)
+		}
+	}
+}

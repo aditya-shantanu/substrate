@@ -551,6 +551,15 @@ func (s *AteWorkerService) endPreviousActivation(ctx context.Context, actorUID s
 
 func (s *AteWorkerService) terminateWorkload(ctx context.Context, actor resources.ActorAttribution, actorDirs *ateworkerpb.ActorDirs) error {
 	var errs []error
+	if hosted := s.lookupActor(actor.UID); hosted != nil {
+		// An adopt the control plane never saw complete leaves the sandbox
+		// registered under a name the request does not carry.
+		if current := hosted.attribution(); current.Ref != actor.Ref {
+			if err := s.tunnel.Deactivate(ctx, current); err != nil {
+				errs = append(errs, fmt.Errorf("while deactivating actor networking under %s: %w", current.Ref, err))
+			}
+		}
+	}
 	if err := s.tunnel.Deactivate(ctx, actor); err != nil {
 		errs = append(errs, fmt.Errorf("while deactivating actor networking: %w", err))
 	}
