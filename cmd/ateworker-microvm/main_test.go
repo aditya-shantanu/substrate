@@ -49,6 +49,10 @@ func TestRPCsRejectInvalidRequests(t *testing.T) {
 			_, err := s.TerminateWorkload(ctx, &ateworkerpb.TerminateWorkloadRequest{})
 			return err
 		},
+		"AdoptWorkload": func() error {
+			_, err := s.AdoptWorkload(ctx, &ateworkerpb.AdoptWorkloadRequest{})
+			return err
+		},
 		"GetWorkloadStats": func() error {
 			_, err := s.GetWorkloadStats(ctx, &ateworkerpb.GetWorkloadStatsRequest{})
 			return err
