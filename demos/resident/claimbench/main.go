@@ -62,6 +62,7 @@ var (
 	runSpec        = flag.String("run", "", "headless: comma-separated template=count to claim serially, then exit")
 	out            = flag.String("out", "", "headless: file the claims are appended to as JSON lines")
 	firstTimeout   = flag.Duration("first-response-timeout", 30*time.Second, "how long to wait for the actor's first HTTP response")
+	interval       = flag.Duration("interval", 0, "headless: pause between claims, the arrival rate a pool has to keep up with")
 )
 
 // claim is one measured actor: created, resumed, and reached once.
@@ -257,7 +258,7 @@ func (b *bench) get(ctx context.Context, ref *ateapi.ObjectRef) (int, error) {
 		return 0, err
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, resp.Body)
 	return resp.StatusCode, nil
 }
 
@@ -286,6 +287,7 @@ func (b *bench) handleRun(w http.ResponseWriter, r *http.Request) {
 	template := r.URL.Query().Get("template")
 	n, _ := strconv.Atoi(r.URL.Query().Get("n"))
 	concurrency, _ := strconv.Atoi(r.URL.Query().Get("concurrency"))
+	intervalMs, _ := strconv.Atoi(r.URL.Query().Get("interval_ms"))
 	if template == "" || n <= 0 {
 		http.Error(w, "template and n are required", http.StatusBadRequest)
 		return
@@ -303,7 +305,7 @@ func (b *bench) handleRun(w http.ResponseWriter, r *http.Request) {
 	results := make(chan claim)
 	go func() {
 		defer close(results)
-		b.runMany(r.Context(), template, n, concurrency, func(c claim) { results <- c })
+		b.runMany(r.Context(), template, n, concurrency, time.Duration(intervalMs)*time.Millisecond, func(c claim) { results <- c })
 	}()
 	for c := range results {
 		data, _ := json.Marshal(c)
@@ -314,13 +316,18 @@ func (b *bench) handleRun(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 }
 
-func (b *bench) runMany(ctx context.Context, template string, n, concurrency int, emit func(claim)) {
+// runMany claims n actors from template, at most concurrency at a time and
+// at least pause apart.
+func (b *bench) runMany(ctx context.Context, template string, n, concurrency int, pause time.Duration, emit func(claim)) {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, concurrency)
 	var mu sync.Mutex
-	for range n {
+	for i := range n {
 		if ctx.Err() != nil {
 			break
+		}
+		if i > 0 && pause > 0 {
+			time.Sleep(pause)
 		}
 		wg.Add(1)
 		sem <- struct{}{}
@@ -397,7 +404,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 // headless claims per the spec "template=count,..." one at a time and prints
 // percentiles per template.
 func (b *bench) headless(ctx context.Context, spec string) error {
-	var sink io.Writer = io.Discard
+	sink := io.Discard
 	if *out != "" {
 		f, err := os.OpenFile(*out, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
@@ -418,7 +425,7 @@ func (b *bench) headless(ctx context.Context, spec string) error {
 			return fmt.Errorf("bad count in %q: %w", part, err)
 		}
 		order = append(order, template)
-		b.runMany(ctx, template, n, 1, func(c claim) {
+		b.runMany(ctx, template, n, 1, *interval, func(c claim) {
 			byTemplate[template] = append(byTemplate[template], c)
 			line, _ := json.Marshal(c)
 			fmt.Fprintln(sink, string(line))

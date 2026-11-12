@@ -184,6 +184,10 @@ type ServiceImpl struct {
 	// clusterSnapshotLocation is ate-api-server's --snapshot-location; see
 	// resolveSnapshotLocation.
 	clusterSnapshotLocation string
+
+	// residentTaken, when set, is told which template's pool a CreateActor
+	// took a resident from. The pool reconciler sets it.
+	residentTaken func(resources.ActorTemplateRef)
 }
 
 var _ store.Interface = (*ServiceImpl)(nil)

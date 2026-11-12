@@ -210,6 +210,9 @@ func (s *ServiceImpl) adoptResident(ctx context.Context, template *ateapi.ActorT
 				slog.String("actor", resources.ActorRefFromActor(stored).String()),
 				slog.String("resident", resident.GetMetadata().GetName()),
 				slog.String("worker", stored.GetStatus().GetWorkerAssignment().GetWorker().GetName()))
+			if s.residentTaken != nil {
+				s.residentTaken(resources.ActorTemplateRefFromActorTemplate(template))
+			}
 			return stored, nil
 		case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrUIDConflict), errors.Is(err, store.ErrFailedPrecondition):
 			// Taken, deleted or no longer pooled since the list.

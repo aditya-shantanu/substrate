@@ -364,8 +364,7 @@ func main() {
 	templateReconciler.Start(shutdownCtx)
 
 	// Keep each ActorTemplate's resident pool at its replicas.
-	residentReconciler := controlapi.NewResidentPoolReconciler(persistence, controlSrv, *residentPoolResyncInterval)
-	residentReconciler.Start(shutdownCtx)
+	controlSrv.NewResidentPoolReconciler(persistence, *residentPoolResyncInterval).Start(shutdownCtx)
 
 	// Crash the Actors lost when a Worker's worker restarts.
 	workerAssignmentReconciler := controlapi.NewWorkerAssignmentReconciler(persistence, workerCache)

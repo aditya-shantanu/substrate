@@ -67,13 +67,24 @@ type ResidentPoolReconciler struct {
 	queue          workqueue.TypedRateLimitingInterface[resources.ActorTemplateRef]
 }
 
-func NewResidentPoolReconciler(persistence residentPoolStore, control residentPoolControl, resyncInterval time.Duration) *ResidentPoolReconciler {
-	return &ResidentPoolReconciler{
+// NewResidentPoolReconciler builds the reconciler over this service: it
+// creates and resumes residents through the service's own entry points, and
+// CreateActor tells it when a claim takes one, so the pool is topped up at
+// once rather than at the next resync.
+func (s *RPCService) NewResidentPoolReconciler(persistence residentPoolStore, resyncInterval time.Duration) *ResidentPoolReconciler {
+	r := &ResidentPoolReconciler{
 		persistence:    persistence,
-		control:        control,
+		control:        s,
 		resyncInterval: resyncInterval,
 		queue:          workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[resources.ActorTemplateRef]()),
 	}
+	s.serviceImpl.residentTaken = r.Notify
+	return r
+}
+
+// Notify asks for a pass over template's pool ahead of the next resync.
+func (r *ResidentPoolReconciler) Notify(template resources.ActorTemplateRef) {
+	r.queue.Add(template)
 }
 
 // Start launches the queue workers and the periodic list that feeds them.

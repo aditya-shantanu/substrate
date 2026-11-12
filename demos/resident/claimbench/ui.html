@@ -62,7 +62,7 @@ limitations under the License.
   <h1>Resident pools</h1>
   <div class="sub">time from <b>CreateActor</b> to the actor's <b>first HTTP response</b>, per claim</div>
 </header>
-<div class="race"><button class="primary" id="race">Claim 10 from each, side by side</button>&nbsp;<button id="clear">Clear</button></div>
+<div class="race"><button class="primary" id="race">Claim 10 from each, one every 300 ms</button>&nbsp;<button id="clear">Clear</button></div>
 <main id="main"></main>
 <footer>
   Each bar is one actor: <span class="legend"><span><i style="background:var(--create)"></i>CreateActor</span><span><i style="background:var(--resume)"></i>ResumeActor</span><span><i style="background:var(--first)"></i>first response through the router</span></span>
@@ -77,7 +77,7 @@ function card(t) {
   el.innerHTML = `
     <h2>${t.name} <span class="pill ${t.replicas>0?'on':''}">${t.replicas>0 ? 'resident pool: '+t.replicas : 'no pool'}</span></h2>
     <div class="pool"><span class="poolText"></span><span class="dots"></span></div>
-    <div class="actions"><button data-n="1">Claim 1</button><button data-n="10" class="primary">Claim 10</button><button data-n="10" data-c="5">Claim 10, 5 at a time</button></div>
+    <div class="actions"><button data-n="1">Claim 1</button><button data-n="10" data-i="300" class="primary">Claim 10, one every 300 ms</button><button data-n="10">Claim 10, back to back</button></div>
     <div class="stats">
       <div class="stat"><div class="v" id="p50">–</div><div class="k">total p50 ms</div></div>
       <div class="stat"><div class="v" id="p90">–</div><div class="k">total p90 ms</div></div>
@@ -85,7 +85,7 @@ function card(t) {
       <div class="stat"><div class="v" id="n">0</div><div class="k">claims (adopted)</div></div>
     </div>
     <div class="bars"></div>`;
-  el.querySelectorAll('button').forEach(b => b.onclick = () => run(t.name, +b.dataset.n, +(b.dataset.c||1)));
+  el.querySelectorAll('button').forEach(b => b.onclick = () => run(t.name, +b.dataset.n, +(b.dataset.c||1), +(b.dataset.i||0)));
   document.getElementById('main').appendChild(el);
   cards[t.name] = { el, claims: [] };
   return cards[t.name];
@@ -107,8 +107,8 @@ function addRow(x) {
   const bars = c.el.querySelector('.bars'); bars.prepend(row);
   render(x.template);
 }
-function run(template, n, concurrency) {
-  const es = new EventSource(`/api/run?template=${encodeURIComponent(template)}&n=${n}&concurrency=${concurrency}`);
+function run(template, n, concurrency, intervalMs) {
+  const es = new EventSource(`/api/run?template=${encodeURIComponent(template)}&n=${n}&concurrency=${concurrency}&interval_ms=${intervalMs||0}`);
   es.onmessage = e => addRow(JSON.parse(e.data));
   es.addEventListener('done', () => es.close());
   es.onerror = () => es.close();
@@ -125,7 +125,7 @@ async function refresh() {
     }
   } catch (e) { console.warn(e); }
 }
-document.getElementById('race').onclick = () => { for (const name in cards) run(name, 10, 1); };
+document.getElementById('race').onclick = () => { for (const name in cards) run(name, 10, 1, 300); };
 document.getElementById('clear').onclick = () => { for (const name in cards) { cards[name].claims = []; cards[name].el.querySelector('.bars').innerHTML = ''; render(name); } };
 refresh(); setInterval(refresh, 1000);
 </script>
