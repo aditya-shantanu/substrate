@@ -46,6 +46,15 @@ service Worker {
   // gVisor / runsc version to match the checkpoint.
   rpc RestoreWorkload(RestoreWorkloadRequest) returns (RestoreWorkloadResponse) {}
 
+  // AdoptWorkload hands a running workload to another actor name with the
+  // same UID and atespace. The sandbox keeps running; only the host state
+  // bound to the name changes: the egress certificate, the egress policy
+  // source, the ingress registration, and the attribution on stats, crash
+  // reports, and logs. Returns NOT_FOUND when the worker does not host
+  // actor_uid and FAILED_PRECONDITION when previous_actor_name is not the
+  // name it hosts the actor under.
+  rpc AdoptWorkload(AdoptWorkloadRequest) returns (AdoptWorkloadResponse) {}
+
   // GetWorkloadStats returns a point-in-time resource-usage sample for the
   // workload this worker is currently executing.
   //
@@ -572,6 +581,43 @@ message RestoreWorkloadRequest {
 }
 
 message RestoreWorkloadResponse {
+  // The epoch this worker process registered with.
+  int64 worker_epoch = 1;
+}
+
+message AdoptWorkloadRequest {
+  // +k8s:required
+  // +k8s:format=k8s-short-name
+  string atespace = 1;
+  // +k8s:required
+  // +k8s:format=k8s-uuid
+  string actor_uid = 2;
+  // The name the worker hosts the actor under now.
+  //
+  // +k8s:required
+  // +k8s:format=k8s-short-name
+  string previous_actor_name = 3;
+  // The name the actor takes.
+  //
+  // +k8s:required
+  // +k8s:format=k8s-short-name
+  string actor_name = 4;
+  // +k8s:optional
+  // +k8s:format=k8s-short-name
+  string actor_template_atespace = 5;
+  // +k8s:optional
+  // +k8s:format=k8s-short-name
+  string actor_template_name = 6;
+
+  // Must match the workload's egress: present when the workload runs with
+  // tunneled egress, absent when it has none. Fails with FAILED_PRECONDITION
+  // otherwise.
+  //
+  // +k8s:optional
+  optional EgressGateway egress_gateway = 7;
+}
+
+message AdoptWorkloadResponse {
   // The epoch this worker process registered with.
   int64 worker_epoch = 1;
 }

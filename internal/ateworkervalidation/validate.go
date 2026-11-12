@@ -52,6 +52,14 @@ func ValidateRestoreWorkloadRequest(ctx context.Context, req *ateworkerpb.Restor
 	return nil
 }
 
+// ValidateAdoptWorkloadRequest validates req at the RPC edge.
+func ValidateAdoptWorkloadRequest(ctx context.Context, req *ateworkerpb.AdoptWorkloadRequest) error {
+	if errs := Validate_AdoptWorkloadRequest(ctx, createOp(), nil, req, nil); len(errs) > 0 {
+		return resources.ToAPIError(errs)
+	}
+	return nil
+}
+
 // ValidateTerminateWorkloadRequest validates req at the RPC edge.
 func ValidateTerminateWorkloadRequest(ctx context.Context, req *ateworkerpb.TerminateWorkloadRequest) error {
 	if errs := Validate_TerminateWorkloadRequest(ctx, createOp(), nil, req, nil); len(errs) > 0 {
