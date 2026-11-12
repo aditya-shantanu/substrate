@@ -2577,6 +2577,20 @@ func runWorkerAssignmentContractTests(t *testing.T, setup func(t *testing.T) sto
 		}); err != nil {
 			t.Fatalf("BindActorToWorker failed: %v", err)
 		}
+		// Bound but still SUSPENDED: its restore has not finished.
+		if _, err := s.AdoptResidentActor(ctx, residentRef, stored.GetMetadata().GetUid(), newTestSuspendedActor(testAtespace, "s2")); !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Errorf("adopting a resident that is not RUNNING err = %v, want ErrFailedPrecondition", err)
+		}
+		bound, err := s.GetActor(ctx, residentRef)
+		if err != nil {
+			t.Fatalf("GetActor(resident) failed: %v", err)
+		}
+		if _, err := s.UpdateActor(ctx, residentRef, store.PreconditionFrom(bound), func(a *ateapi.Actor) error {
+			a.Status.State = ateapi.ActorState_ACTOR_STATE_RUNNING
+			return nil
+		}); err != nil {
+			t.Fatalf("UpdateActor(resident RUNNING) failed: %v", err)
+		}
 		if _, err := s.CreateActor(ctx, newTestSuspendedActor(testAtespace, "taken")); err != nil {
 			t.Fatalf("CreateActor(taken) failed: %v", err)
 		}

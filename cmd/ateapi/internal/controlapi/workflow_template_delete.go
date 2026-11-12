@@ -30,11 +30,17 @@ import (
 // DeleteActorTemplate executes the workflow to delete an ActorTemplate. The
 // golden actor and tag go first and the row last, so a failed attempt leaves
 // the row for a retry to rediscover them by.
+// templateLeaseKey names the lease that serializes DeleteActorTemplate, the
+// golden build and the resident pool passes over one template.
+func templateLeaseKey(ref resources.ActorTemplateRef) string {
+	return "lease:actortemplate:" + ref.Atespace + ":" + ref.Name
+}
+
 func (w *ActorWorkflow) DeleteActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions) (*ateapi.ActorTemplate, error) {
 	ctx = preview.ContextWithOptIn(ctx)
 	// Serializes against the reconciler, which creates the golden actor and
 	// tag under the same lease.
-	ctx, lease, err := acquireLease(ctx, w.store, "lease:actortemplate:"+templateRef.Atespace+":"+templateRef.Name, "ActorTemplate "+templateRef.String())
+	ctx, lease, err := acquireLease(ctx, w.store, templateLeaseKey(templateRef), "ActorTemplate "+templateRef.String())
 	if err != nil {
 		return nil, err
 	}

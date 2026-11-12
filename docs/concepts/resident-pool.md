@@ -47,9 +47,8 @@ its network namespace, cgroup and directories stay. The worker mints the
 actor's egress certificate under the new name, retargets the DNS policy
 source, registers ingress under the new name and retires the placeholder's,
 and swaps the attribution its stats and crash reports carry. atelet rewrites
-the system-info volume files and sandbox record and drops the cached
-worker-for-actor JWT. The control plane then commits RUNNING with
-`resident.state = ADOPTED`.
+the system-info volume files and drops the cached worker-for-actor JWT. The
+control plane then commits RUNNING with `resident.state = ADOPTED`.
 
 If the adoption fails, the resume terminates the resident's sandbox, releases
 the actor's assignment, clears the marker, and restores the actor from the
@@ -62,7 +61,13 @@ never fails because of it.
 - A later suspend and resume of an adopted actor restores its own snapshot;
   residents only serve first activations.
 - Residents are single-use. A sandbox that ran under one actor is never handed
-  to another; threat T-27 in the threat model forbids it.
+  to another; threat T-27 in the threat model forbids it. Anything the guest
+  obtained under the placeholder name before adoption, such as an actor JWT or
+  the system-info files it read at boot, stays valid for its lifetime; the
+  placeholder had no egress policy and no caller, so nothing of another
+  tenant's is in it.
+- A pool waits for the template's golden snapshot and is refused for
+  templates that disable it, so a resident is always a restore, never a boot.
 - `DeleteActor` of a reserved actor terminates the sandbox through the
   assigned node, as for any assigned actor. `DeleteActorTemplate` deletes the
   template's pooled residents first.
@@ -74,6 +79,10 @@ never fails because of it.
 - `SuspendActor` of a reserved actor that was never resumed returns at once,
   as for any SUSPENDED actor, and leaves the resident running until the
   actor is resumed or deleted.
+- A resident that crashes between the claim and the first resume reports the
+  crash under its placeholder name, which no longer exists. The actor stays
+  SUSPENDED until its first resume finds the sandbox gone and restores the
+  snapshot.
 - Residents are placed by the scheduler like any other actor. There is no
   per-node target mix; a claim only needs one resident on some worker.
 - Only the gVisor runtime adopts. ateworker-microvm returns Unimplemented and

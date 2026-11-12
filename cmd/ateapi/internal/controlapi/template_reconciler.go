@@ -178,7 +178,7 @@ func (r *ActorTemplateReconciler) processNextWorkItem(ctx context.Context) bool 
 // reentrant. A positive requeueAfter asks the caller to revisit the template
 // once its snapshot deadline (or a transitional actor state) passes.
 func (r *ActorTemplateReconciler) reconcileOne(ctx context.Context, ref resources.ActorTemplateRef) (requeueAfter time.Duration, err error) {
-	lease, err := r.persistence.AcquireLease(ctx, "lease:actortemplate:"+ref.Atespace+":"+ref.Name)
+	lease, err := r.persistence.AcquireLease(ctx, templateLeaseKey(ref))
 	if err != nil {
 		if errors.Is(err, store.ErrLeaseConflict) {
 			// Another replica owns this template for now.

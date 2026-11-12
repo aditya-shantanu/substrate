@@ -65,6 +65,7 @@ type ResidentPoolReconciler struct {
 	control        residentPoolControl
 	resyncInterval time.Duration
 	queue          workqueue.TypedRateLimitingInterface[resources.ActorTemplateRef]
+	resyncs        int
 }
 
 // NewResidentPoolReconciler builds the reconciler over this service: it
@@ -98,8 +99,10 @@ func (r *ResidentPoolReconciler) Start(ctx context.Context) {
 	}()
 }
 
-// resync enqueues every template that wants a pool or still reports one.
+// resync enqueues every template that wants a pool or still reports one, and
+// every sweepEvery passes deletes pooled residents whose template is gone.
 func (r *ResidentPoolReconciler) resync(ctx context.Context) {
+	templates := map[resources.ActorTemplateRef]bool{}
 	pageToken := ""
 	for {
 		page, err := r.persistence.ListActorTemplates(ctx, "", store.ListOptions{PageSize: templateListPageSize, PageToken: pageToken})
@@ -108,9 +111,49 @@ func (r *ResidentPoolReconciler) resync(ctx context.Context) {
 			return
 		}
 		for _, tmpl := range page.Items {
+			ref := resources.ActorTemplateRefFromActorTemplate(tmpl)
+			templates[ref] = true
 			status := tmpl.GetStatus().GetResidentPoolStatus()
 			if tmpl.GetResidentPool().GetReplicas() > 0 || status.GetReady() > 0 || status.GetPending() > 0 {
-				r.queue.Add(resources.ActorTemplateRefFromActorTemplate(tmpl))
+				r.queue.Add(ref)
+			}
+		}
+		if page.NextPageToken == "" {
+			break
+		}
+		pageToken = page.NextPageToken
+	}
+	r.resyncs++
+	if r.resyncs%sweepEvery == 1 {
+		r.sweepOrphans(ctx, templates)
+	}
+}
+
+// sweepEvery is how many resyncs apart orphaned residents are swept. The
+// sweep lists every actor, so it runs less often than the pool passes.
+const sweepEvery = 6
+
+// sweepOrphans deletes pooled residents whose template no longer exists: a
+// pass that was creating them when the template was deleted, or a replica
+// that died mid-pass, can leave them running and booked.
+func (r *ResidentPoolReconciler) sweepOrphans(ctx context.Context, templates map[resources.ActorTemplateRef]bool) {
+	pageToken := ""
+	for {
+		page, err := r.persistence.ListActors(ctx, "", store.ListOptions{PageSize: maxPageSize, PageToken: pageToken})
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to list actors for the resident sweep", slog.Any("err", err))
+			return
+		}
+		for _, actor := range page.Items {
+			if actor.GetStatus().GetResident().GetState() != ateapi.ResidentState_RESIDENT_STATE_POOLED || actor.GetMetadata().GetDeleteTime() != nil {
+				continue
+			}
+			if templates[resources.ActorTemplateRefFromObjectRef(actor.GetActorTemplate())] {
+				continue
+			}
+			slog.InfoContext(ctx, "Deleting a resident whose template is gone", slog.String("actor", resources.ActorRefFromActor(actor).String()))
+			if err := r.deleteResident(ctx, actor); err != nil {
+				slog.ErrorContext(ctx, "Failed to delete an orphaned resident", slog.Any("err", err))
 			}
 		}
 		if page.NextPageToken == "" {
@@ -141,16 +184,13 @@ func (r *ResidentPoolReconciler) processNextWorkItem(ctx context.Context) bool {
 	return true
 }
 
-// residentPoolLeaseKey serializes passes over one template across replicas.
-func residentPoolLeaseKey(ref resources.ActorTemplateRef) string {
-	return "lease:residentpool:" + ref.Atespace + ":" + ref.Name
-}
-
 // reconcileOne brings one template's pool to its replicas: broken members
 // are deleted, idle ones resumed, missing ones created and resumed, extra ones
 // deleted, and the counts written to the template's status.
 func (r *ResidentPoolReconciler) reconcileOne(ctx context.Context, ref resources.ActorTemplateRef) error {
-	lease, err := r.persistence.AcquireLease(ctx, residentPoolLeaseKey(ref))
+	// The template lease, so a pass never interleaves with DeleteActorTemplate
+	// or the golden build.
+	lease, err := r.persistence.AcquireLease(ctx, templateLeaseKey(ref))
 	if err != nil {
 		if errors.Is(err, store.ErrLeaseConflict) {
 			return nil
@@ -173,13 +213,23 @@ func (r *ResidentPoolReconciler) reconcileOne(ctx context.Context, ref resources
 	}
 
 	want := int(tmpl.GetResidentPool().GetReplicas())
-	if want > 0 && hasExternalVolumes(tmpl) {
+	refused := ""
+	switch golden := tmpl.GetStatus().GetGoldenSnapshotStatus(); {
+	case want > 0 && hasExternalVolumes(tmpl):
 		// Volumes are created per Actor at its first resume, so a sandbox
 		// restored ahead of the claim cannot carry the claimant's.
+		refused = "resident pools do not support ActorTemplates with external volumes"
+	case want > 0 && tmpl.GetSnapshotConfig().GetGoldenSnapshotConfig().GetMode() == ateapi.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_DISABLED:
+		refused = "resident pools need a golden snapshot; this template disables it"
+	case want > 0 && golden.GetErrorMessage() != "":
+		refused = "resident pools need a golden snapshot; this template's build failed"
+	case want > 0 && golden.GetGoldenTag() == nil:
+		// A resident restored before the golden exists would boot from the
+		// image instead. Wait for the build; the next resync retries.
+		return r.writeStatus(ctx, tmpl, 0, 0, "waiting for the golden snapshot")
+	}
+	if refused != "" {
 		want = 0
-		if err := r.writeStatus(ctx, tmpl, 0, 0, "resident pools do not support ActorTemplates with external volumes"); err != nil {
-			return err
-		}
 	}
 
 	var ready, idle, broken []*ateapi.Actor
@@ -231,6 +281,12 @@ func (r *ResidentPoolReconciler) reconcileOne(ctx context.Context, ref resources
 	// Missing members: create, then resume the idle set in parallel.
 	toResume := idle
 	for have < want {
+		// The pass holds the template lease, so a delete cannot start under
+		// it; the re-read catches one that was marked before the lease.
+		latest, err := r.persistence.GetActorTemplate(ctx, ref)
+		if err != nil || latest.GetMetadata().GetDeleteTime() != nil {
+			break
+		}
 		actor, err := r.control.CreateResidentActor(ctx, tmpl)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("while creating a resident: %w", err))
@@ -244,7 +300,7 @@ func (r *ResidentPoolReconciler) reconcileOne(ctx context.Context, ref resources
 	readyCount := len(ready) + resumed
 	pendingCount := pending + len(toResume) - resumed
 
-	msg := ""
+	msg := refused
 	if err := errors.Join(errs...); err != nil {
 		msg = truncateUTF8(err.Error(), maxGoldenErrorMessageLen)
 	}

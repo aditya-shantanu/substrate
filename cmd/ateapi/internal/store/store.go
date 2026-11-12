@@ -320,9 +320,9 @@ type Interface interface {
 	// points the assignment row at the new name. The booking on the Worker is
 	// untouched. actor's metadata.uid, version and timestamps are assigned by the
 	// store; its atespace must be the resident's. Returns ErrNotFound if the
-	// resident is gone, ErrUIDConflict if it is not residentUID, or
-	// ErrFailedPrecondition if it is no longer POOLED, and ErrAlreadyExists if
-	// actor's name is taken.
+	// resident is gone, ErrUIDConflict if it is not residentUID,
+	// ErrFailedPrecondition if it is not POOLED, RUNNING and undeleted, and
+	// ErrAlreadyExists if actor's name is taken.
 	AdoptResidentActor(ctx context.Context, residentRef resources.ActorRef, residentUID string, actor *ateapi.Actor) (*ateapi.Actor, error)
 
 	// GetWorkerAssignment returns a Worker's assignment for actorUID, or

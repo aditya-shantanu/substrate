@@ -92,8 +92,10 @@ func (p *Persistence) AdoptResidentActor(ctx context.Context, residentRef resour
 		return nil, store.ErrUIDConflict
 	}
 	if resident.GetStatus().GetResident().GetState() != ateapi.ResidentState_RESIDENT_STATE_POOLED ||
-		resident.GetStatus().GetWorkerAssignment() == nil {
-		return nil, fmt.Errorf("%w: resident %s is not pooled", store.ErrFailedPrecondition, residentRef)
+		resident.GetStatus().GetState() != ateapi.ActorState_ACTOR_STATE_RUNNING ||
+		resident.GetStatus().GetWorkerAssignment() == nil ||
+		resident.GetMetadata().GetDeleteTime() != nil {
+		return nil, fmt.Errorf("%w: resident %s is not pooled and running", store.ErrFailedPrecondition, residentRef)
 	}
 
 	dbActor := proto.Clone(actor).(*ateapi.Actor)

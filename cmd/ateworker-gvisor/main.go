@@ -1371,10 +1371,17 @@ func (s *AteWorkerService) TerminateWorkload(ctx context.Context, req *ateworker
 }
 
 func (s *AteWorkerService) terminateWorkload(ctx context.Context, actorRef resources.ActorRef, actorUID, runscPath string, actorDirs *ateworkerpb.ActorDirs, containers []*ateworkerpb.Container) error {
+	var errs []error
 	if hosted := s.lookupActor(actorUID); hosted != nil {
 		hosted.stopping.Store(true)
+		// An adopt the control plane never saw complete leaves the sandbox
+		// registered under a name the request does not carry.
+		if current := hosted.attribution(); current.Ref != actorRef {
+			if err := s.tunnel.Deactivate(ctx, current); err != nil {
+				errs = append(errs, fmt.Errorf("while deactivating actor networking under %s: %w", current.Ref, err))
+			}
+		}
 	}
-	var errs []error
 	if err := s.tunnel.Deactivate(ctx, resources.ActorAttribution{Ref: actorRef, UID: actorUID}); err != nil {
 		errs = append(errs, fmt.Errorf("while deactivating actor networking: %w", err))
 	}
