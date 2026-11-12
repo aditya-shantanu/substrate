@@ -23,6 +23,9 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: ate-demo-resident
+  labels:
+    # Admits claimbench through ate-system's network policy to ate-api-server.
+    ate.dev/api-access: "true"
 
 ---
 
