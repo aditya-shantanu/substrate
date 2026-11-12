@@ -42,15 +42,16 @@ spec:
   sandboxClasses:
   - name: gvisor
   template:
-    # Capacity for the pool's residents plus the claims in flight: the
-    # templates size actors at 500m and 256Mi.
+    # Capacity for every guest's residents plus the claims in flight: the
+    # default guests book 500m each and 256Mi to 1.5Gi, twenty residents in
+    # all.
     resources:
       limits:
-        cpu: "4"
-        memory: 8Gi
+        cpu: "12"
+        memory: 32Gi
       requests:
-        cpu: "1"
-        memory: 8Gi
+        cpu: "2"
+        memory: 32Gi
 
 ---
 
