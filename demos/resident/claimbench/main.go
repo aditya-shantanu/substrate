@@ -86,6 +86,7 @@ type bench struct {
 	router  *http.Client
 	mu      sync.Mutex
 	recent  []claim
+	exp     experiments
 }
 
 func main() {
@@ -110,6 +111,9 @@ func main() {
 	})
 	mux.HandleFunc("/api/state", b.handleState)
 	mux.HandleFunc("/api/run", b.handleRun)
+	mux.HandleFunc("/api/guests", b.handleGuests)
+	mux.HandleFunc("/api/experiment", b.handleExperiment)
+	mux.HandleFunc("/api/experiment/last", b.handleLastExperiment)
 	mux.HandleFunc("/api/recent", func(w http.ResponseWriter, r *http.Request) {
 		b.mu.Lock()
 		defer b.mu.Unlock()

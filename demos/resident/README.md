@@ -49,7 +49,16 @@ kubectl port-forward -n ate-demo-resident svc/claimbench 8080:8080
 open http://localhost:8080
 ```
 
-Pick a guest at the top; each card claims from one of its templates. A bar is one actor: `CreateActor`,
+"Run the experiment" at the top runs the whole measurement from the page: pick
+one guest or all, set the claims per template and the pause between claims,
+and watch each claim land as a cell per template, plain templates first and
+then pooled. When the last template finishes the page draws the results: a
+dumbbell per guest (plain against pooled claim time, p90) and the resume step
+against the memory each guest holds, with a table view and the raw JSON at
+`/api/experiment/last`. The last run stays on the page across reloads until
+claimbench restarts.
+
+Below that, pick a guest; each card claims from one of its templates. A bar is one actor: `CreateActor`,
 `ResumeActor`, and the first HTTP response through the router. A claim that
 adopted a resident is marked with a check. The dots above the bars are the pool
 refilling after each claim. "One every 300 ms" is an arrival rate a pool of
