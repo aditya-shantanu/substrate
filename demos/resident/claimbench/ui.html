@@ -90,7 +90,7 @@ limitations under the License.
 <section class="exp">
   <h2>Run the experiment</h2>
   <div class="controls">
-    <label>sandbox <select id="expClass"><option value="all">all</option></select></label>
+    <label>sandbox <select id="expClass"></select></label>
     <label>guests <select id="expGuests"><option value="all">all</option></select></label>
     <label>claims per template <input id="expN" type="number" min="1" max="500" value="30"></label>
     <label>one claim every <input id="expInterval" type="number" min="0" max="5000" step="50" value="300"> ms</label>
@@ -191,9 +191,10 @@ async function loadGuests() {
     const sel = $('expGuests'); for (const o of [...sel.options].slice(1)) o.remove();
     const seen = new Set();
     for (const g of exp.guests) { if (seen.has(g.label)) continue; seen.add(g.label); const o = document.createElement('option'); o.value = g.label; o.textContent = `${g.label} (${fmtMB(g.size_mb)}${g.touch_mib ? ', holds ' + g.touch_mib + ' MiB' : ''})`; sel.appendChild(o); }
-    const cls = $('expClass'); for (const o of [...cls.options].slice(1)) o.remove();
+    // One sandbox class per run; "all" applies to guests only.
+    const cls = $('expClass'); const current = cls.value; cls.innerHTML = '';
     for (const c of [...new Set(exp.guests.map(g => g.class))].sort()) { const o = document.createElement('option'); o.value = o.textContent = c; cls.appendChild(o); }
-    if (cls.options.length === 2) cls.value = cls.options[1].value;
+    if ([...cls.options].some(o => o.value === current)) cls.value = current;
   } catch (e) { console.warn(e); }
 }
 function strip(template, n) {
@@ -212,6 +213,7 @@ function onClaim(c) {
 $('expRun').onclick = () => {
   if (exp.running) return;
   const n = +$('expN').value, interval = +$('expInterval').value, guests = $('expGuests').value, cls = $('expClass').value;
+  if (!cls) { $('expProgress').textContent = 'no sandbox class found; are the templates deployed?'; return; }
   $('expStrips').innerHTML = ''; $('expResults').innerHTML = ''; exp.strips = {}; exp.running = true; $('expRun').disabled = true;
   const es = new EventSource(`/api/experiment?guests=${encodeURIComponent(guests)}&class=${encodeURIComponent(cls)}&n=${n}&interval_ms=${interval}`);
   es.addEventListener('start', e => { const d = JSON.parse(e.data); for (const t of d.templates) strip(t, d.spec.n); $('expProgress').textContent = `running ${d.templates.length} templates, ${d.spec.n} claims each`; });

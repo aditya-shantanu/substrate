@@ -71,7 +71,7 @@ open http://localhost:8080
 ```
 
 "Run the experiment" at the top runs the whole measurement from the page: pick
-a sandbox class and one guest or all, set the claims per template and the pause between claims,
+a sandbox class, one guest or all guests of it, the claims per template and the pause between claims,
 and watch each claim land as a cell per template, plain templates first and
 then pooled. When the last template finishes the page draws the results: a
 dumbbell per guest (plain against pooled claim time, p90) and the resume step
