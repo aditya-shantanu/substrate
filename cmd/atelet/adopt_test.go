@@ -141,7 +141,7 @@ func TestAdopt(t *testing.T) {
 	})
 	t.Run("a worker failure keeps the previous name", func(t *testing.T) {
 		f := newAdoptFixture(t)
-		f.worker.adoptErr = status.Error(codes.Unimplemented, "microvm")
+		f.worker.adoptErr = status.Error(codes.Unimplemented, "older worker")
 		_, err := f.s.Adopt(t.Context(), f.request())
 		if apierror.Code(err) != codes.Unimplemented {
 			t.Fatalf("Adopt error = %v, want the worker's Unimplemented", err)

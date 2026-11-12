@@ -85,7 +85,5 @@ never fails because of it.
   snapshot.
 - Residents are placed by the scheduler like any other actor. There is no
   per-node target mix; a claim only needs one resident on some worker.
-- Only the gVisor runtime adopts. ateworker-microvm returns Unimplemented and
-  the resume falls back to a restore.
 - The resident's container stdio logs keep the placeholder name; the log
   pipes are opened at start and carry their attribution by value.

@@ -98,7 +98,7 @@ func TestResumeActor_AdoptsReservedResident(t *testing.T) {
 }
 
 // TestResumeActor_ReleasesResidentWhenAdoptFails pins the fallback: when
-// atelet cannot adopt (an older or micro-VM worker says Unimplemented), the
+// atelet cannot adopt (an older worker says Unimplemented), the
 // resident is terminated and the actor returns to plain SUSPENDED with no
 // worker, so the resume continues as an ordinary restore.
 func TestResumeActor_ReleasesResidentWhenAdoptFails(t *testing.T) {
