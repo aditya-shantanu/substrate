@@ -37,7 +37,13 @@ type tunnelDialer interface {
 
 type actorCertificateSource interface {
 	MintWorkerCertificate(context.Context) (time.Time, error)
+	// Rename changes the actor name the next mint is for and returns the
+	// previous one.
+	Rename(actorName string) (previous string)
 }
+
+// ErrNotActive reports an actor without active egress.
+var ErrNotActive = errors.New("egress: actor has no active egress")
 
 // originalDestinationFunc returns the address that a transparently intercepted
 // connection originally targeted.
@@ -166,6 +172,44 @@ func (e *Proxy) Activate(actorUID string, dialer tunnelDialer, certificateSource
 	active.expiresAt = expiresAt
 	active.wg.Add(1)
 	go e.renew(active, expiresAt)
+	return nil
+}
+
+// Active reports whether the actor's egress is active.
+func (e *Proxy) Active(actorUID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	active := e.active[actorUID]
+	return active != nil && active.dialer != nil
+}
+
+// Rename moves the actor's active egress to another actor name: it renames
+// the certificate source and mints a certificate for the new name, which the
+// next tunnel presents. A failed mint leaves the old name and certificate in
+// place. Returns ErrNotActive when the actor has no active egress.
+func (e *Proxy) Rename(ctx context.Context, actorUID, actorName string) error {
+	e.mu.Lock()
+	active := e.active[actorUID]
+	if active == nil || active.dialer == nil {
+		e.mu.Unlock()
+		return ErrNotActive
+	}
+	source := active.certificateSource
+	e.mu.Unlock()
+
+	previous := source.Rename(actorName)
+	expiresAt, err := source.MintWorkerCertificate(ctx)
+	if err != nil {
+		source.Rename(previous)
+		return fmt.Errorf("egress: mint actor certificate for %s: %w", actorName, err)
+	}
+	e.mu.Lock()
+	// Same rule as renew: never install an expiry after Deactivate cleared
+	// it. renew keeps the schedule it took from the previous certificate.
+	if active.ctx.Err() == nil {
+		active.expiresAt = expiresAt
+	}
+	e.mu.Unlock()
 	return nil
 }
 

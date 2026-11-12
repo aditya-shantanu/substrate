@@ -48,19 +48,21 @@ const (
 	egressPolicyStaleWarnInterval = 5 * time.Minute
 )
 
-// actorEgressPolicy supplies an actor's egress policy to its DNS relay.
-type actorEgressPolicy struct {
-	fetch func(context.Context) (*ateletpb.EgressPolicy, error)
+// EgressPolicySource supplies an actor's egress policy to its DNS relay.
+type EgressPolicySource struct {
+	fetch func(context.Context, resources.ActorRef) (*ateletpb.EgressPolicy, error)
 	ttl   time.Duration
 	now   func() time.Time
-	// log identifies the actor on the source's records.
-	log *slog.Logger
 
 	// flight shares one fetch among the queries waiting on it to avoid duplicate
 	// requests for the same information.
 	flight singleflight.Group
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// actor is the actor whose policy is fetched. Retarget changes it.
+	actor resources.ActorAttribution
+	// log identifies the actor on the source's records.
+	log     *slog.Logger
 	fetched bool
 	policy  *ateletpb.EgressPolicy
 	expires time.Time
@@ -70,29 +72,51 @@ type actorEgressPolicy struct {
 	nextStaleWarn time.Time
 }
 
+var _ dns.PolicySource = (*EgressPolicySource)(nil)
+
 // ActorEgressPolicy returns the source of actor's egress policy for its DNS
 // relay.
-func (t *Tunnel) ActorEgressPolicy(actor resources.ActorAttribution) dns.PolicySource {
-	return &actorEgressPolicy{
-		fetch: func(ctx context.Context) (*ateletpb.EgressPolicy, error) {
+func (t *Tunnel) ActorEgressPolicy(actor resources.ActorAttribution) *EgressPolicySource {
+	return &EgressPolicySource{
+		fetch: func(ctx context.Context, actor resources.ActorRef) (*ateletpb.EgressPolicy, error) {
 			conn, err := ateletdial.Dial(nodepath.WorkerSupportSocket, t.ateletTLS)
 			if err != nil {
 				return nil, err
 			}
 			defer conn.Close()
-			return getEgressPolicy(ctx, ateletpb.NewWorkerSupportClient(conn), actor.Ref)
+			return getEgressPolicy(ctx, ateletpb.NewWorkerSupportClient(conn), actor)
 		},
-		ttl: egressPolicyTTL,
-		now: time.Now,
-		log: slog.New(slog.Default().Handler().WithAttrs(ateattr.ActorLogAttrs(actor))),
+		ttl:   egressPolicyTTL,
+		now:   time.Now,
+		actor: actor,
+		log:   actorPolicyLogger(actor),
 	}
+}
+
+func actorPolicyLogger(actor resources.ActorAttribution) *slog.Logger {
+	return slog.New(slog.Default().Handler().WithAttrs(ateattr.ActorLogAttrs(actor)))
+}
+
+// Retarget makes the source fetch actor's policy from now on and drops the
+// cached policy, so the next query fetches. A fetch in flight for the previous
+// actor is not cached.
+func (p *EgressPolicySource) Retarget(actor resources.ActorAttribution) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.actor = actor
+	p.log = actorPolicyLogger(actor)
+	p.fetched = false
+	p.policy = nil
+	p.expires = time.Time{}
+	p.failing = false
+	p.nextStaleWarn = time.Time{}
 }
 
 // EgressPolicy returns the actor's egress policy, or nil if it has none.
 //
 // Callers must not modify the policy as it may be shared in response to concurrent calls
 // to EgressPolicy.
-func (p *actorEgressPolicy) EgressPolicy(ctx context.Context) (*ateletpb.EgressPolicy, error) {
+func (p *EgressPolicySource) EgressPolicy(ctx context.Context) (*ateletpb.EgressPolicy, error) {
 	if policy, ok := p.cached(); ok {
 		return policy, nil
 	}
@@ -105,8 +129,11 @@ func (p *actorEgressPolicy) EgressPolicy(ctx context.Context) (*ateletpb.EgressP
 		// waiting on it still need its result.
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), egressPolicyFetchTimeout)
 		defer cancel()
-		policy, err := p.fetch(fetchCtx)
-		return p.record(ctx, policy, err)
+		p.mu.Lock()
+		actor := p.actor.Ref
+		p.mu.Unlock()
+		policy, err := p.fetch(fetchCtx, actor)
+		return p.record(ctx, actor, policy, err)
 	})
 	select {
 	case res := <-results:
@@ -121,7 +148,7 @@ func (p *actorEgressPolicy) EgressPolicy(ctx context.Context) (*ateletpb.EgressP
 }
 
 // cached returns the policy last fetched, unless it has expired.
-func (p *actorEgressPolicy) cached() (*ateletpb.EgressPolicy, bool) {
+func (p *EgressPolicySource) cached() (*ateletpb.EgressPolicy, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.fetched || !p.now().Before(p.expires) {
@@ -134,11 +161,15 @@ func (p *actorEgressPolicy) cached() (*ateletpb.EgressPolicy, bool) {
 // error EgressPolicy should report. When a refresh fails after a policy has
 // already been fetched, record keeps and returns the stale entry (fail static),
 // logging an error on the first failure and a warning every
-// egressPolicyStaleWarnInterval while stale entries are used.
-func (p *actorEgressPolicy) record(ctx context.Context, policy *ateletpb.EgressPolicy, err error) (*ateletpb.EgressPolicy, error) {
+// egressPolicyStaleWarnInterval while stale entries are used. A fetch for an
+// actor the source was retargeted away from is neither cached nor returned.
+func (p *EgressPolicySource) record(ctx context.Context, actor resources.ActorRef, policy *ateletpb.EgressPolicy, err error) (*ateletpb.EgressPolicy, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if actor != p.actor.Ref {
+		return nil, fmt.Errorf("egress policy source was retargeted from %s to %s during the fetch", actor, p.actor.Ref)
+	}
 	now := p.now()
 	if err != nil {
 		if !p.fetched {

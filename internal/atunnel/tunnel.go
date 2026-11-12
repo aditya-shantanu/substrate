@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"time"
 
+	"go.ate.dev/substrate/internal/apierror"
 	"go.ate.dev/substrate/internal/ateletdial"
 	"go.ate.dev/substrate/internal/atunnel/dns"
 	"go.ate.dev/substrate/internal/atunnel/egress"
@@ -254,6 +255,36 @@ func (t *Tunnel) ActivateEgress(actor resources.ActorAttribution, actorEgress *A
 func (t *Tunnel) ActivateIngress(actor resources.ActorAttribution, dial ingress.DialFunc) error {
 	if err := t.Ingress.Activate(actor.Ref.Atespace, actor.Ref.Name, actor.UID, dial); err != nil {
 		return fmt.Errorf("while activating actor ingress: %w", err)
+	}
+	return nil
+}
+
+// AdoptEgress moves the actor's tunneled egress to the name in actor: the
+// egress certificate is minted again for it. gateway must match the actor's
+// egress, present when it has one and absent when it has none; an adopt
+// cannot add or remove egress.
+func (t *Tunnel) AdoptEgress(ctx context.Context, actor resources.ActorAttribution, gateway *ateworkerpb.EgressGateway) error {
+	if gateway == nil {
+		if t.Egress.Active(actor.UID) {
+			return apierror.FailedPrecondition("actor %s has tunneled egress but the request names no egress gateway", actor.UID)
+		}
+		return nil
+	}
+	err := t.Egress.Rename(ctx, actor.UID, actor.Ref.Name)
+	if errors.Is(err, egress.ErrNotActive) {
+		return apierror.FailedPrecondition("actor %s has no tunneled egress but the request names an egress gateway", actor.UID)
+	}
+	if err != nil {
+		return fmt.Errorf("while renaming actor egress: %w", err)
+	}
+	return nil
+}
+
+// AdoptIngress moves the actor's inbound traffic from previous to the name in
+// actor, through dial.
+func (t *Tunnel) AdoptIngress(ctx context.Context, previous resources.ActorRef, actor resources.ActorAttribution, dial ingress.DialFunc) error {
+	if err := t.Ingress.Adopt(ctx, actor.Ref.Atespace, previous.Name, actor.Ref.Name, actor.UID, dial); err != nil {
+		return fmt.Errorf("while renaming actor ingress: %w", err)
 	}
 	return nil
 }

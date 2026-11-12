@@ -81,19 +81,20 @@ type scriptedFetch struct {
 	fetches atomic.Int32
 }
 
-func (f *scriptedFetch) fetch(context.Context) (*ateletpb.EgressPolicy, error) {
+func (f *scriptedFetch) fetch(context.Context, resources.ActorRef) (*ateletpb.EgressPolicy, error) {
 	r := f.results[f.fetches.Add(1)-1]
 	return r.policy, r.err
 }
 
-// newTestSource returns a source over fetch whose clock moves only when the
-// test advances it.
-func newTestSource(fetch func(context.Context) (*ateletpb.EgressPolicy, error)) (*actorEgressPolicy, *fakeClock) {
+// newTestSource returns a source for testActor over fetch whose clock moves
+// only when the test advances it.
+func newTestSource(fetch func(context.Context, resources.ActorRef) (*ateletpb.EgressPolicy, error)) (*EgressPolicySource, *fakeClock) {
 	clock := &fakeClock{t: time.Unix(1_000_000, 0)}
-	return &actorEgressPolicy{
+	return &EgressPolicySource{
 		fetch: fetch,
 		ttl:   egressPolicyTTL,
 		now:   clock.now,
+		actor: testActor,
 		log:   slog.New(slog.DiscardHandler),
 	}, clock
 }
@@ -188,7 +189,7 @@ func TestActorEgressPolicySharesOneFetch(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var fetches atomic.Int32
-	source, _ := newTestSource(func(context.Context) (*ateletpb.EgressPolicy, error) {
+	source, _ := newTestSource(func(context.Context, resources.ActorRef) (*ateletpb.EgressPolicy, error) {
 		if fetches.Add(1) == 1 {
 			close(started)
 		}
@@ -227,7 +228,7 @@ func TestActorEgressPolicyQueryStopsWaitingWhenCanceled(t *testing.T) {
 	release := make(chan struct{})
 	fetchCtxErr := make(chan error, 1)
 	var fetches atomic.Int32
-	source, _ := newTestSource(func(ctx context.Context) (*ateletpb.EgressPolicy, error) {
+	source, _ := newTestSource(func(ctx context.Context, _ resources.ActorRef) (*ateletpb.EgressPolicy, error) {
 		fetches.Add(1)
 		close(started)
 		<-release
@@ -532,5 +533,71 @@ func TestTunnelFetchesActorEgressPolicyFromAtelet(t *testing.T) {
 		if diff := cmp.Diff(want, got, protocmp.Transform()); diff != "" {
 			t.Errorf("request mismatch (-want +got):\n%s", diff)
 		}
+	}
+}
+
+// Retarget drops the cached policy and the next query fetches for the new
+// actor, under the TTL.
+func TestActorEgressPolicyRetargetFetchesForTheNewActor(t *testing.T) {
+	adopted := resources.ActorAttribution{Ref: resources.ActorRef{Atespace: "space", Name: "adopted"}, UID: "uid"}
+	policy := &ateletpb.EgressPolicy{Rules: []*ateletpb.EgressRule{{Http: &ateletpb.EgressDestinations{Hostnames: []string{"example.com"}}}}}
+	adoptedPolicy := &ateletpb.EgressPolicy{}
+	var refs []resources.ActorRef
+	source, _ := newTestSource(func(_ context.Context, actor resources.ActorRef) (*ateletpb.EgressPolicy, error) {
+		refs = append(refs, actor)
+		if actor == adopted.Ref {
+			return adoptedPolicy, nil
+		}
+		return policy, nil
+	})
+
+	for range 2 {
+		if got, err := source.EgressPolicy(context.Background()); err != nil || got != policy {
+			t.Fatalf("EgressPolicy() = %v, %v, want the first actor's policy", got, err)
+		}
+	}
+	source.Retarget(adopted)
+	for range 2 {
+		if got, err := source.EgressPolicy(context.Background()); err != nil || got != adoptedPolicy {
+			t.Fatalf("EgressPolicy() after Retarget = %v, %v, want the adopted actor's policy", got, err)
+		}
+	}
+	want := []resources.ActorRef{testActor.Ref, adopted.Ref}
+	if diff := cmp.Diff(want, refs); diff != "" {
+		t.Errorf("fetched refs (-want +got):\n%s", diff)
+	}
+}
+
+// A fetch in flight for the previous actor is not cached, or returned, once
+// the source is retargeted.
+func TestActorEgressPolicyRetargetDiscardsAnInFlightFetch(t *testing.T) {
+	adopted := resources.ActorAttribution{Ref: resources.ActorRef{Atespace: "space", Name: "adopted"}, UID: "uid"}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var fetches atomic.Int32
+	source, _ := newTestSource(func(_ context.Context, actor resources.ActorRef) (*ateletpb.EgressPolicy, error) {
+		if fetches.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return &ateletpb.EgressPolicy{}, nil
+	})
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := source.EgressPolicy(context.Background())
+		result <- err
+	}()
+	<-started
+	source.Retarget(adopted)
+	close(release)
+	if err := <-result; err == nil {
+		t.Fatal("a fetch for the previous actor was returned after Retarget")
+	}
+	if _, err := source.EgressPolicy(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := fetches.Load(); got != 2 {
+		t.Fatalf("fetches = %d, want 2: the stale result was not cached", got)
 	}
 }
