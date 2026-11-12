@@ -23,7 +23,7 @@ metadata:
   name: ${NAME}
 workerSelector:
   matchLabels:
-    workload: resident
+    workload: ${WORKLOAD}
 containers:
 - name: counter
   image: ${GUEST_IMAGE}

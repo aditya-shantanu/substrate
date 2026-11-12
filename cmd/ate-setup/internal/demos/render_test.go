@@ -35,9 +35,9 @@ import (
 func TestDemoTemplatesRender(t *testing.T) {
 	e := demotest.Env(t)
 
-	render := func(t *testing.T, relPath string) []byte {
+	render := func(t *testing.T, relPath string, values map[string]string, drop []string) []byte {
 		t.Helper()
-		manifest, err := demos.Render(e, relPath, nil, demos.ExternalVolumePlaceholders)
+		manifest, err := demos.Render(e, relPath, values, append(append([]string{}, demos.ExternalVolumePlaceholders...), drop...))
 		if err != nil {
 			t.Fatalf("Render(%s): %v", relPath, err)
 		}
@@ -55,9 +55,11 @@ func TestDemoTemplatesRender(t *testing.T) {
 		covered++
 		t.Run(demo.Name(), func(t *testing.T) {
 			s := d.SubstrateDemo()
-			demotest.AssertRendered(t, render(t, s.WorkerPoolManifest))
+			// Without RenderValues every optional line is dropped, as a
+			// deploy that supplies none of them would.
+			demotest.AssertRendered(t, render(t, s.WorkerPoolManifest, nil, s.OptionalPlaceholders))
 			for _, tmpl := range s.Templates {
-				demotest.AssertRenderedActorTemplate(t, render(t, tmpl.Manifest), tmpl.Ref)
+				demotest.AssertRenderedActorTemplate(t, render(t, tmpl.Manifest, tmpl.Values, tmpl.Drop), tmpl.Ref)
 			}
 		})
 	}

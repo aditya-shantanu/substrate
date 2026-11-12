@@ -80,6 +80,11 @@ type Substrate struct {
 	// Delete renders only the pool manifest, so deploy-only values may live
 	// solely here.
 	RenderValues func(ctx context.Context, e *steps.Env) (map[string]string, error)
+
+	// OptionalPlaceholders are the demo's own optional placeholders, treated
+	// like ExternalVolumePlaceholders: lines naming one RenderValues leaves
+	// out are dropped.
+	OptionalPlaceholders []string
 }
 
 func (d *Substrate) Name() string        { return d.DemoName }
@@ -123,8 +128,9 @@ func (d *Substrate) Deploy(ctx context.Context, e *steps.Env) error {
 	// Placeholders that RenderValues supplies are substituted; the rest of
 	// the optional set is dropped, so a demo opts lines in by providing
 	// values for them (render.Expand drops before it substitutes).
-	drop := make([]string, 0, len(ExternalVolumePlaceholders))
-	for _, name := range ExternalVolumePlaceholders {
+	optional := append(slices.Clone(ExternalVolumePlaceholders), d.OptionalPlaceholders...)
+	drop := make([]string, 0, len(optional))
+	for _, name := range optional {
 		if _, ok := values[name]; !ok {
 			drop = append(drop, name)
 		}
@@ -207,7 +213,13 @@ func (d *Substrate) Delete(ctx context.Context, e *steps.Env) ([]string, error) 
 	if err := e.DeleteSubstrateDemo(ctx, refs, d.atespaces()); err != nil {
 		return nil, err
 	}
-	manifest, err := Render(e, d.WorkerPoolManifest, nil, ExternalVolumePlaceholders)
+	// Delete renders with every optional line kept (empty values), so every
+	// object a deploy may have created is named.
+	keep := map[string]string{}
+	for _, name := range d.OptionalPlaceholders {
+		keep[name] = ""
+	}
+	manifest, err := Render(e, d.WorkerPoolManifest, keep, ExternalVolumePlaceholders)
 	if err != nil {
 		return nil, err
 	}

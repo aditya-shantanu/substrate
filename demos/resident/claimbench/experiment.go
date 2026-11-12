@@ -35,6 +35,7 @@ import (
 // guestInfo is one guest image with its two templates.
 type guestInfo struct {
 	Label    string `json:"label"`
+	Class    string `json:"class"`
 	Image    string `json:"image"`
 	SizeMB   int64  `json:"size_mb"`
 	TouchMiB int    `json:"touch_mib"`
@@ -62,6 +63,7 @@ type guestResult struct {
 
 type experimentSpec struct {
 	Guests     []string `json:"guests"`
+	Class      string   `json:"class"`
 	N          int      `json:"n"`
 	IntervalMs int      `json:"interval_ms"`
 }
@@ -91,16 +93,15 @@ func (b *bench) guests(ctx context.Context) ([]guestInfo, error) {
 	}
 	byLabel := map[string]*guestInfo{}
 	for _, n := range names {
-		label, variant := n, ""
-		for _, suffix := range []string{"-pooled", "-plain"} {
-			if strings.HasSuffix(n, suffix) {
-				label, variant = strings.TrimSuffix(n, suffix), suffix[1:]
-			}
+		label, class, variant, ok := parseTemplateName(n)
+		if !ok {
+			continue
 		}
-		g := byLabel[label]
+		key := label + "/" + class
+		g := byLabel[key]
 		if g == nil {
-			g = &guestInfo{Label: label}
-			byLabel[label] = g
+			g = &guestInfo{Label: label, Class: class}
+			byLabel[key] = g
 		}
 		if variant == "pooled" {
 			g.Pooled = n
@@ -127,12 +128,31 @@ func (b *bench) guests(ctx context.Context) ([]guestInfo, error) {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
+		if out[i].Class != out[j].Class {
+			return out[i].Class < out[j].Class
+		}
 		if out[i].SizeMB != out[j].SizeMB {
 			return out[i].SizeMB < out[j].SizeMB
 		}
 		return out[i].Label < out[j].Label
 	})
 	return out, nil
+}
+
+// parseTemplateName splits "<guest>-<class>-<pooled|plain>". The guest label
+// may itself contain dashes; the class is the last dash-separated word before
+// the variant.
+func parseTemplateName(name string) (label, class, variant string, ok bool) {
+	parts := strings.Split(name, "-")
+	if len(parts) < 3 {
+		return "", "", "", false
+	}
+	variant = parts[len(parts)-1]
+	class = parts[len(parts)-2]
+	if (variant != "pooled" && variant != "plain") || (class != "gvisor" && class != "microvm") {
+		return "", "", "", false
+	}
+	return strings.Join(parts[:len(parts)-2], "-"), class, variant, true
 }
 
 // imageSizeMB is the compressed size of the image's layers, 0 when the
@@ -218,8 +238,12 @@ func (b *bench) handleExperiment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	want := q.Get("guests")
+	class := q.Get("class")
 	var chosen []guestInfo
 	for _, g := range all {
+		if class != "" && class != "all" && g.Class != class {
+			continue
+		}
 		if want == "" || want == "all" || contains(strings.Split(want, ","), g.Label) {
 			chosen = append(chosen, g)
 		}
@@ -249,7 +273,7 @@ func (b *bench) handleExperiment(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
 		flusher.Flush()
 	}
-	spec := experimentSpec{N: n, IntervalMs: intervalMs}
+	spec := experimentSpec{N: n, IntervalMs: intervalMs, Class: class}
 	var order []string
 	for _, g := range chosen {
 		spec.Guests = append(spec.Guests, g.Label)

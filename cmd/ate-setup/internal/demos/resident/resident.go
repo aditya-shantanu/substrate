@@ -106,51 +106,36 @@ func (d *demo) Settings() []config.Setting {
 			Flag: "replicas", Kind: config.KindInt, Default: "4",
 			Usage: "Residents each pooled template keeps running",
 		},
+		{
+			Key: "demo.resident.sandboxClasses", Env: "ATE_DEMO_RESIDENT_SANDBOX_CLASSES",
+			Flag: "sandbox-classes", Kind: config.KindString, Default: "gvisor",
+			Usage: "Sandbox classes to measure, comma-separated from gvisor and microvm. Each gets its own WorkerPool and a template pair per guest, named <guest>-<class>-pooled and -plain.",
+		},
+		{
+			Key: "demo.resident.workers", Env: "ATE_DEMO_RESIDENT_WORKERS",
+			Flag: "workers", Kind: config.KindInt, Default: "2",
+			Usage: "Worker pods per sandbox class pool",
+		},
 	}
 }
 
-// templatesFor renders the one template manifest twice per guest.
-func (d *demo) templatesFor(e *steps.Env) error {
-	guests, err := parseGuests(e.Cfg.Resolved().String("demo.resident.guests"))
-	if err != nil {
-		return err
-	}
-	replicas := e.Cfg.Resolved().Int("demo.resident.replicas")
-	d.Templates = d.Templates[:0]
-	for _, g := range guests {
-		for _, variant := range []string{"pooled", "plain"} {
-			name := g.label + "-" + variant
-			values := map[string]string{
-				"NAME":                 name,
-				"GUEST_IMAGE":          g.image,
-				"COUNTER_COMMAND":      "/ko-app/counter",
-				"ACTOR_MEMORY_BYTES":   strconv.Itoa(g.memoryMiB << 20),
-				"RESIDENT_POOL":        "residentPool:\n  replicas: " + strconv.Itoa(replicas),
-				"TOUCH_MEMORY_ARG":     "  - --touch-memory-mb=" + strconv.Itoa(g.touchMiB),
-				"COUNTER_VOLUME_MOUNT": "  - name: counter-bin\n    mountPath: /ate",
-				"COUNTER_VOLUME":       "- name: counter-bin\n  image:\n    reference: " + counterImage,
-			}
-			var drop []string
-			if g.image == counterImage {
-				drop = append(drop, "COUNTER_VOLUME_MOUNT", "COUNTER_VOLUME")
-			} else {
-				values["COUNTER_COMMAND"] = "/ate/ko-app/counter"
-			}
-			if g.touchMiB == 0 {
-				drop = append(drop, "TOUCH_MEMORY_ARG")
-			}
-			if variant == "plain" {
-				drop = append(drop, "RESIDENT_POOL")
-			}
-			d.Templates = append(d.Templates, demos.SubstrateTemplate{
-				Manifest: template,
-				Ref:      resources.ActorTemplateRef{Atespace: namespace, Name: name},
-				Values:   values,
-				Drop:     drop,
-			})
+// classes reads the sandbox classes setting.
+func classes(e *steps.Env) ([]string, error) {
+	var out []string
+	for _, c := range strings.Split(e.Cfg.Resolved().String("demo.resident.sandboxClasses"), ",") {
+		c = strings.TrimSpace(c)
+		switch c {
+		case "gvisor", "microvm":
+			out = append(out, c)
+		case "":
+		default:
+			return nil, fmt.Errorf("sandbox class %q: want gvisor or microvm", c)
 		}
 	}
-	return nil
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no sandbox classes selected")
+	}
+	return out, nil
 }
 
 // guestSizes renders the --guest-sizes claimbench shows, "label=MB,...": the
@@ -175,12 +160,86 @@ func guestSizes(ctx context.Context, guests []guest) string {
 	return strings.Join(parts, ",")
 }
 
+// templatesFor builds the templates and pool Deployments for the resolved
+// settings.
+func (d *demo) templatesFor(e *steps.Env) error {
+	guests, err := parseGuests(e.Cfg.Resolved().String("demo.resident.guests"))
+	if err != nil {
+		return err
+	}
+	cls, err := classes(e)
+	if err != nil {
+		return err
+	}
+	d.Templates, d.Deployments = buildTemplates(guests, cls, e.Cfg.Resolved().Int("demo.resident.replicas"))
+	return nil
+}
+
+// buildTemplates renders the one template manifest twice per guest and class,
+// and names the pool Deployments to wait for.
+func buildTemplates(guests []guest, cls []string, replicas int) ([]demos.SubstrateTemplate, []steps.TemplateRef) {
+	var templates []demos.SubstrateTemplate
+	var deployments []steps.TemplateRef
+	for _, class := range cls {
+		deployments = append(deployments, steps.TemplateRef{Atespace: namespace, Name: "resident-" + class})
+	}
+	for _, class := range cls {
+		for _, g := range guests {
+			for _, variant := range []string{"pooled", "plain"} {
+				name := g.label + "-" + class + "-" + variant
+				values := map[string]string{
+					"NAME":                 name,
+					"WORKLOAD":             "resident-" + class,
+					"GUEST_IMAGE":          g.image,
+					"COUNTER_COMMAND":      "/ko-app/counter",
+					"ACTOR_MEMORY_BYTES":   strconv.Itoa(g.memoryMiB << 20),
+					"RESIDENT_POOL":        "residentPool:\n  replicas: " + strconv.Itoa(replicas),
+					"TOUCH_MEMORY_ARG":     "  - --touch-memory-mb=" + strconv.Itoa(g.touchMiB),
+					"COUNTER_VOLUME_MOUNT": "  - name: counter-bin\n    mountPath: /ate",
+					"COUNTER_VOLUME":       "- name: counter-bin\n  image:\n    reference: " + counterImage,
+				}
+				var drop []string
+				if g.image == counterImage {
+					drop = append(drop, "COUNTER_VOLUME_MOUNT", "COUNTER_VOLUME")
+				} else {
+					values["COUNTER_COMMAND"] = "/ate/ko-app/counter"
+				}
+				if g.touchMiB == 0 {
+					drop = append(drop, "TOUCH_MEMORY_ARG")
+				}
+				if variant == "plain" {
+					drop = append(drop, "RESIDENT_POOL")
+				}
+				templates = append(templates, demos.SubstrateTemplate{
+					Manifest: template,
+					Ref:      resources.ActorTemplateRef{Atespace: namespace, Name: name},
+					Values:   values,
+					Drop:     drop,
+				})
+			}
+		}
+	}
+	return templates, deployments
+}
+
 func (d *demo) renderValues(ctx context.Context, e *steps.Env) (map[string]string, error) {
 	guests, err := parseGuests(e.Cfg.Resolved().String("demo.resident.guests"))
 	if err != nil {
 		return nil, err
 	}
-	return map[string]string{"GUEST_SIZES": guestSizes(ctx, guests)}, nil
+	cls, err := classes(e)
+	if err != nil {
+		return nil, err
+	}
+	values := map[string]string{
+		"GUEST_SIZES": guestSizes(ctx, guests),
+		"WORKERS":     strconv.Itoa(e.Cfg.Resolved().Int("demo.resident.workers")),
+	}
+	// A pool's lines stay only for a selected class.
+	for _, class := range cls {
+		values[strings.ToUpper(class)+"_POOL"] = ""
+	}
+	return values, nil
 }
 
 func (d *demo) Deploy(ctx context.Context, e *steps.Env) error {
@@ -200,14 +259,21 @@ func (d *demo) Delete(ctx context.Context, e *steps.Env) ([]string, error) {
 func init() {
 	d := &demo{}
 	d.Substrate = demos.Substrate{
-		DemoName:           "demo-resident",
-		Short:              "Claim latency with and without a resident pool, across guest images",
-		WorkerPoolManifest: "demos/resident/resident.yaml.tmpl",
-		Deployments:        []steps.TemplateRef{{Atespace: namespace, Name: "resident"}},
+		DemoName:             "demo-resident",
+		Short:                "Claim latency with and without a resident pool, across guest images",
+		WorkerPoolManifest:   "demos/resident/resident.yaml.tmpl",
+		OptionalPlaceholders: []string{"GVISOR_POOL", "MICROVM_POOL", "GUEST_SIZES"},
 		// The largest default guest is a 2.4 GB image; its first pull and
 		// golden build take longer than a demo usually does.
 		GoldenTimeout: 20 * time.Minute,
 		RenderValues:  d.renderValues,
 	}
+	// The default set, so the render test covers the template; Deploy and
+	// Delete rebuild it from the resolved settings.
+	defaults, err := parseGuests(defaultGuests)
+	if err != nil {
+		panic(err)
+	}
+	d.Templates, d.Deployments = buildTemplates(defaults, []string{"gvisor"}, 4)
 	demos.Register(d)
 }

@@ -52,7 +52,7 @@ var uiHTML []byte
 var (
 	listen         = flag.String("listen", ":8080", "address of the page and the JSON API")
 	atespace       = flag.String("atespace", "ate-demo-resident", "atespace the claimed actors are created in")
-	templates      = flag.String("templates", "", "comma-separated ActorTemplates to claim from; empty lists the atespace's <guest>-pooled and <guest>-plain pairs")
+	templates      = flag.String("templates", "", "comma-separated ActorTemplates to claim from; empty lists the atespace's <guest>-<class>-pooled and -plain pairs")
 	controlAddr    = flag.String("control-addr", "api.ate-system.svc.cluster.local:443", "ate-api-server address")
 	apiServerName  = flag.String("api-server-name", "api.ate-system.svc", "name on ate-api-server's serving certificate")
 	routerAddr     = flag.String("router-addr", "atenet-router.ate-system.svc.cluster.local:443", "atenet-router HTTPS address")
@@ -353,6 +353,7 @@ func (b *bench) runMany(ctx context.Context, template string, n, concurrency int
 type templateState struct {
 	Name     string `json:"name"`
 	Guest    string `json:"guest"`
+	Class    string `json:"class"`
 	Image    string `json:"image"`
 	TouchMiB int    `json:"touch_mib"`
 	Replicas int32  `json:"replicas"`
@@ -375,8 +376,8 @@ func (b *bench) templateNames(ctx context.Context) ([]string, error) {
 			return nil, err
 		}
 		for _, t := range resp.GetActorTemplates() {
-			if name := t.GetMetadata().GetName(); strings.HasSuffix(name, "-pooled") || strings.HasSuffix(name, "-plain") {
-				names = append(names, name)
+			if _, _, _, ok := parseTemplateName(t.GetMetadata().GetName()); ok {
+				names = append(names, t.GetMetadata().GetName())
 			}
 		}
 		if token = resp.GetNextPageToken(); token == "" {
@@ -417,8 +418,8 @@ func (b *bench) handleState(w http.ResponseWriter, r *http.Request) {
 	var ts []templateState
 	for _, name := range names {
 		t, err := b.control.GetActorTemplate(ctx, &ateapi.GetActorTemplateRequest{ActorTemplate: &ateapi.ObjectRef{Atespace: *atespace, Name: name}})
-		guest := strings.TrimSuffix(strings.TrimSuffix(name, "-pooled"), "-plain")
-		st := templateState{Name: name, Guest: guest}
+		guest, class, _, _ := parseTemplateName(name)
+		st := templateState{Name: name, Guest: guest, Class: class}
 		if err != nil {
 			st.Error = err.Error()
 		} else {

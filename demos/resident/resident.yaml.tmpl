@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The resident pool demo: one WorkerPool, two ActorTemplates of the counter
-# workload (one with a resident pool, one without), and claimbench, which
-# claims actors from both and serves a page showing each claim's latency.
+# The resident pool demo: a WorkerPool per sandbox class (the lines of a pool
+# the deploy did not select are dropped by their placeholder), per guest and
+# class two ActorTemplates of the counter workload (one with a resident pool,
+# one without), and claimbench, which claims actors from both and serves a
+# page showing each claim's latency.
 #
 # The ActorTemplates are not CRDs: they live in resident-*-template.yaml.tmpl
 # and are created through the ate API with `kubectl ate create actor-template`.
@@ -29,29 +31,57 @@ metadata:
 
 ---
 
-apiVersion: ate.dev/v1
-kind: WorkerPool
-metadata:
-  name: resident
-  namespace: ate-demo-resident
-  labels:
-    workload: resident
-spec:
-  replicas: 2
-  workerImage: ko://go.ate.dev/substrate/cmd/ateworker-gvisor
-  sandboxClasses:
-  - name: gvisor
-  template:
-    # Capacity for every guest's residents plus the claims in flight: the
-    # default guests book 500m each and 256Mi to 1.5Gi, twenty residents in
-    # all.
-    resources:
-      limits:
-        cpu: "12"
-        memory: 32Gi
-      requests:
-        cpu: "2"
-        memory: 32Gi
+apiVersion: ate.dev/v1  # ${GVISOR_POOL}
+kind: WorkerPool  # ${GVISOR_POOL}
+metadata:  # ${GVISOR_POOL}
+  name: resident-gvisor  # ${GVISOR_POOL}
+  namespace: ate-demo-resident  # ${GVISOR_POOL}
+  labels:  # ${GVISOR_POOL}
+    workload: resident-gvisor  # ${GVISOR_POOL}
+spec:  # ${GVISOR_POOL}
+  replicas: ${WORKERS}  # ${GVISOR_POOL}
+  workerImage: ko://go.ate.dev/substrate/cmd/ateworker-gvisor  # ${GVISOR_POOL}
+  sandboxClasses:  # ${GVISOR_POOL}
+  - name: gvisor  # ${GVISOR_POOL}
+  template:  # ${GVISOR_POOL}
+    # Capacity for every guest's residents plus the claims in flight: the  # ${GVISOR_POOL}
+    # default guests book 500m each and 256Mi to 1.5Gi, twenty residents in  # ${GVISOR_POOL}
+    # all.  # ${GVISOR_POOL}
+    resources:  # ${GVISOR_POOL}
+      limits:  # ${GVISOR_POOL}
+        cpu: "12"  # ${GVISOR_POOL}
+        memory: 32Gi  # ${GVISOR_POOL}
+      requests:  # ${GVISOR_POOL}
+        cpu: "2"  # ${GVISOR_POOL}
+        memory: 32Gi  # ${GVISOR_POOL}
+
+---
+
+apiVersion: ate.dev/v1  # ${MICROVM_POOL}
+kind: WorkerPool  # ${MICROVM_POOL}
+metadata:  # ${MICROVM_POOL}
+  name: resident-microvm  # ${MICROVM_POOL}
+  namespace: ate-demo-resident  # ${MICROVM_POOL}
+  labels:  # ${MICROVM_POOL}
+    workload: resident-microvm  # ${MICROVM_POOL}
+spec:  # ${MICROVM_POOL}
+  replicas: ${WORKERS}  # ${MICROVM_POOL}
+  workerImage: ko://go.ate.dev/substrate/cmd/ateworker-microvm  # ${MICROVM_POOL}
+  sandboxClasses:  # ${MICROVM_POOL}
+  - name: microvm  # ${MICROVM_POOL}
+    configRef:  # ${MICROVM_POOL}
+      name: microvm  # ${MICROVM_POOL}
+  template:  # ${MICROVM_POOL}
+    # microVM residents are whole VMs sized at the actor's memory.  # ${MICROVM_POOL}
+    resources:  # ${MICROVM_POOL}
+      limits:  # ${MICROVM_POOL}
+        cpu: "12"  # ${MICROVM_POOL}
+        memory: 48Gi  # ${MICROVM_POOL}
+      requests:  # ${MICROVM_POOL}
+        cpu: "2"  # ${MICROVM_POOL}
+        memory: 48Gi  # ${MICROVM_POOL}
+
+---
 
 ---
 
@@ -86,7 +116,7 @@ spec:
         image: ko://go.ate.dev/substrate/demos/resident/claimbench
         args:
         - --atespace=ate-demo-resident
-        - --guest-sizes=${GUEST_SIZES}
+        - --guest-sizes=${GUEST_SIZES}  # dropped when the deploy measured no sizes
         ports:
         - name: http
           containerPort: 8080

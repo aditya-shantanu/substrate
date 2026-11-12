@@ -90,6 +90,7 @@ limitations under the License.
 <section class="exp">
   <h2>Run the experiment</h2>
   <div class="controls">
+    <label>sandbox <select id="expClass"><option value="all">all</option></select></label>
     <label>guests <select id="expGuests"><option value="all">all</option></select></label>
     <label>claims per template <input id="expN" type="number" min="1" max="500" value="30"></label>
     <label>one claim every <input id="expInterval" type="number" min="0" max="5000" step="50" value="300"> ms</label>
@@ -133,9 +134,10 @@ function card(t) {
     <div class="bars"></div>`;
   el.querySelectorAll('button').forEach(b => b.onclick = () => run(t.name, +b.dataset.n, +(b.dataset.c||1), +(b.dataset.i||0)));
   document.getElementById('main').appendChild(el);
-  cards[t.name] = { el, claims: [], guest: t.guest };
-  if (![...guestSelect.options].some(o => o.value === t.guest)) { const o = document.createElement('option'); o.value = o.textContent = t.guest; guestSelect.appendChild(o); }
-  if (!state.guest) { guestSelect.value = t.guest; showGuest(t.guest); } else el.style.display = t.guest === state.guest ? '' : 'none';
+  const key = t.guest + ' · ' + t.class;
+  cards[t.name] = { el, claims: [], guest: key };
+  if (![...guestSelect.options].some(o => o.value === key)) { const o = document.createElement('option'); o.value = o.textContent = key; guestSelect.appendChild(o); }
+  if (!state.guest) { guestSelect.value = key; showGuest(key); } else el.style.display = key === state.guest ? '' : 'none';
   return cards[t.name];
 }
 function render(name) {
@@ -187,7 +189,11 @@ async function loadGuests() {
   try {
     exp.guests = await (await fetch('/api/guests')).json();
     const sel = $('expGuests'); for (const o of [...sel.options].slice(1)) o.remove();
-    for (const g of exp.guests) { const o = document.createElement('option'); o.value = g.label; o.textContent = `${g.label} (${fmtMB(g.size_mb)}${g.touch_mib ? ', holds ' + g.touch_mib + ' MiB' : ''})`; sel.appendChild(o); }
+    const seen = new Set();
+    for (const g of exp.guests) { if (seen.has(g.label)) continue; seen.add(g.label); const o = document.createElement('option'); o.value = g.label; o.textContent = `${g.label} (${fmtMB(g.size_mb)}${g.touch_mib ? ', holds ' + g.touch_mib + ' MiB' : ''})`; sel.appendChild(o); }
+    const cls = $('expClass'); for (const o of [...cls.options].slice(1)) o.remove();
+    for (const c of [...new Set(exp.guests.map(g => g.class))].sort()) { const o = document.createElement('option'); o.value = o.textContent = c; cls.appendChild(o); }
+    if (cls.options.length === 2) cls.value = cls.options[1].value;
   } catch (e) { console.warn(e); }
 }
 function strip(template, n) {
@@ -205,9 +211,9 @@ function onClaim(c) {
 }
 $('expRun').onclick = () => {
   if (exp.running) return;
-  const n = +$('expN').value, interval = +$('expInterval').value, guests = $('expGuests').value;
+  const n = +$('expN').value, interval = +$('expInterval').value, guests = $('expGuests').value, cls = $('expClass').value;
   $('expStrips').innerHTML = ''; $('expResults').innerHTML = ''; exp.strips = {}; exp.running = true; $('expRun').disabled = true;
-  const es = new EventSource(`/api/experiment?guests=${encodeURIComponent(guests)}&n=${n}&interval_ms=${interval}`);
+  const es = new EventSource(`/api/experiment?guests=${encodeURIComponent(guests)}&class=${encodeURIComponent(cls)}&n=${n}&interval_ms=${interval}`);
   es.addEventListener('start', e => { const d = JSON.parse(e.data); for (const t of d.templates) strip(t, d.spec.n); $('expProgress').textContent = `running ${d.templates.length} templates, ${d.spec.n} claims each`; });
   es.addEventListener('template', e => { const d = JSON.parse(e.data); $('expProgress').textContent = `template ${d.index+1} of ${d.of}: ${d.template}`; });
   es.addEventListener('claim', e => onClaim(JSON.parse(e.data)));
@@ -215,8 +221,13 @@ $('expRun').onclick = () => {
   es.onerror = () => { es.close(); exp.running = false; $('expRun').disabled = false; $('expProgress').textContent = 'the run stopped; see the server log'; };
 };
 function renderResults(r) {
-  const gs = r.guests.filter(g => g.plain_result.n && g.pooled_result.n);
-  if (!gs.length) return;
+  const all = r.guests.filter(g => g.plain_result.n && g.pooled_result.n);
+  if (!all.length) return;
+  const classes = [...new Set(all.map(g => g.class))].sort();
+  $('expResults').innerHTML = '';
+  for (const c of classes) renderClassResults(r, all.filter(g => g.class === c), classes.length > 1 ? c : '');
+}
+function renderClassResults(r, gs, classTitle) {
   const P = 'p90';
   const savings = gs.map(g => g.plain_result.total[P] - g.pooled_result.total[P]);
   const ratios = gs.map(g => g.plain_result.total[P] / g.pooled_result.total[P]);
@@ -225,12 +236,14 @@ function renderResults(r) {
   const big = gs[gs.length-1];
   const tiles = [[`${Math.round(median(savings))} ms`, 'p90 claim time saved, median across guests'], [`${median(ratios).toFixed(1)}×`, 'p90 speedup, median'], [`${Math.round(big.plain_result.total[P])} → ${Math.round(big.pooled_result.total[P])} ms`, 'largest guest, plain → pooled, p90'], [`${Math.round(100*adopted/total)}%`, 'pooled claims that adopted a resident']];
   const legend = `<div class="clegend"><span><i class="ckey plain"></i>plain: every claim restores the golden snapshot</span><span><i class="ckey pooled"></i>pooled: the claim adopts a resident sandbox</span></div>`;
-  const el = $('expResults');
-  el.innerHTML = `<div class="tiles">${tiles.map(([v,k]) => `<div class="stat"><div class="v">${v}</div><div class="k">${k}</div></div>`).join('')}</div>
-    <h3>Claim time per guest, p90</h3>${legend}${dumbbell(gs, P)}
-    <h3>The resume step against the memory a guest holds, p90</h3>${legend}${lineChart(gs, P)}
+  const el = document.createElement('div');
+  const suffix = classTitle ? ` · ${classTitle}` : '';
+  el.innerHTML = `${classTitle ? `<h3 style="font-size:17px;margin-top:22px">${esc(classTitle)}</h3>` : ''}<div class="tiles">${tiles.map(([v,k]) => `<div class="stat"><div class="v">${v}</div><div class="k">${k}</div></div>`).join('')}</div>
+    <h3>Claim time per guest, p90${suffix}</h3>${legend}${dumbbell(gs, P)}
+    <h3>The resume step against the memory a guest holds, p90${suffix}</h3>${legend}${lineChart(gs, P)}
     <details><summary>Table view</summary>${table(gs)}</details>
-    <div class="progress">${r.spec.n} claims per template, one every ${r.spec.interval_ms} ms. <a href="/api/experiment/last" style="color:var(--muted)">JSON</a></div>`;
+    <div class="progress">${r.spec.n} claims per template, one every ${r.spec.interval_ms} ms${r.spec.class && r.spec.class !== 'all' ? ', ' + esc(r.spec.class) : ''}. <a href="/api/experiment/last" style="color:var(--muted)">JSON</a></div>`;
+  $('expResults').appendChild(el);
   wireTips(el);
 }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }

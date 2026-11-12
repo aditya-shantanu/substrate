@@ -16,6 +16,14 @@ environment, holding more memory as they grow. Pass your own with
 `--guests 'label|touchMiB|memoryMiB|image;...'` (images digest-pinned) and
 size the pools with `--replicas`.
 
+Each sandbox class gets its own WorkerPool and its own template pair per
+guest, named `<guest>-<class>-pooled` and `<guest>-<class>-plain`.
+`--sandbox-classes gvisor,microvm` measures both; the default is gVisor only.
+A microVM pool needs an install with the `microvm` sandbox class and nodes
+with KVM (bare metal or nested virtualization), and its residents are whole
+VMs sized at the actor's memory, so the microVM pool asks for more memory per
+worker. `--workers` sets the worker pods per pool.
+
 ## Prerequisites
 
 - A cluster with Agent Substrate installed as in the
@@ -63,7 +71,7 @@ open http://localhost:8080
 ```
 
 "Run the experiment" at the top runs the whole measurement from the page: pick
-one guest or all, set the claims per template and the pause between claims,
+a sandbox class and one guest or all, set the claims per template and the pause between claims,
 and watch each claim land as a cell per template, plain templates first and
 then pooled. When the last template finishes the page draws the results: a
 dumbbell per guest (plain against pooled claim time, p90) and the resume step
