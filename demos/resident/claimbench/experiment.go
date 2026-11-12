@@ -113,7 +113,11 @@ func (b *bench) guests(ctx context.Context) ([]guestInfo, error) {
 				return nil, err
 			}
 			g.Image, g.TouchMiB = describeTemplate(t)
-			g.SizeMB = b.imageSizeMB(ctx, g.Image)
+			if size, ok := knownSizes()[label]; ok && size > 0 {
+				g.SizeMB = size
+			} else {
+				g.SizeMB = b.imageSizeMB(ctx, g.Image)
+			}
 		}
 	}
 	var out []guestInfo
@@ -296,6 +300,21 @@ func (b *bench) handleGuests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, gs)
+}
+
+// knownSizes parses --guest-sizes.
+func knownSizes() map[string]int64 {
+	out := map[string]int64{}
+	for _, part := range strings.Split(*guestSizes, ",") {
+		label, mb, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		if v, err := strconv.ParseInt(mb, 10, 64); err == nil {
+			out[label] = v
+		}
+	}
+	return out
 }
 
 func contains(xs []string, x string) bool {

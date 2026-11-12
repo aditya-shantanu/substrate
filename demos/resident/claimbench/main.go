@@ -64,6 +64,7 @@ var (
 	out            = flag.String("out", "", "headless: file the claims are appended to as JSON lines")
 	firstTimeout   = flag.Duration("first-response-timeout", 30*time.Second, "how long to wait for the actor's first HTTP response")
 	interval       = flag.Duration("interval", 0, "headless: pause between claims, the arrival rate a pool has to keep up with")
+	guestSizes     = flag.String("guest-sizes", "", "compressed image size per guest as label=MB,..., for registries this pod cannot read")
 )
 
 // claim is one measured actor: created, resumed, and reached once.

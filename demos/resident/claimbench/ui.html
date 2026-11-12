@@ -181,7 +181,7 @@ refresh(); setInterval(refresh, 1000);
 // ---- the experiment: run, watch, then chart.
 const exp = { guests: [], strips: {}, running: false };
 const $ = id => document.getElementById(id);
-function fmtMB(mb) { return mb >= 1000 ? (mb/1000).toFixed(1) + ' GB' : mb + ' MB'; }
+function fmtMB(mb) { return !mb ? 'size n/a' : mb >= 1000 ? (mb/1000).toFixed(1) + ' GB' : mb + ' MB'; }
 function pct(xs, p) { if (!xs.length) return 0; const s = [...xs].sort((a,b)=>a-b); return s[Math.min(s.length-1, Math.round(p/100*(s.length-1)))]; }
 async function loadGuests() {
   try {

@@ -24,6 +24,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/google"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
 	"go.ate.dev/substrate/cmd/ate-setup/internal/demos"
 	"go.ate.dev/substrate/cmd/ate-setup/internal/steps"
@@ -149,6 +153,36 @@ func (d *demo) templatesFor(e *steps.Env) error {
 	return nil
 }
 
+// guestSizes renders the --guest-sizes claimbench shows, "label=MB,...": the
+// compressed size of each guest image, read here because the pod cannot read
+// private registries. A ko:// guest is built later and reads as 0.
+func guestSizes(ctx context.Context, guests []guest) string {
+	var parts []string
+	for _, g := range guests {
+		var size int64
+		if ref, err := name.ParseReference(g.image); err == nil {
+			img, err := remote.Image(ref, remote.WithContext(ctx), remote.WithAuthFromKeychain(authn.NewMultiKeychain(authn.DefaultKeychain, google.Keychain)))
+			if err == nil {
+				if m, err := img.Manifest(); err == nil {
+					for _, l := range m.Layers {
+						size += l.Size
+					}
+				}
+			}
+		}
+		parts = append(parts, g.label+"="+strconv.FormatInt(size/1e6, 10))
+	}
+	return strings.Join(parts, ",")
+}
+
+func (d *demo) renderValues(ctx context.Context, e *steps.Env) (map[string]string, error) {
+	guests, err := parseGuests(e.Cfg.Resolved().String("demo.resident.guests"))
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{"GUEST_SIZES": guestSizes(ctx, guests)}, nil
+}
+
 func (d *demo) Deploy(ctx context.Context, e *steps.Env) error {
 	if err := d.templatesFor(e); err != nil {
 		return err
@@ -173,6 +207,7 @@ func init() {
 		// The largest default guest is a 2.4 GB image; its first pull and
 		// golden build take longer than a demo usually does.
 		GoldenTimeout: 20 * time.Minute,
+		RenderValues:  d.renderValues,
 	}
 	demos.Register(d)
 }

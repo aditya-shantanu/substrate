@@ -86,6 +86,7 @@ spec:
         image: ko://go.ate.dev/substrate/demos/resident/claimbench
         args:
         - --atespace=ate-demo-resident
+        - --guest-sizes=${GUEST_SIZES}
         ports:
         - name: http
           containerPort: 8080
