@@ -148,10 +148,16 @@ func (w *ActorWorkflow) ensureAteletTerminated(ctx context.Context, actorRef res
 		workloadSpec = fallbackWorkloadSpec(actor)
 	}
 
+	// A reserved resident's sandbox still runs under its placeholder name,
+	// which is what the node retires its ingress and egress by.
+	actorName := actor.GetMetadata().GetName()
+	if resident := actor.GetStatus().GetResident(); resident.GetState() == ateapi.ResidentState_RESIDENT_STATE_RESERVED && resident.GetPooledName() != "" {
+		actorName = resident.GetPooledName()
+	}
 	req := &ateletpb.TerminateRequest{
 		WorkerPodUid:          workerPodUID,
 		Atespace:              actor.GetMetadata().GetAtespace(),
-		ActorName:             actor.GetMetadata().GetName(),
+		ActorName:             actorName,
 		ActorUid:              actor.GetMetadata().GetUid(),
 		ActorTemplateAtespace: actor.GetActorTemplate().GetAtespace(),
 		ActorTemplateName:     actor.GetActorTemplate().GetName(),

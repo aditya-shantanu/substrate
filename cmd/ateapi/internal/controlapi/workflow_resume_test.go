@@ -165,7 +165,7 @@ func TestFinalizeRunning_CommitsRunning(t *testing.T) {
 	seedFinalizeActor(t, ctx, persistence, 1, []string{"10.0.0.1"})
 	w := &ActorWorkflow{store: persistence}
 
-	got, err := w.finalizeRunning(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, 1)
+	got, err := w.finalizeRunning(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, 1, nil)
 	if err != nil {
 		t.Fatalf("finalizeRunning: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestFinalizeRunning_StampsReportedEpochAndIPs(t *testing.T) {
 	seedFinalizeActor(t, ctx, persistence, 2, []string{"10.0.0.2"})
 	w := &ActorWorkflow{store: persistence}
 
-	got, err := w.finalizeRunning(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, 2)
+	got, err := w.finalizeRunning(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, 2, nil)
 	if err != nil {
 		t.Fatalf("finalizeRunning: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestFinalizeRunning_ReplacedWorkerProcess(t *testing.T) {
 			}
 			w := &ActorWorkflow{store: persistence}
 
-			_, err := w.finalizeRunning(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, tc.reported)
+			_, err := w.finalizeRunning(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, tc.reported, nil)
 			if got := apierror.Code(err); got != tc.want {
 				t.Fatalf("finalizeRunning() = %v (err %v), want %v", got, err, tc.want)
 			}
@@ -258,7 +258,7 @@ func TestFinalizeRunning_UnrecordableUploadStillRuns(t *testing.T) {
 	})
 	w := &ActorWorkflow{store: persistence}
 
-	got, err := w.finalizeRunning(ctx, ref, 1)
+	got, err := w.finalizeRunning(ctx, ref, 1, nil)
 	if err != nil {
 		t.Fatalf("finalizeRunning: %v", err)
 	}
@@ -1128,6 +1128,22 @@ type capturingAtelet struct {
 	onDetach     func()
 	terminateErr error
 	onTerminate  func()
+	// adopt is the last Adopt request; adoptErr, when set, fails Adopt after
+	// it is recorded.
+	adopt    *ateletpb.AdoptRequest
+	adoptErr error
+	// terminate is the last Terminate request.
+	terminate *ateletpb.TerminateRequest
+}
+
+func (f *capturingAtelet) Adopt(ctx context.Context, req *ateletpb.AdoptRequest) (*ateletpb.AdoptResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.adopt = proto.Clone(req).(*ateletpb.AdoptRequest)
+	if f.adoptErr != nil {
+		return nil, f.adoptErr
+	}
+	return &ateletpb.AdoptResponse{WorkerEpoch: registeredEpoch}, nil
 }
 
 func (f *capturingAtelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (*ateletpb.RestoreResponse, error) {
@@ -1192,6 +1208,7 @@ func (f *capturingAtelet) DetachActor(ctx context.Context, req *ateletpb.DetachA
 
 func (f *capturingAtelet) Terminate(ctx context.Context, req *ateletpb.TerminateRequest) (*ateletpb.TerminateResponse, error) {
 	f.mu.Lock()
+	f.terminate = proto.Clone(req).(*ateletpb.TerminateRequest)
 	hook := f.onTerminate
 	f.mu.Unlock()
 	if hook != nil {
